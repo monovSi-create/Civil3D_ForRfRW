@@ -131,8 +131,37 @@ namespace Civil3D_commands.AssociativeBreaks
 
             double lo = view.ElevationMin;
             double hi = view.ElevationMax;
-
             if (hi < lo) { double t = lo; lo = hi; hi = t; }
+
+            // X берём по пикету, на заведомо внутренней отметке: ровно на границе
+            // диапазона FindXYAtStationAndElevation возвращает NaN.
+            Point3d anchor;
+            if (!RwGeometry.TryPointInProfileView(view, m.Station, (lo + hi) / 2.0, out anchor))
+                return null;
+
+            // Y — по фактическим габаритам вида. ElevationMin/ElevationMax дают
+            // диапазон ОТМЕТОК, и построенная по ним вертикаль оказывалась заметно
+            // короче самого вида: сетка рисуется с запасом, а вертикальное
+            // преувеличение к отметкам отношения не имеет.
+            try
+            {
+                Extents3d ext = view.GeometricExtents;
+
+                double yLo = Math.Min(ext.MinPoint.Y, ext.MaxPoint.Y);
+                double yHi = Math.Max(ext.MinPoint.Y, ext.MaxPoint.Y);
+
+                if (yHi - yLo > 1e-6)
+                    return new[]
+                    {
+                        new Point3d(anchor.X, yLo, 0.0),
+                        new Point3d(anchor.X, yHi, 0.0)
+                    };
+            }
+            catch (System.Exception)
+            {
+                // Габаритов нет (вид только что создан и не отрисован) —
+                // строим по диапазону отметок, как раньше.
+            }
 
             double inset = Math.Max((hi - lo) * 1e-4, 1e-6);
 

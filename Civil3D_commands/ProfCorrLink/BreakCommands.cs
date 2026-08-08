@@ -859,6 +859,30 @@ namespace Civil3D_commands.AssociativeBreaks
 
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
+                // Высота вида двумя мерками: по диапазону отметок и по фактическим
+                // габаритам. Расхождение и объясняет, почему вертикаль, построенная
+                // по отметкам, выглядит короче самого вида.
+                if (link != null)
+                {
+                    var pv = RwHandles.Open<ProfileView>(
+                        tr, doc.Database, link.ProfileViewHandle, OpenMode.ForRead);
+
+                    if (pv != null)
+                    {
+                        string extents;
+                        try
+                        {
+                            Extents3d e = pv.GeometricExtents;
+                            extents = $"{Math.Abs(e.MaxPoint.Y - e.MinPoint.Y):F3}";
+                        }
+                        catch (System.Exception) { extents = "нет"; }
+
+                        ed.WriteMessage(
+                            $"\nвид: отметки {pv.ElevationMin:F3}..{pv.ElevationMax:F3}" +
+                            $" (диапазон {pv.ElevationMax - pv.ElevationMin:F3}), габарит по Y {extents}");
+                    }
+                }
+
                 foreach (var m in session.Store.All.OrderBy(x => x.Station))
                 {
                     ed.WriteMessage(
