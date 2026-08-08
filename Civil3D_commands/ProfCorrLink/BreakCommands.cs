@@ -585,12 +585,6 @@ namespace Civil3D_commands.AssociativeBreaks
                 return;
             }
 
-            // Работаем в том виде, в котором выбран прокси: щёлкнули по линии
-            // на профиле — тянем в профиле. Иначе jig сносил бы курсор на ось,
-            // и от точки в виде профиля тянулась бы линия через весь чертёж
-            // к трассе.
-            bool inProfileView = res.ObjectId.Handle == m.ProfileProxyHandle;
-
             double station;
             bool accepted = false;
 
@@ -609,11 +603,8 @@ namespace Civil3D_commands.AssociativeBreaks
                     return;
                 }
 
-                if (inProfileView && pv == null)
-                {
-                    ed.WriteMessage("\nВид профиля не найден — переношу по плану.");
-                    inProfileView = false;
-                }
+                if (pv == null)
+                    ed.WriteMessage("\nВид профиля не найден — вести можно только в плане.");
 
                 // Соседние разрывы тоже держат границу — те же пределы, что
                 // и при перетаскивании ручки.
@@ -621,10 +612,8 @@ namespace Civil3D_commands.AssociativeBreaks
                 lo = Math.Max(lo, bounds.min);
                 hi = Math.Min(hi, bounds.max);
 
-                var jig = inProfileView
-                    ? new BreakBoundaryJig(pv, lo, hi, m.Station)
-                    : new BreakBoundaryJig(al, lo, hi, m.Station);
-
+                // Виды равноправны: куда увели курсор, в том и ведём.
+                var jig = new BreakBoundaryJig(al, pv, lo, hi, m.Station);
                 PromptResult jigRes = ed.Drag(jig);
 
                 accepted = jigRes.Status == PromptStatus.OK && jig.HasStation;
@@ -649,67 +638,72 @@ namespace Civil3D_commands.AssociativeBreaks
         /// за курсором; вторая скользит по оси, оставаясь основанием
         /// перпендикуляра, — проекция на трассу и есть нормаль.
         /// </summary>
+        /// <summary>
+        /// Виды равноправны: тянуть границу можно и в плане, и в виде профиля,
+        /// независимо от того, какой прокси выбран. Режим определяется на каждом
+        /// движении мыши — по тому, попал курсор в габариты вида профиля или нет,
+        /// — а показываются сразу оба представления будущей границы.
+        /// </summary>
         private class BreakBoundaryJig : DrawJig
         {
-            // Задан ровно один из двух: в каком виде тянем, в том и работаем.
             private readonly Alignment _alignment;
             private readonly ProfileView _view;
 
             private readonly double _lo;
             private readonly double _hi;
 
-            // Профильный режим: середина диапазона отметок (для перевода пикета
-            // в X) и габарит вида по Y — вертикаль рисуется во всю его высоту.
+            // Габариты вида: по ним и распознаётся «курсор внутри вида»,
+            // и рисуется вертикаль во всю его высоту.
+            private readonly bool _hasBox;
+            private readonly double _xLo, _xHi, _yLo, _yHi;
             private readonly double _midElevation;
-            private readonly double _yLo;
-            private readonly double _yHi;
 
             private Point3d _cursor;
-            private Point3d _a;
-            private Point3d _b;
             private bool _valid;
+            private bool _inView;
+
+            // Что рисуем: представление в каждом виде плюс «резинка» к курсору.
+            private Point3d _profA, _profB;
+            private Point3d _planA, _planB;
+            private Point3d _rubberA, _rubberB;
+            private bool _hasProf, _hasPlan, _hasRubber;
 
             public double Station { get; private set; }
             public bool HasStation { get { return _valid; } }
 
-            /// <summary>План: отрезок «курсор → его проекция на ось».</summary>
-            public BreakBoundaryJig(Alignment alignment, double lo, double hi, double startStation)
+            public BreakBoundaryJig(Alignment alignment, ProfileView view,
+                                    double lo, double hi, double startStation)
             {
                 _alignment = alignment;
-                _lo = lo;
-                _hi = hi;
-                Station = startStation;
-            }
-
-            /// <summary>Вид профиля: вертикаль на пикете под курсором.</summary>
-            public BreakBoundaryJig(ProfileView view, double lo, double hi, double startStation)
-            {
                 _view = view;
                 _lo = lo;
                 _hi = hi;
                 Station = startStation;
 
-                double eLo = view.ElevationMin;
-                double eHi = view.ElevationMax;
-                _midElevation = (eLo + eHi) / 2.0;
+                if (view == null) return;
+
+                _midElevation = (view.ElevationMin + view.ElevationMax) / 2.0;
 
                 try
                 {
                     Extents3d ext = view.GeometricExtents;
+                    _xLo = Math.Min(ext.MinPoint.X, ext.MaxPoint.X);
+                    _xHi = Math.Max(ext.MinPoint.X, ext.MaxPoint.X);
                     _yLo = Math.Min(ext.MinPoint.Y, ext.MaxPoint.Y);
                     _yHi = Math.Max(ext.MinPoint.Y, ext.MaxPoint.Y);
+                    _hasBox = _xHi - _xLo > 1e-6 && _yHi - _yLo > 1e-6;
                 }
                 catch (System.Exception)
                 {
-                    _yLo = 0.0;
-                    _yHi = 0.0;
+                    _hasBox = false;
                 }
             }
 
             protected override SamplerStatus Sampler(JigPrompts prompts)
             {
                 var opt = new JigPromptPointOptions(
-                    "\nНовое положение границы участков (щелчок — подтвердить)");
+                    "\nНовое положение границы участков — ведите в плане или в виде профиля" +
+                    " (щелчок — подтвердить)");
                 opt.UserInputControls =
                     UserInputControls.Accept3dCoordinates |
                     UserInputControls.NoZeroResponseAccepted;
@@ -721,74 +715,83 @@ namespace Civil3D_commands.AssociativeBreaks
                 if (res.Value.DistanceTo(_cursor) < 1e-8) return SamplerStatus.NoChange;
 
                 _cursor = res.Value;
-                _valid = _view != null ? SampleInProfileView() : SampleInPlan();
+                _inView = InsideView(_cursor);
 
+                double station;
+                bool ok = _inView
+                    ? RwGeometry.TryStationInProfileView(_view, _cursor, out station)
+                    : RwGeometry.TryStationOnAlignment(_alignment, _cursor, out station);
+
+                if (ok)
+                {
+                    Station = RwGeometry.Clamp(station, _lo, _hi);
+                    BuildPreview();
+                }
+
+                _valid = ok && (_hasProf || _hasPlan);
                 return SamplerStatus.OK;
             }
 
-            /// <summary>
-            /// В плане: пикет — проекция курсора на ось, картинка — отрезок
-            /// от курсора до этой проекции. Проекция идёт по нормали, поэтому
-            /// отрезок перпендикулярен оси сам собой.
-            /// </summary>
-            private bool SampleInPlan()
+            /// <summary>Курсор в габаритах вида профиля — значит ведём по профилю.</summary>
+            private bool InsideView(Point3d p)
             {
-                double station;
-                if (!RwGeometry.TryStationOnAlignment(_alignment, _cursor, out station)) return false;
-
-                Station = RwGeometry.Clamp(station, _lo, _hi);
-
-                Point3d onAxis;
-                if (!RwGeometry.TryPointOnAlignment(_alignment, Station, 0.0, out onAxis)) return false;
-
-                _a = onAxis;
-                _b = _cursor;
-                return true;
+                if (!_hasBox) return false;
+                return p.X >= _xLo && p.X <= _xHi && p.Y >= _yLo && p.Y <= _yHi;
             }
 
             /// <summary>
-            /// В виде профиля: пикет — координата курсора по горизонтали,
-            /// картинка — вертикаль на этом пикете во всю высоту вида, то есть
-            /// ровно то, чем станет граница после подтверждения.
+            /// Оба представления строятся из одного пикета, поэтому разъехаться
+            /// не могут: подвели курсор в плане — вертикаль в профиле уже там же.
             /// </summary>
-            private bool SampleInProfileView()
+            private void BuildPreview()
             {
-                double station;
-                if (!RwGeometry.TryStationInProfileView(_view, _cursor, out station)) return false;
+                _hasProf = false;
+                _hasPlan = false;
+                _hasRubber = false;
 
-                Station = RwGeometry.Clamp(station, _lo, _hi);
-
-                Point3d anchor;
-                if (!RwGeometry.TryPointInProfileView(_view, Station, _midElevation, out anchor))
-                    return false;
-
-                if (_yHi - _yLo > 1e-6)
+                if (_view != null && _hasBox)
                 {
-                    _a = new Point3d(anchor.X, _yLo, 0.0);
-                    _b = new Point3d(anchor.X, _yHi, 0.0);
-                }
-                else
-                {
-                    // Габаритов нет — показываем хотя бы отрезок по диапазону отметок.
-                    Point3d lo, hi;
-                    if (!RwGeometry.TryPointInProfileView(_view, Station, _view.ElevationMin, out lo) ||
-                        !RwGeometry.TryPointInProfileView(_view, Station, _view.ElevationMax, out hi))
-                        return false;
-
-                    _a = lo;
-                    _b = hi;
+                    Point3d anchor;
+                    if (RwGeometry.TryPointInProfileView(_view, Station, _midElevation, out anchor))
+                    {
+                        _profA = new Point3d(anchor.X, _yLo, 0.0);
+                        _profB = new Point3d(anchor.X, _yHi, 0.0);
+                        _hasProf = true;
+                    }
                 }
 
-                return true;
+                if (_alignment != null)
+                {
+                    Point3d[] pts = BreakProxyFactory.PlanPoints(_alignment, Station);
+                    if (pts != null)
+                    {
+                        _planA = pts[0];
+                        _planB = pts[1];
+                        _hasPlan = true;
+
+                        // В плане «резинка» от оси к курсору показывает, что
+                        // именно сносится на ось. В виде профиля она не нужна:
+                        // там курсор и так стоит на будущей границе.
+                        if (!_inView)
+                        {
+                            _rubberA = pts[0];
+                            _rubberB = _cursor;
+                            _hasRubber = true;
+                        }
+                    }
+                }
             }
 
             protected override bool WorldDraw(Autodesk.AutoCAD.GraphicsInterface.WorldDraw draw)
             {
-                // Курсор увели за пределы — показывать нечего, но jig
-                // продолжает работать: вернётся в зону, и картинка появится.
+                // Курсор увели туда, где пикет не определяется — показывать
+                // нечего, но jig продолжает работать: вернётся, и картинка появится.
                 if (!_valid) return true;
 
-                draw.Geometry.WorldLine(_a, _b);
+                if (_hasProf) draw.Geometry.WorldLine(_profA, _profB);
+                if (_hasPlan) draw.Geometry.WorldLine(_planA, _planB);
+                if (_hasRubber) draw.Geometry.WorldLine(_rubberA, _rubberB);
+
                 return true;
             }
         }
