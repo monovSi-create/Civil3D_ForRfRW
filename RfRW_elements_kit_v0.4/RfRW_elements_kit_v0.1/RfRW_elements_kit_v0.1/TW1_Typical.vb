@@ -1,0 +1,2616 @@
+﻿Option Explicit On
+Option Strict Off
+
+Imports DBTransactionManager = Autodesk.AutoCAD.DatabaseServices.TransactionManager
+Imports System.Math
+Imports Shape = Autodesk.Civil.DatabaseServices.Shape
+Imports OpenMode = Autodesk.AutoCAD.DatabaseServices.OpenMode
+
+
+
+Public Class TW1_Typical
+    Inherits SATemplate
+
+    ' *************************************************************************
+    ' *************************************************************************
+    ' *************************************************************************
+    '          Name: BasicLane
+    '
+    '   Description: Creates a simple cross-sectional representation of a reinforcement soil wall composed of an array of geogrids.Attachment origin
+    '                is at bottom.
+    '
+    ' Logical Names: Name                       Type       Optional  Description
+    '                --------------------------------------------------------------
+    '                TargetSurface              Surface    Yes       May be used to judge fill/cut condition
+    '
+    '
+    ' Input Parameters: Name                   Type    Optional    Default Value    Description
+    '                -------------------------------------------------------------------------------------------
+    '                FaceAngle              double      no          0                degrees of face element slope
+    '                Side                   long        no          Right            specifies side to place SA on
+    '                Width                  double      no          3.0              width of geogrids
+    '                Step                   double      no          0.5              step of geogrid layer
+    '                GravelSlope            double      no          1.5              0
+    '                DrenageOffset          double      no          0.3              0
+    '                DrenageElevation       long        no           1               0
+    '                GeotextileOverlap      double      no          0.3              0
+    '                BaseElevation          double      no          0.15             0
+    '                RE520_count            long        no          0                0
+    '                RE540_count            long        no          0                0
+    '                RE560_count            long        no          0                0
+    '                RE570_count            long        no          0                0
+    '                RE580_count            long        no          0                0
+    '                RE520_length           double      no          3                0
+    '                RE540_length           double      no          3                0
+    '                RE560_length           double      no          3                0
+    '                RE570_length           double      no          3                0
+    '                RE580_length           double      no          3                0
+    '
+    '
+    'Output Parameters: Name               Type              Description
+    '                ------------------------------------------------------------------
+    '                None
+    Private Const dFaceAngleDefault = 4
+    Private Const dHorizOffset = 0.0
+    Private Const SideDefault = Utilities.Right  '"right"
+    Private Const dGridWidthDefault = 3.0
+    Private Const dLayerStepDefault = 0.45
+    Private Const dGravelSlopeDefault = 1.5
+    Private Const dDrenageOffsetDefault = 0.3
+    Private Const dDrenageElevationDefault = 1
+    Private Const dGeotextileOverlapDefault = 0.3
+    Private Const dBaseElevationDefault = 0.15
+    Private Const dRE520_countDefault = 0
+    Private Const dRE540_countDefault = 0
+    Private Const dRE560_countDefault = 0
+    Private Const dRE570_countDefault = 0
+    Private Const dRE580_countDefault = 0
+    Private Const dSubAsNameDefault = "Участок"
+    'Private Const blocksAboveGrid As Integer = 0
+    'Private Const dBlocksCount As Integer = 1
+    'Private Const dBlockH = 0.5
+    Private Const dBlockWidth = 0.214
+    Private Const dBlocksInLayout = 5
+    Private Const dBlockHeight = 0.15
+    Private Const deltaH = 0.000
+    Private Const dBlockOffset = 0.010459
+    Private Const dBlockLength = 0.4
+    Private Const WidthDefaultF = 0.8
+    Private Const HeightDefaultF = 0.3
+    Private Const dPrepHeight = 0.02
+    Private Const dPipeSlope = 0.05
+    Private Const dPipeStep = 5.0
+    Private Const dPipeDiametr = 0.16
+
+
+    Private Shared _blocksCount As Integer = 0 'необходима для хранения значения на протяжении перестроения всего коридора
+    'Private Const dRE520_lengthDefault = 3
+    'Private Const dRE540_lengthDefault = 3
+    'Private Const dRE560_lengthDefault = 3
+    'Private Const dRE570_lengthDefault = 3
+    'Private Const dRE580_lengthDefault = 3
+
+
+    Protected Overrides Sub GetLogicalNamesImplement(corridorState As CorridorState)
+        MyBase.GetLogicalNamesImplement(corridorState)
+
+        'retrieve paramater buckets from the corridor state
+        Dim paramsLong As ParamLongCollection
+        paramsLong = corridorState.ParamsLong
+        'add logical names we used to script
+        Dim ParamLong As ParamLong
+
+        ParamLong = paramsLong.Add("Проектный профиль", ParamLogicalNameType.ElevationTarget)
+        ParamLong.DisplayName = "Проектный профиль"
+
+        ParamLong = paramsLong.Add("Граница засыпки", ParamLogicalNameType.OffsetTarget)
+        ParamLong.DisplayName = "Граница засыпки"
+
+        ParamLong = paramsLong.Add("blocksTop", ParamLogicalNameType.ElevationTarget)
+        ParamLong.DisplayName = "Профиль облицовочных блоков"
+
+        ParamLong = paramsLong.Add("BackProf", ParamLogicalNameType.ElevationTarget)
+        ParamLong.DisplayName = "Профиль тыльной стороны"
+    End Sub
+    Protected Overrides Sub GetInputParametersImplement(ByVal corridorState As CorridorState)
+        MyBase.GetInputParametersImplement(corridorState)
+
+        ' define collection for long parameters in corridor
+        Dim paramsLong As ParamLongCollection
+        paramsLong = corridorState.ParamsLong
+
+        ' define collection for double parameters in corridor
+        Dim paramsDouble As ParamDoubleCollection
+        paramsDouble = corridorState.ParamsDouble
+
+        ' define collection for string parameters in corridor
+        Dim paramsString As ParamStringCollection
+        paramsString = corridorState.ParamsString
+
+        ' Add input parameters we used in this script
+
+        'paramsDouble.Add("Наклон лицевой грани", dFaceAngleDefault)
+        'paramsDouble.Add("Горизонтальное смещение", dHorizOffset)
+        paramsDouble.Add("Длина георешеток", dGridWidthDefault)
+        paramsDouble.Add("Шаг георешеток", dLayerStepDefault)
+        paramsDouble.Add("Наклон дренажных призм", dGravelSlopeDefault)
+        paramsDouble.Add("Ширина дренажных призм", dDrenageOffsetDefault)
+        paramsDouble.Add("Отступ первого слоя георешетки", dBaseElevationDefault)
+        paramsDouble.Add("Перехлест геотекстиля", dGeotextileOverlapDefault)
+        paramsLong.Add(Utilities.Side, SideDefault)
+        paramsLong.Add("Отступ первого слоя дренажа", dDrenageElevationDefault)
+        paramsLong.Add("Кол-во RE580", dRE580_countDefault)
+        paramsLong.Add("Кол-во RE570", dRE570_countDefault)
+        paramsLong.Add("Кол-во RE560", dRE560_countDefault)
+        paramsLong.Add("Кол-во RE540", dRE540_countDefault)
+        paramsLong.Add("Кол-во RE520", dRE520_countDefault)
+        paramsString.Add("Имя участка", dSubAsNameDefault)
+        'paramsLong.Add("bCount", dBlocksCount)
+        'paramsDouble.Add("bHeight", dBlockH)
+        'paramsLong.Add("BlocksAboveGrid", blocksAboveGrid)
+        'paramsDouble.Add("RE580_length", dRE580_lengthDefault)
+        'paramsDouble.Add("RE570_length", dRE570_lengthDefault)
+        'paramsDouble.Add("RE560_length", dRE560_lengthDefault)
+        'paramsDouble.Add("RE540_length", dRE540_lengthDefault)
+        'paramsDouble.Add("RE520_length", dRE520_lengthDefault)
+        paramsLong.Add("BlocksInLayout", dBlocksInLayout)
+        paramsDouble.Add("BlocksDeltaH", deltaH)
+        paramsDouble.Add("BlockLength", dBlockLength)
+        paramsDouble.Add("Толщина Подготовки", dPrepHeight)
+        paramsDouble.Add("Уклон дренажной трубы", dPipeSlope)
+        paramsDouble.Add("Шаг дренажных выпусков", dPipeStep)
+        paramsDouble.Add("Диаметр дренажной трубы", dPipeDiametr)
+    End Sub
+
+    Protected Overrides Sub GetOutputParametersImplement(ByVal corridorState As CorridorState)
+        MyBase.GetOutputParametersImplement(corridorState)
+
+    End Sub
+
+    Protected Overrides Sub DrawImplement(ByVal corridorState As CorridorState)
+
+        Dim tm As DBTransactionManager
+        tm = Autodesk.AutoCAD.DatabaseServices.HostApplicationServices.WorkingDatabase.TransactionManager
+
+        Dim oParamsElevationTarget As ParamElevationTargetCollection
+        oParamsElevationTarget = corridorState.ParamsElevationTarget
+
+        Dim oParamsOffsetTarget As ParamOffsetTargetCollection
+        oParamsOffsetTarget = corridorState.ParamsOffsetTarget
+        ' Retrieve parameter buckets from the corridor state
+        Dim paramsLong As ParamLongCollection
+        paramsLong = corridorState.ParamsLong
+
+        Dim paramsDouble As ParamDoubleCollection
+        paramsDouble = corridorState.ParamsDouble
+
+        Dim paramsString As ParamStringCollection
+        paramsString = corridorState.ParamsString
+#Region "Присваивание переменным значений параметров"
+
+        Dim side As Long
+        Try
+            side = paramsLong.Value(Utilities.Side)
+        Catch
+            side = SideDefault
+        End Try
+        '----------------------------------------
+        'flip about Y axis
+        Dim flip As Double
+        flip = 1.0#
+        If side = Utilities.Left Then
+            flip = -1.0#
+        End If
+        '----------------------------------------
+        'geogrid dimensions
+        Dim oGridWidth As Double
+        Try
+            oGridWidth = paramsDouble.Value("Длина георешеток")
+        Catch
+            oGridWidth = dGridWidthDefault
+        End Try
+        '----------------------------------------
+        'Dim oHorizStep As Double
+        'Try
+        '    oHorizStep = paramsDouble.Value("Горизонтальное смещение")
+        'Catch
+        '    oHorizStep = dHorizOffset
+        'End Try
+        '----------------------------------------
+        'Dim oFaceAngle As Double
+        '    Try
+        '        oFaceAngle = paramsDouble.Value("Наклон лицевой грани")
+        '    Catch
+        '        oFaceAngle = dFaceAngleDefault
+        '    End Try
+        '----------------------------------------
+        Dim gStep As Double
+        Try
+            gStep = paramsDouble.Value("Шаг георешеток")
+        Catch
+            gStep = dLayerStepDefault
+        End Try
+        '----------------------------------------
+        Dim oDrenageSlope As Double
+        Try
+            oDrenageSlope = paramsDouble.Value("Заложение дренажных призм")
+        Catch
+            oDrenageSlope = dGravelSlopeDefault
+        End Try
+        '----------------------------------------
+        Dim oDrenageOffset As Double
+        Try
+            oDrenageOffset = paramsDouble.Value("Ширина дренажных призм")
+        Catch
+            oDrenageOffset = dDrenageOffsetDefault
+        End Try
+        '----------------------------------------
+        Dim oDrenageElevation As Long
+        Try
+            oDrenageElevation = paramsLong.Value("Отступ первого слоя дренажа")
+        Catch
+            oDrenageElevation = dDrenageElevationDefault
+        End Try
+        '----------------------------------------
+        Dim oBaseElevation As Double
+        Try
+            oBaseElevation = paramsDouble.Value("Отступ первого слоя георешетки")
+        Catch
+            oBaseElevation = dBaseElevationDefault
+        End Try
+        '----------------------------------------
+        Dim geotextileOverlap As Double
+        Try
+            geotextileOverlap = paramsDouble.Value("Перехлест геотекстиля")
+        Catch
+            geotextileOverlap = dGeotextileOverlapDefault
+        End Try
+        '----------------------------------------
+        Dim RE580_count As Long
+        Try
+            RE580_count = paramsLong.Value("Кол-во RE580")
+        Catch
+            RE580_count = dRE580_countDefault
+        End Try
+        '----------------------------------------
+        Dim RE570_count As Long
+        Try
+            RE570_count = paramsLong.Value("Кол-во RE570")
+        Catch
+            RE570_count = dRE570_countDefault
+        End Try
+        '----------------------------------------
+        Dim RE560_count As Long
+        Try
+            RE560_count = paramsLong.Value("Кол-во RE560")
+        Catch
+            RE560_count = dRE560_countDefault
+        End Try
+        '----------------------------------------
+        Dim RE540_count As Long
+        Try
+            RE540_count = paramsLong.Value("Кол-во RE540")
+        Catch
+            RE540_count = dRE540_countDefault
+        End Try
+        '----------------------------------------
+        Dim RE520_count As Long
+        Try
+            RE520_count = paramsLong.Value("Кол-во RE520")
+        Catch
+            RE520_count = dRE520_countDefault
+        End Try
+        '----------------------------------------
+        Dim oSubAsName As String
+        Try
+            oSubAsName = paramsString.Value("Имя участка")
+        Catch
+            oSubAsName = dSubAsNameDefault
+        End Try
+        '----------------------------------------
+        'Dim bAboveGrid As Integer
+        'Try
+        '    bAboveGrid = paramsLong.Value("BlocksAboveGrid")
+        'Catch
+        '    bAboveGrid = blocksAboveGrid
+        'End Try
+        '----------------------------------------
+        'Dim blockHeight As Double
+        'Try
+        '    blockHeight = paramsDouble.Value("bHeight")
+        'Catch
+        '    blockHeight = dBlockH
+        'End Try
+        '----------------------------------------
+        ' Dim blockCount As Long
+        ' Try
+        '     blockCount = paramsLong.Value("bCount")
+        ' Catch
+        '     blockCount = dBlocksCount
+        ' End Try
+        '----------------------------------------
+        'Dim blockLayers As Long
+        'Try
+        '    blockLayers = paramsLong.Value("BlocksInLayout")
+        'Catch
+        '    blockLayers = dBlocksInLayout
+        'End Try
+        '----------------------------------------
+        Dim dH As Double
+        Try
+            dH = paramsDouble.Value("BlocksDeltaH")
+        Catch
+            dH = deltaH
+        End Try
+        '----------------------------------------
+        Dim dL As Double
+        Try
+            dL = paramsDouble.Value("BlockLength")
+        Catch
+            dL = dBlockLength
+        End Try
+        '----------------------------------------
+        Dim prepHeight As Double
+        Try
+            prepHeight = paramsDouble.Value("Толщина Подготовки")
+        Catch
+            prepHeight = dPrepHeight
+        End Try
+        '----------------------------------------
+        'foundation dimensions
+        Dim widthF As Double
+        Try
+            widthF = paramsDouble.Value("Ширина Фундамента")
+        Catch
+            widthF = WidthDefaultF
+        End Try
+        '-----------------------------------------
+        Dim heightF As Double
+        Try
+            heightF = paramsDouble.Value("Высота Фундамента")
+        Catch
+            heightF = HeightDefaultF
+        End Try
+        '----------------------------------------
+        Dim oPipeStep As Double
+        Try
+            oPipeStep = paramsDouble.Value("Шаг дренажных выпусков") / 2
+        Catch
+            oPipeStep = dPipeStep / 2
+        End Try
+        '-----------------------
+        Dim oPipeSlope As Double
+        Try
+            oPipeSlope = paramsDouble.Value("Уклон дренажной трубы")
+        Catch
+            oPipeSlope = dPipeSlope
+        End Try
+        '-----------------------
+        Dim oPipeD As Double
+        Try
+            oPipeD = paramsDouble.Value("Диаметр дренажной трубы")
+        Catch
+            oPipeD = dPipeDiametr
+        End Try
+        '-----------------------------------------------
+#End Region
+        ' Check user input
+        If oGridWidth < 2 Then
+            Utilities.RecordError(corridorState, CorridorError.ValueTooSmall, "Длина георешеток", "Geogrid")
+            oGridWidth = dGridWidthDefault
+        End If
+
+        If gStep <= 0 Then
+            Utilities.RecordError(corridorState, CorridorError.ValueShouldNotBeLessThanOrEqualToZero, "Шаг георешеток", "Geogrid")
+            gStep = dLayerStepDefault
+        End If
+
+        Dim oOrigin As New PointInMem
+        Dim oCurrentAlignmentId As ObjectId
+        Utilities.GetAlignmentAndOrigin(corridorState, oCurrentAlignmentId, oOrigin)
+
+        Dim dWallWidthOffset As Double = (oGridWidth + 1.0) * flip 'soil width
+        Dim blockStep = dBlockHeight + dH
+
+        If corridorState.Mode <> CorridorMode.Layout Then 'для сечений коридора
+            If corridorState.Mode = CorridorMode.None Then
+                Throw New Exception("NONE")
+            End If
+            '--------------------------------------------------------
+            'анализируем наличие целей для сбора информации в сечении
+            '--------------------------------------------------------
+
+            Dim elevationTarget As SlopeElevationTarget
+            Try
+                elevationTarget = oParamsElevationTarget.Value("Проектный профиль")
+            Catch
+                elevationTarget = Nothing
+            End Try
+
+            Dim hasWallHeightProfile As Boolean
+            hasWallHeightProfile = False
+            Dim dWallHeightElevation As Double
+
+            If Not elevationTarget Is Nothing Then
+                'get elevation on elevationTarget
+                Try
+                    dWallHeightElevation = elevationTarget.GetElevation(oCurrentAlignmentId, corridorState.CurrentStation, side) - (oOrigin.Elevation)
+                    hasWallHeightProfile = True
+                Catch
+                    Utilities.RecordWarning(corridorState, CorridorError.LogicalNameNotFound, "Проектный профиль", "RetainWallVertical")
+                End Try
+            End If
+            'определяем профиль облицовочных блоков (если имеется)
+            Dim blocksElevTarget As SlopeElevationTarget
+            Try
+                blocksElevTarget = oParamsElevationTarget.Value("blocksTop")
+            Catch
+                blocksElevTarget = Nothing
+            End Try
+
+            Dim hasWallBlocksProfile As Boolean
+            hasWallBlocksProfile = False
+            Dim blocksHeight As Double
+
+            If Not blocksElevTarget Is Nothing Then
+                'получим высоту по профилю
+                Try
+                    blocksHeight = blocksElevTarget.GetElevation(oCurrentAlignmentId, corridorState.CurrentStation) - oOrigin.Elevation
+                    hasWallBlocksProfile = True
+                Catch
+                    Utilities.RecordWarning(corridorState, CorridorError.LogicalNameNotFound, "blocksTop", "RetainWallVertical")
+                End Try
+                'сечение по заданному профилю высоты блоков+проектному
+
+            End If
+            'Определяем глубину отступа для грунта засыпки
+            Dim offsetTarget As WidthOffsetTarget
+            Try
+                offsetTarget = oParamsOffsetTarget.Value("Граница засыпки")
+            Catch
+                offsetTarget = Nothing
+            End Try
+
+            Dim hasWallOffsetTarget As Boolean
+            hasWallOffsetTarget = False
+
+            Dim xOffset As Double
+            Dim yOffset As Double
+            Dim soilOffset As Double
+
+            If Not offsetTarget Is Nothing Then
+                Try
+                    Utilities.CalcAlignmentOffsetToThisAlignment(oCurrentAlignmentId, corridorState.CurrentStation, offsetTarget, soilOffset, xOffset, yOffset)
+                    hasWallOffsetTarget = True
+                    dWallWidthOffset = soilOffset - oOrigin.Offset
+                Catch
+                    Utilities.RecordWarning(corridorState, CorridorError.LogicalNameNotFound, "Граница засыпки", "RetainWallHorizontal")
+                End Try
+            End If
+
+            'Определяем есть ли профиль ТЫЛЬНОЙ стороны и его значение
+            Dim backTarget As SlopeElevationTarget
+            Try
+                backTarget = oParamsElevationTarget.Value("BackProf")
+            Catch
+                backTarget = Nothing
+            End Try
+
+            Dim hasWallBackProfile As Boolean = False
+            Dim dWallBackElevation As Double
+
+            If Not backTarget Is Nothing Then
+                'get elevation on elevationTarget
+                Try
+                    dWallBackElevation = backTarget.GetElevation(oCurrentAlignmentId, corridorState.CurrentStation, side) - (oOrigin.Elevation)
+                    hasWallBackProfile = True
+                Catch
+                    Utilities.RecordWarning(corridorState, CorridorError.LogicalNameNotFound, "BackProf", "RetainWallVertical")
+                End Try
+            End If
+
+            Dim rows As Integer
+            If hasWallBlocksProfile Then 'если есть верхний профиль облицовочных блоков
+                rows = CType(blocksHeight / blockStep, Integer)
+                createAddStationsForProfile(tm, corridorState, blocksElevTarget)
+
+            Else 'в случае отсутствия профиля для определения высоты облицовки (для первого прохода например)
+                'в начале каждого региона(области) добавляем сечения в пикетах шага облицовочного блока TW1
+                If corridorState.CurrentStation = corridorState.CurrentRegionStartStation Then
+                    'создаем доп.сечения
+                    createAddStations(tm, corridorState, blockStep, dL, elevationTarget) 'доп сечения для облицовки
+                    ' Рассчитываем новое количество блоков на основе высоты
+                    Dim divisor = blockStep * 1000
+                    _blocksCount = dWallHeightElevation * 1000 \ divisor
+                    'доп условие: если стена опускается с самого начала на расстоянии в половину блока
+                    'Dim firstTop As Double = 0
+                    'While firstTop <= dL / 2
+                    '    If isStep(tm, corridorState, firstTop) Then
+                    '        _blocksCount -= 1
+                    '    End If
+                    '    firstTop += 0.001
+                    'End While
+
+                    'доп.условие2: если на расстоянии до первого скачка блоков проектный профиль ниже облицовочного блока
+                    Dim firstStepStation As Double
+                    firstStepAtCurrRegion(tm, corridorState, firstStepStation)
+                    Dim elevAtFirstStep = elevationTarget.GetElevation(oCurrentAlignmentId, firstStepStation)
+                    If (elevAtFirstStep - oOrigin.Elevation) < (_blocksCount * blockStep) Then
+                        _blocksCount -= 1
+                    End If
+
+                End If
+
+                'условие для переопределения высоты облицовки
+                If isStep(tm, corridorState, corridorState.CurrentStation) And corridorState.CurrentStation <> corridorState.CurrentRegionStartStation And corridorState.CurrentStation <> corridorState.CurrentRegionStartStation + 0.001 Then
+                    'вспомогательные вектора до и после скачка для оценки направления проектного профиля
+                    Dim beforeStep = elevationTarget.GetElevation(oCurrentAlignmentId, corridorState.CurrentStation - 0.01)
+                    Dim afterStep = elevationTarget.GetElevation(oCurrentAlignmentId, corridorState.CurrentStation + 0.01)
+                    'сравниваем текущую высоту по блокам и высоту луча(общую высоту стенки)
+                    If beforeStep < afterStep Then
+                        Dim dif As Integer = (afterStep - oOrigin.Elevation - _blocksCount * blockStep) * 1000 \ (blockStep * 1000)
+                        _blocksCount += 1
+                    ElseIf beforeStep > afterStep Then
+                        Dim dif As Integer = Math.Abs((_blocksCount * blockStep - (afterStep - oOrigin.Elevation)) * 1000 \ (blockStep * 1000)) + 1
+                        _blocksCount -= 1
+                    Else
+                        Throw New Exception("что-то неладное")
+                    End If
+
+                End If
+                rows = _blocksCount
+            End If
+            'paramsLong.Item("BlocksCount").Value = rows
+            Dim lowerLayerH As Double = oBaseElevation + prepHeight
+            Dim levelWidth = 0.21 'ширина выравнивающего слоя по облицовке
+            If corridorState.CurrentStation = corridorState.CurrentRegionStartStation Then
+                createPipeAddStations(tm, corridorState, oPipeStep, oPipeSlope) 'доп сечения для трубы
+                createSoilAddStations(tm, corridorState, elevationTarget, lowerLayerH, gStep,
+                                      RE520_count + RE540_count + RE560_count + RE570_count + RE580_count,
+                                        False, 0, 0, False)
+            End If
+            '--------------------------------
+            'построение конструкции в сечении
+            '--------------------------------
+            Dim pointToSoil As New PointInMem
+            Dim pointToSubbase As New PointInMem 'точка для вставки щебеночной подготовки
+            Dim zeroPoint As New PointInMem With {
+            .Offset = 0,
+            .Elevation = 0
+            }
+            Dim PointToFoundat As New PointInMem With {
+            .Offset = (dBlockWidth / 2 - dWallHeightElevation * dBlockOffset / dBlockHeight) * flip,
+            .Elevation = 0
+            }
+            Foundation(corridorState, flip, widthF, heightF, dBlockWidth, prepHeight, PointToFoundat, oSubAsName, pointToSubbase)
+            SubBase(corridorState, flip, widthF, heightF, dWallWidthOffset, geotextileOverlap, oBaseElevation, dBlockWidth, prepHeight, dFaceAngleDefault, pointToSubbase, hasWallOffsetTarget, oSubAsName)
+            'создание облицовочных блоков
+            createFacingTW(corridorState, dWallHeightElevation, flip, rows, blockStep, dH, levelWidth, zeroPoint, pointToSoil)
+            'создание армогрунта
+            pointToSoil.Offset += flip * (dBlockWidth / 2 - 0.01) 'т.к. точка вставки = середине нижнего блока, смещаем ее на пол блока за исключением фаски
+            pointToSoil.Elevation -= prepHeight
+            wallCreate(corridorState, dWallHeightElevation, dWallWidthOffset, dWallBackElevation,
+                   oGridWidth, gStep, dHorizOffset,
+                   lowerLayerH, oDrenageElevation, oDrenageOffset, oDrenageSlope,
+                   geotextileOverlap, dFaceAngleDefault, flip, oSubAsName,
+                   RE520_count, RE540_count, RE560_count, RE570_count, RE580_count,
+                   rows, blockStep,
+                   hasWallOffsetTarget, hasWallBackProfile, oPipeStep, oPipeSlope, oPipeD, pointToSoil)
+        Else 'для представления шаблона конструкции
+                '----------------------------------
+                'строим шаблон конструкции
+                '----------------------------------
+                Dim levelWidth = 0.21
+            Dim levelH = 0.1
+            'Dim dWallHeight = blockLayers * (dBlockHeight + dH) + levelH
+            Dim hasTarget As Boolean = False
+            Dim dWallHeightElevation As Double = oBaseElevation + (RE520_count + RE540_count + RE560_count + RE570_count + RE580_count) * gStep + levelH
+            Dim blockLayers As Integer = dWallHeightElevation * 1000 \ blockStep * 1000
+            Dim hasWallOffsetTarget As Boolean
+            hasWallOffsetTarget = False
+            Dim hasWallBackProfile As Boolean = False
+            Dim dWallBackElevation As Double
+            Dim lowerLayerH As Double = oBaseElevation + prepHeight
+
+            Dim pointToSoil As New PointInMem  'точка для вставки армогрунта
+            Dim pointToSubbase As New PointInMem 'точка для вставки щебеночной подготовки
+            Dim PointToFoundat As New PointInMem With {
+                .Offset = (dBlockWidth / 2 - dWallHeightElevation * dBlockOffset / dBlockHeight) * flip,
+                .Elevation = 0
+                }
+            'создание облицовочных блоков
+            Foundation(corridorState, flip, widthF, heightF, dBlockWidth, prepHeight, PointToFoundat, oSubAsName, pointToSubbase)
+            SubBase(corridorState, flip, widthF, heightF, dWallWidthOffset, geotextileOverlap, oBaseElevation, dBlockWidth, prepHeight, dFaceAngleDefault, pointToSubbase, hasWallOffsetTarget, oSubAsName)
+            createFacingTW(corridorState, dWallHeightElevation, flip, blockLayers, blockStep, dH, levelWidth, oOrigin, pointToSoil)
+            pointToSoil.Offset += flip * (dBlockWidth / 2 - 0.01) 'т.к. точка вставки = середине нижнего блока, смещаем ее на пол блока за исключением фаски
+            pointToSoil.Elevation -= prepHeight
+            wallCreate(corridorState, dWallHeightElevation, dWallWidthOffset, dWallBackElevation,
+                       oGridWidth, gStep, dHorizOffset,
+                       lowerLayerH, oDrenageElevation, oDrenageOffset, oDrenageSlope,
+                       geotextileOverlap, dFaceAngleDefault, flip, oSubAsName,
+                       RE520_count, RE540_count, RE560_count, RE570_count, RE580_count,
+                       blockLayers, blockStep,
+                       hasWallOffsetTarget, hasWallBackProfile, oPipeStep, oPipeSlope, oPipeD, pointToSoil)
+
+        End If
+        ' Обновляем входные параметры (если требуется)
+        Dim param As IParam
+
+        'param = paramsDouble.Add("Горизонтальное смещение", oHorizStep)
+        'param = paramsDouble.Add("Наклон лицевой грани", oFaceAngle)
+        param = paramsDouble.Add("Длина георешеток", oGridWidth)
+        param = paramsDouble.Add("Шаг георешеток", gStep)
+        param = paramsDouble.Add("Заложение дренажных призм", oDrenageSlope)
+        param = paramsDouble.Add("Ширина дренажных призм", oDrenageOffset)
+        param = paramsDouble.Add("Отступ первого слоя георешетки", oBaseElevation)
+        param = paramsDouble.Add("Перехлест геотекстиля", geotextileOverlap)
+        param = paramsLong.Add(Utilities.Side, side)
+        param = paramsLong.Add("Отступ первого слоя дренажа", oDrenageElevation)
+        param = paramsLong.Add("Кол-во RE580", RE580_count)
+        param = paramsLong.Add("Кол-во RE570", RE570_count)
+        param = paramsLong.Add("Кол-во RE560", RE560_count)
+        param = paramsLong.Add("Кол-во RE540", RE540_count)
+        param = paramsLong.Add("Кол-во RE520", RE520_count)
+        param = paramsString.Add("Имя участка", oSubAsName)
+        param = paramsDouble.Add("BlocksDeltaH", dH)
+        param = paramsDouble.Add("BlockLength", dL)
+        param = paramsDouble.Add("Толщина Подготовки", prepHeight)
+        param = paramsDouble.Add("Уклон дренажной трубы", oPipeSlope)
+        param = paramsDouble.Add("Шаг дренажных выпусков", oPipeStep)
+        param = paramsDouble.Add("Диаметр дренажной трубы", oPipeD)
+        'param = paramsLong.Add("BlocksAboveGrid", bAboveGrid)
+        'param = paramsLong.Add("bCount", blockCount)
+        'param = paramsDouble.Add("bHeight", blockHeight)
+    End Sub
+
+#Region "Создание армогрунта"
+    'создание конструкции
+    Private Sub wallCreate(ByVal corridorState As CorridorState,
+                           ByVal wallHeight As Double,
+                           ByVal wallWidth As Double,
+                           ByVal wallBackHeight As Double,
+                           ByVal gridWidth As Double,
+                           ByVal verticalStep As Double,
+                           ByVal horizontalStep As Double,
+                           ByVal baseLayerStep As Double,
+                           ByVal drenageElevLayer As Long,
+                           ByVal drenageWidth As Double,
+                           ByVal drenageSlope As Double,
+                           ByVal geotxtOverlap As Double,
+                           ByVal faceAngle As Double,
+                           ByVal flipValue As Double,
+                           ByVal subAsName As String,
+                           ByVal RE520Count As Long,
+                           ByVal RE540Count As Long,
+                           ByVal RE560Count As Long,
+                           ByVal RE570Count As Long,
+                           ByVal RE580Count As Long,
+                           ByVal blocksCount As Integer,
+                           ByVal blockHeight As Double,
+                           ByVal hasTargetOffset As Boolean,
+                           ByVal hasTargetElevation As Boolean,
+                           ByVal pipeStep As Double,
+                           ByVal pipeSlope As Double,
+                           ByVal pipeDiameter As Double,
+                           ByVal startInputPoint As PointInMem
+                           )
+        'далее в качестве точек вставки используем "точки из памяти"
+        Dim insertPoint As New PointInMem
+        Dim elevatP As Double = startInputPoint.Elevation 'переменные для записи значений отметки и отступа
+        Dim offsetP As Double = startInputPoint.Offset
+        insertPoint.Offset = offsetP 'присваиваем значения опорной точке
+        insertPoint.Elevation = elevatP
+
+        Dim dX As Double = (horizontalStep + verticalStep * Math.Tan(faceAngle * Math.PI / 180)) * flipValue 'отступ для каждого вышележащего ряда (в метрах) 
+        'определим кол-во слоев
+        Dim layers As Integer
+        layers = RE580Count + RE570Count + RE560Count + RE540Count + RE520Count
+        'layers = wallHeight * 1000 \ verticalStep * 1000
+        'определим остаток сверху
+        'Dim reminder As Double
+        'reminder = wallHeight Mod verticalStep
+        Dim blocksInLayer As Integer = CInt(Math.Round(verticalStep / blockHeight)) 'блоков в одном слое
+        Dim blockCountForLayers As Integer = blocksCount - ((baseLayerStep * 1000) \ (blockHeight * 1000)) 'блоков выше первого слоя решетки
+        Dim maxLayers As Integer = blockCountForLayers \ CType(blocksInLayer, Integer) 'максимальное ЦЕЛОЕ число слоев исходя из кол-ва облицовочных блоков 
+        Dim blocksReminder As Integer = blockCountForLayers Mod CType(blocksInLayer, Integer) 'остаток облицовочных блоков выше ЦЕЛОГО числа слоев
+        If layers > maxLayers Then 'условие не выше облицовки
+            If blocksInLayer > 1 And blocksReminder = 0 Then 'доп условие для маленького блока
+                layers = maxLayers - 1
+                blocksReminder = blocksInLayer
+            Else 'для большого блока или если у маленького есть хотя бы один блок выше последнего слоя
+                layers = maxLayers
+            End If
+        End If
+        Dim geotextileName As String = "Геотекстиль"
+        Dim soilName As String = "Дренирующий грунт"
+        Dim drenageName As String = "Щебень дренажной призмы"
+        Dim gridNameRE520 As String = "Георешетка RE520"
+        Dim gridNameRE540 As String = "Георешетка RE540"
+        Dim gridNameRE560 As String = "Георешетка RE560"
+        Dim gridNameRE570 As String = "Георешетка RE570"
+        Dim gridNameRE580 As String = "Георешетка RE580"
+
+        Dim isLast As Boolean = False
+        Dim isDrenLayers As Boolean = False
+        Dim isFirst As Boolean = True
+        'Dim linkName As String
+
+        Dim i As Integer = 0
+
+        'песок ниже первой георешетки
+        createLowerLayer(corridorState, subAsName, soilName, wallWidth, baseLayerStep, faceAngle, flipValue, insertPoint, i, hasTargetOffset)
+        elevatP += baseLayerStep
+        offsetP += baseLayerStep * Math.Tan(faceAngle * Math.PI / 180) * flipValue
+        i += 1
+        'ЦИКЛ СОЗДАЮЩИЙ СЛОИ АРМОГРУНТА И ГЕОРЕШЕТКИ (без верхнего слоя)
+        Do While layers >= i
+            'testPoint = testPoints.Add(offsetP, elevatP, i.ToString())
+            insertPoint.Offset = offsetP
+            insertPoint.Elevation = elevatP
+            If i <= drenageElevLayer Then 'слои ниже дренажной призмы
+                If i = drenageElevLayer Then
+                    isLast = True
+                    If layers > i Then
+                        isDrenLayers = True
+                    End If
+                End If
+                createNonDrenageLayer(corridorState, subAsName, soilName, wallWidth, verticalStep, faceAngle, drenageWidth, flipValue, insertPoint, geotxtOverlap, geotextileName, i, hasTargetOffset, isLast, isDrenLayers)
+            Else 'If drenageElevLayer < i And i < layers Then 'слои с дренажной призмой
+                createDrenageLayer(corridorState, subAsName, drenageName, soilName, geotextileName, wallWidth, verticalStep, faceAngle, drenageWidth, drenageSlope, flipValue, insertPoint, geotxtOverlap, i, hasTargetOffset, isFirst, pipeStep, pipeSlope, pipeDiameter)
+                isFirst = False
+            End If
+            gridlayers(corridorState, i, insertPoint, flipValue, gridWidth, gridNameRE580, gridNameRE570, gridNameRE560, gridNameRE540, gridNameRE520, RE580Count, RE570Count, RE560Count, RE540Count, RE520Count) 'добавляем слой георешетки
+            elevatP += verticalStep
+            offsetP += dX
+            i += 1
+        Loop
+        insertPoint.Offset = offsetP
+        insertPoint.Elevation = elevatP
+        'добавляем еще один слой решетки
+        gridlayers(corridorState, i, insertPoint, flipValue, gridWidth, gridNameRE580, gridNameRE570, gridNameRE560, gridNameRE540, gridNameRE520, RE580Count, RE570Count, RE560Count, RE540Count, RE520Count) 'добавляем слой георешетки
+        'проводим анализ оставшегося пространства
+        Dim reminder As Double = wallHeight - elevatP 'остаток
+        If i <= drenageElevLayer Then
+            createLastNonDrenageLayer(corridorState, soilName, wallWidth, reminder, wallBackHeight, flipValue, insertPoint, geotxtOverlap, geotextileName, hasTargetOffset, hasTargetElevation)
+        Else
+            If blocksReminder < 3 And reminder <= verticalStep Then
+                createLastDrenageLayer(corridorState, subAsName, drenageName, soilName, geotextileName, wallWidth, verticalStep, wallBackHeight, faceAngle, drenageWidth, drenageSlope, flipValue, insertPoint, geotxtOverlap, i, hasTargetOffset, hasTargetElevation, isFirst, reminder)
+            ElseIf blocksReminder < 3 And reminder > verticalStep Then
+                createLastDrenageLayer(corridorState, subAsName, drenageName, soilName, geotextileName, wallWidth, verticalStep, wallBackHeight, faceAngle, drenageWidth, drenageSlope, flipValue, insertPoint, geotxtOverlap, i, hasTargetOffset, hasTargetElevation, isFirst, verticalStep)
+                reminder -= verticalStep
+                elevatP += verticalStep
+                offsetP += dX
+                insertPoint.Offset = offsetP
+                insertPoint.Elevation = elevatP
+                createLastDrenageLayer(corridorState, subAsName, drenageName, soilName, geotextileName, wallWidth, verticalStep, wallBackHeight, faceAngle, drenageWidth, drenageSlope, flipValue, insertPoint, geotxtOverlap, i, hasTargetOffset, hasTargetElevation, isFirst, reminder)
+            ElseIf blocksReminder >= 3 Then
+                createLastDrenageLayer(corridorState, subAsName, drenageName, soilName, geotextileName, wallWidth, verticalStep, wallBackHeight, faceAngle, drenageWidth, drenageSlope, flipValue, insertPoint, geotxtOverlap, i, hasTargetOffset, False, isFirst, blockHeight)
+                reminder -= blockHeight
+                elevatP += blockHeight
+                offsetP += blockHeight * Math.Tan(faceAngle * Math.PI / 180) * flipValue
+                insertPoint.Offset = offsetP
+                insertPoint.Elevation = elevatP
+                i += 1
+                'добавляем еще один слой решетки
+                gridlayers(corridorState, i, insertPoint, flipValue, gridWidth, gridNameRE580, gridNameRE570, gridNameRE560, gridNameRE540, gridNameRE520, RE580Count, RE570Count, RE560Count, RE540Count, RE520Count) 'добавляем слой георешетки
+                createLastDrenageLayer(corridorState, subAsName, drenageName, soilName, geotextileName, wallWidth, verticalStep, wallBackHeight, faceAngle, drenageWidth, drenageSlope, flipValue, insertPoint, geotxtOverlap, i, hasTargetOffset, hasTargetElevation, isFirst, reminder)
+            Else
+                Throw New Exception("какая-то лажа с верхними слоями армогрунта")
+            End If
+        End If
+    End Sub
+    'создание георешетки
+    Private Sub createGeogrid(ByVal corridorState As CorridorState,
+                              ByVal linkName As String,
+                              ByVal geogridWidth As Double,
+                              ByVal flipValue As Double,
+                              ByVal pointToInsert As PointInMem)
+        '---------------------------------------------------------
+        ' создание точек и связи между ними
+        '---------------------------------------------------------
+        Dim blueCon As String = "Коннектор"
+
+        Dim geogridPoints As PointCollection
+        geogridPoints = corridorState.Points
+
+        Dim geogridLinks As LinkCollection
+        geogridLinks = corridorState.Links
+
+        Dim gridPoint1 As Point
+        Dim gridPoint2 As Point
+        Dim gridLink As Link
+
+        Dim gridF As String() = {linkName + "_лицевая", blueCon}
+
+        gridPoint1 = geogridPoints.Add(pointToInsert.Offset, pointToInsert.Elevation, gridF)
+        gridPoint2 = geogridPoints.Add(pointToInsert.Offset + geogridWidth * flipValue, pointToInsert.Elevation, linkName + "_тыльная")
+        gridLink = geogridLinks.Add(gridPoint1, gridPoint2, linkName)
+
+    End Sub
+    'добавление соответствующего слоя георешетки
+    Private Sub gridlayers(ByVal corridorstate As CorridorState,
+                           ByVal i As Integer,
+                           ByVal insertPoint As PointInMem,
+                           ByVal flipValue As Double,
+                           ByVal gridWidth As Double,
+                           ByVal gridNameRE580 As String,
+                           ByVal gridNameRE570 As String,
+                           ByVal gridNameRE560 As String,
+                           ByVal gridNameRE540 As String,
+                           ByVal gridNameRE520 As String,
+                           ByVal RE580Count As Long,
+                           ByVal RE570Count As Long,
+                           ByVal RE560Count As Long,
+                           ByVal RE540Count As Long,
+                           ByVal RE520Count As Long
+                           )
+        Try 'логика присваивания названия слоя
+            If i <= RE580Count Then
+                'linkName = subAsName + " " + i.ToString + "_RE580"
+                createGeogrid(corridorstate, gridNameRE580, gridWidth, flipValue, insertPoint)
+            ElseIf RE580Count < i And i <= RE580Count + RE570Count Then
+                'linkName = subAsName + " " + i.ToString + "_RE570"
+                createGeogrid(corridorstate, gridNameRE570, gridWidth, flipValue, insertPoint)
+            ElseIf RE580Count + RE570Count < i And i <= RE580Count + RE570Count + RE560Count Then
+                'linkName = subAsName + " " + i.ToString + "_RE560"
+                createGeogrid(corridorstate, gridNameRE560, gridWidth, flipValue, insertPoint)
+            ElseIf RE580Count + RE570Count + RE560Count < i And i <= RE580Count + RE570Count + RE560Count + RE540Count Then
+                'linkName = subAsName + " " + i.ToString + "_RE540"
+                createGeogrid(corridorstate, gridNameRE540, gridWidth, flipValue, insertPoint)
+            ElseIf RE580Count + RE570Count + RE560Count + RE540Count < i And i <= RE580Count + RE570Count + RE560Count + RE540Count + RE520Count Then
+                'linkName = subAsName + " " + i.ToString + "_RE520"
+                createGeogrid(corridorstate, gridNameRE520, gridWidth, flipValue, insertPoint)
+            End If
+        Catch
+            Utilities.RecordWarning(corridorstate, CorridorError.None, "no reinforcement", "ReinfSoilArray")
+        End Try
+    End Sub
+
+    'создание самого нижнего слоя
+    Private Sub createLowerLayer(ByVal corridorState As CorridorState,
+                                 ByVal subAsName As String,
+                                 ByVal soilName As String,
+                                 ByVal soilWidth As Double,
+                                 ByVal layerHeight As Double,
+                                 ByVal faceAngle As Double,
+                                 ByVal flipValue As Double,
+                                 ByVal pointToInsert As PointInMem,
+                                 ByVal layerCounter As Integer,
+                                 ByVal hasTargetOffset As Boolean
+                                 )
+        '----------------------------
+        'sand before first grid
+        '----------------------------
+        Dim faceSlope As Double = faceAngle * (Math.PI / 180)
+        Dim fSOffset As Double = layerHeight * Tan(faceSlope) * flipValue 'firstStepOffset
+        'создание коллекций для точек и связей
+        Dim sandPoints As PointCollection = corridorState.Points
+        Dim sandLinks As LinkCollection = corridorState.Links
+        Dim sandShapes As ShapeCollection = corridorState.Shapes
+
+        Dim sandPoint1 As Point
+        Dim sandPoint2 As Point
+        Dim sandPoint3 As Point
+        Dim sandPoint4 As Point
+
+        Dim sandLink1 As Link
+        Dim sandLink2 As Link
+        Dim sandLink3 As Link
+        Dim sandLink4 As Link
+
+        Dim sandShape1 As Shape
+        'имена точек при построении сечения
+        Dim sandPointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 1
+        Dim sandPointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 2
+        Dim sandPointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 3
+        Dim sandPointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 4
+        'имена связей при построении сечения
+        Dim sandLinkName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandUpBase"
+        Dim sandLinkName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandDownBase"
+        'создание точек контура песка
+        sandPoint1 = sandPoints.Add(pointToInsert.Offset, pointToInsert.Elevation, sandPointName1)
+        sandPoint2 = sandPoints.Add(sandPoint1.Offset + fSOffset, sandPoint1.Elevation + layerHeight, sandPointName2)
+        'проверка наличия цели для отступа(ширины стены)
+        If hasTargetOffset Then
+            sandPoint3 = sandPoints.Add(soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(soilWidth, sandPoint1.Elevation, sandPointName4)
+        Else
+            sandPoint3 = sandPoints.Add(sandPoint2.Offset + soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(sandPoint1.Offset + soilWidth, sandPoint1.Elevation, sandPointName4)
+        End If
+        'создание линий контура песка
+        sandLink1 = sandLinks.Add(sandPoint1, sandPoint2, soilName)
+        sandLink2 = sandLinks.Add(sandPoint2, sandPoint3, "Низ дренирующего грунта")
+        sandLink3 = sandLinks.Add(sandPoint3, sandPoint4, soilName)
+        sandLink4 = sandLinks.Add(sandPoint4, sandPoint1, soilName)
+        ' создание заполнения контура песка
+        sandShape1 = sandShapes.Add(sandLink1, sandLink2, sandLink3, sandLink4, soilName)
+    End Sub
+    'создание слоя засыпки дренирующим грунтом
+    Private Sub createNonDrenageLayer(ByVal corridorState As CorridorState,
+                                      ByVal subAsName As String,
+                                      ByVal soilName As String,
+                                      ByVal soilWidth As Double,
+                                      ByVal layerHeight As Double,
+                                      ByVal faceAngle As Double,
+                                      ByVal drenageWidth As Double,
+                                      ByVal flipValue As Double,
+                                      ByVal pointToInsert As PointInMem,
+                                      ByVal geotxtOverlap As Double,
+                                      ByVal geotextileName As String,
+                                      ByVal layerCounter As Integer,
+                                      ByVal hasTargetOffset As Boolean,
+                                      ByVal isLastlayer As Boolean,
+                                      ByVal isAnyDrenageLayers As Boolean
+                                      )
+        '----------------------------
+        'sand layer
+        '----------------------------
+        'вычисляем вспомогательные параметры
+        Dim faceSlope As Double = faceAngle * (Math.PI / 180)
+        Dim SOffset As Double = layerHeight * Tan(faceSlope) * flipValue 'layerStepOffset
+        'создание коллекций для точек,связей и форм
+        Dim sandPoints As PointCollection = corridorState.Points
+        Dim sandLinks As LinkCollection = corridorState.Links
+        Dim sandShapes As ShapeCollection = corridorState.Shapes
+
+        Dim sandPoint1 As Point
+        Dim sandPoint2 As Point
+        Dim sandPoint3 As Point
+        Dim sandPoint4 As Point
+
+        Dim sandLink1 As Link
+        Dim sandLink2 As Link
+        Dim sandLink3 As Link
+        Dim sandLink4 As Link
+
+        Dim sandShape1 As Shape
+        'имена точек при построении сечения
+        Dim sandPointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 1
+        Dim sandPointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 2
+        Dim sandPointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 3
+        Dim sandPointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 4
+        'имена связей при построении сечения
+        'Dim sandLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "sandUpBase"
+        'Dim sandLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "sandDownBase"
+        'создание точек контура песка
+        sandPoint1 = sandPoints.Add(pointToInsert.Offset, pointToInsert.Elevation, sandPointName1)
+        sandPoint2 = sandPoints.Add(sandPoint1.Offset + SOffset, sandPoint1.Elevation + layerHeight, sandPointName2)
+        'проверка наличия цели для отступа(ширины стены)
+        If hasTargetOffset Then
+            sandPoint3 = sandPoints.Add(soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(soilWidth, sandPoint1.Elevation, sandPointName4)
+        Else
+            sandPoint3 = sandPoints.Add(sandPoint2.Offset + soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(sandPoint1.Offset + soilWidth, sandPoint1.Elevation, sandPointName4)
+        End If
+        'создание линий контура песка
+        sandLink1 = sandLinks.Add(sandPoint1, sandPoint2, soilName)
+        sandLink2 = sandLinks.Add(sandPoint2, sandPoint3, "")
+        sandLink3 = sandLinks.Add(sandPoint3, sandPoint4, soilName)
+        sandLink4 = sandLinks.Add(sandPoint4, sandPoint1, "")
+        ' создание заполнения контура песка
+        sandShape1 = sandShapes.Add(sandLink1, sandLink2, sandLink3, sandLink4, soilName)
+        '-------------------------
+        'geotextile
+        '-------------------------
+        'вычисляем вспомогательные параметры
+        Dim gtxtOffset = geotxtOverlap * flipValue
+        'создание коллекций для точек и связей
+        Dim geotxtPoints As PointCollection = corridorState.Points
+        Dim geotxtLinks As LinkCollection = corridorState.Links
+        'объявим точки для геотекстиля
+        Dim geotextilePoint1 As Point
+        Dim geotextilePoint2 As Point
+        Dim geotextilePoint3 As Point
+        Dim geotextilePoint4 As Point
+        'объявим связи для геотекстиля
+        Dim geotextileLink1 As Link
+        Dim geotextileLink2 As Link
+        Dim geotextileLink3 As Link
+
+        Dim geotextilePointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 1
+        Dim geotextilePointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 2
+        Dim geotextilePointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 3
+        Dim geotextilePointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 4
+
+        geotextilePoint1 = geotxtPoints.Add(sandPoint1.Offset + gtxtOffset, sandPoint1.Elevation, geotextilePointName1)
+        geotextilePoint2 = geotxtPoints.Add(sandPoint1.Offset, sandPoint1.Elevation, geotextilePointName2)
+        geotextilePoint3 = geotxtPoints.Add(sandPoint2.Offset, sandPoint2.Elevation, geotextilePointName3)
+        'проверка наличия сверху слоя с дренажом
+        If isLastlayer And isAnyDrenageLayers Then
+            geotextilePoint4 = geotxtPoints.Add(sandPoint2.Offset + gtxtOffset + drenageWidth * flipValue, sandPoint2.Elevation, geotextilePointName4)
+        Else
+            geotextilePoint4 = geotxtPoints.Add(sandPoint2.Offset + gtxtOffset, sandPoint2.Elevation, geotextilePointName4)
+        End If
+        'Dim geotextileLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "geotextileUp"
+        'Dim geotextileLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "geotextileDown"
+
+        geotextileLink1 = geotxtLinks.Add(geotextilePoint1, geotextilePoint2, geotextileName)
+        geotextileLink2 = geotxtLinks.Add(geotextilePoint2, geotextilePoint3, geotextileName)
+        geotextileLink3 = geotxtLinks.Add(geotextilePoint3, geotextilePoint4, geotextileName)
+    End Sub
+    'создание слоя засыпки с пристеночным дренажом
+    Private Sub createDrenageLayer(ByVal corridorState As CorridorState,
+                                   ByVal subAsName As String,
+                                   ByVal drenageName As String,
+                                   ByVal soilName As String,
+                                   ByVal gtxtName As String,
+                                   ByVal soilWidth As Double,
+                                   ByVal layerHeight As Double,
+                                   ByVal faceAngle As Double,
+                                   ByVal drenageWidth As Double,
+                                   ByVal drenageSlope As Double,
+                                   ByVal flipValue As Double,
+                                   ByVal pointToInsert As PointInMem,
+                                   ByVal geotxtOverlap As Double,
+                                   ByVal layerCounter As Integer,
+                                   ByVal hasTargetOffset As Boolean,
+                                   ByVal isFirstlayer As Boolean,
+                                   ByVal pipeStep As Double,
+                                   ByVal pipeSlope As Double,
+                                   ByVal pipeDiameter As Double
+                                   )
+        'вычисляем вспомогательные параметры
+        Dim faceSlope As Double = faceAngle * (Math.PI / 180)
+        Dim fOffset As Double = layerHeight * Math.Tan(faceSlope) * flipValue 'layer FaceOffset
+        Dim dOffset As Double = layerHeight * drenageSlope * flipValue 'layer DrenageOffset
+        Dim gOffset As Double = drenageWidth * flipValue 'gravel offset
+        Dim gtxtOffset = geotxtOverlap * flipValue 'перехлест геотекстиля
+        '----------------------------
+        'drenage layer
+        '----------------------------
+        'объявляем коллекции элементов
+        Dim drenagePoints As PointCollection = corridorState.Points
+        Dim drenageLinks As LinkCollection = corridorState.Links
+        Dim drenageShapes As ShapeCollection = corridorState.Shapes
+        'имена точек щебня
+        Dim drPointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 1
+        Dim drPointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 2
+        Dim drPointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 3
+        Dim drPointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 4
+        'строим слой по точкам
+        Dim drPoint1 = drenagePoints.Add(pointToInsert.Offset, pointToInsert.Elevation, drPointName1)
+        Dim drPoint2 = drenagePoints.Add(drPoint1.Offset + fOffset, drPoint1.Elevation + layerHeight, drPointName2)
+        Dim drPoint3 = drenagePoints.Add(drPoint1.Offset + gOffset + dOffset, drPoint2.Elevation, drPointName3)
+        Dim drPoint4 = drenagePoints.Add(pointToInsert.Offset + gOffset, pointToInsert.Elevation, drPointName4)
+        'declare description for links
+        Dim drLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "gravelUp"
+        Dim drLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "Drenagelayer"
+        'create links of gravel layer
+        Dim drLink1 = drenageLinks.Add(drPoint1, drPoint2, drenageName)
+        Dim drLink2 = drenageLinks.Add(drPoint2, drPoint3, drenageName)
+        Dim drLink3 = drenageLinks.Add(drPoint3, drPoint4, drenageName)
+        Dim drLink4 = drenageLinks.Add(drPoint1, drPoint4, drenageName)
+        'create shape for gravel layer
+        Dim drShapeName As String = "" 'subAsName & "_" & drenageName '& CStr(grNumber)
+        Dim drShape = drenageShapes.Add(drLink1, drLink2, drLink3, drLink4, drenageName)
+        '----------------------------
+        'sand layer
+        '----------------------------
+        'создание коллекций для точек и связей
+        Dim sandPoints As PointCollection = corridorState.Points
+        Dim sandLinks As LinkCollection = corridorState.Links
+        Dim sandShapes As ShapeCollection = corridorState.Shapes
+
+        Dim sandPoint1 As Point
+        Dim sandPoint2 As Point
+        Dim sandPoint3 As Point
+        Dim sandPoint4 As Point
+
+        Dim sandLink1 As Link
+        Dim sandLink2 As Link
+        Dim sandLink3 As Link
+        Dim sandLink4 As Link
+
+        Dim sandShape As Shape
+        'имена точек при построении сечения
+        Dim sandPointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 1
+        Dim sandPointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 2
+        Dim sandPointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 3
+        Dim sandPointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 4
+        'имена связей при построении сечения
+        Dim sandLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "sandUpBase"
+        Dim sandLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "sandDownBase"
+        'создание точек контура песка
+        sandPoint1 = sandPoints.Add(drPoint4.Offset, drPoint4.Elevation, sandPointName1)
+        sandPoint2 = sandPoints.Add(drPoint3.Offset, drPoint3.Elevation, sandPointName2)
+        'проверка наличия цели для отступа(ширины стены)
+        If hasTargetOffset Then
+            sandPoint3 = sandPoints.Add(soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(soilWidth, sandPoint1.Elevation, sandPointName4)
+        Else
+            sandPoint3 = sandPoints.Add(drPoint2.Offset + soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(drPoint1.Offset + soilWidth, sandPoint1.Elevation, sandPointName4)
+        End If
+        'создание линий контура песка
+        sandLink1 = sandLinks.Add(sandPoint1, sandPoint2, "")
+        sandLink2 = sandLinks.Add(sandPoint2, sandPoint3, "")
+        sandLink3 = sandLinks.Add(sandPoint3, sandPoint4, soilName)
+        sandLink4 = sandLinks.Add(sandPoint4, sandPoint1, "")
+        ' создание заполнения контура песка
+        sandShape = sandShapes.Add(sandLink1, sandLink2, sandLink3, sandLink4, soilName)
+        '-------------------------
+        'geotextile
+        '-------------------------
+        Dim geotxtPoints As PointCollection = corridorState.Points
+        Dim geotxtLinks As LinkCollection = corridorState.Links
+        'объявим точки для геотекстиля
+        Dim geotextilePoint1 As Point
+        Dim geotextilePoint2 As Point
+        Dim geotextilePoint3 As Point
+        Dim geotextilePoint4 As Point
+        'объявим связи для геотекстиля
+        Dim geotextileLink1 As Link
+        Dim geotextileLink2 As Link
+        Dim geotextileLink3 As Link
+
+        Dim geotextilePointName1 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 1
+        Dim geotextilePointName2 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 2
+        Dim geotextilePointName3 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 3
+        Dim geotextilePointName4 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 4
+        'проверка наличия сверху слоя с дренажом
+        If isFirstlayer Then
+            geotextilePoint1 = geotxtPoints.Add(sandPoint1.Offset + gtxtOffset, sandPoint1.Elevation, geotextilePointName1)
+        Else
+            geotextilePoint1 = geotxtPoints.Add(sandPoint1.Offset + gtxtOffset + dOffset - fOffset, sandPoint1.Elevation, geotextilePointName1)
+        End If
+        geotextilePoint2 = geotxtPoints.Add(sandPoint1.Offset, sandPoint1.Elevation, geotextilePointName2)
+        geotextilePoint3 = geotxtPoints.Add(sandPoint2.Offset, sandPoint2.Elevation, geotextilePointName3)
+        geotextilePoint4 = geotxtPoints.Add(sandPoint2.Offset + gtxtOffset, sandPoint2.Elevation, geotextilePointName4)
+
+        Dim geotextileLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "geotextileUp"
+        Dim geotextileLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "geotextileDown"
+
+        geotextileLink1 = geotxtLinks.Add(geotextilePoint1, geotextilePoint2, gtxtName)
+        geotextileLink2 = geotxtLinks.Add(geotextilePoint2, geotextilePoint3, gtxtName)
+        geotextileLink3 = geotxtLinks.Add(geotextilePoint3, geotextilePoint4, gtxtName)
+
+        If isFirstlayer Then 'создание дренажной трубы и геомембраны в основании пристеночного дренажа
+            Dim dPoint As Point
+            createPipeAxis(corridorState, pipeStep, pipeSlope, pointToInsert, dPoint, pipeDiameter, flipValue)
+            createPipe(corridorState, dPoint, pipeDiameter)
+            createGeomembrane(corridorState, pointToInsert, pipeDiameter, drenageWidth, layerHeight, drenageSlope, dFaceAngleDefault, flipValue)
+        End If
+    End Sub
+    'создание слоя засыпки с пристеночным дренажом самого верхнего слоя (с возможностью задать перехлест геотекстиля с нижне лежащим слоем) 
+    Private Sub createLastDrenageLayer(ByVal corridorState As CorridorState,
+                                   ByVal subAsName As String,
+                                   ByVal drenageName As String,
+                                   ByVal soilName As String,
+                                   ByVal gtxtName As String,
+                                   ByVal soilWidth As Double,
+                                   ByVal layerHeight As Double, 'высота стандартного слоя
+                                   ByVal wallHeightBack As Double,
+                                   ByVal faceAngle As Double,
+                                   ByVal drenageWidth As Double,
+                                   ByVal drenageSlope As Double,
+                                   ByVal flipValue As Double,
+                                   ByVal pointToInsert As PointInMem,
+                                   ByVal geotxtOverlap As Double,
+                                   ByVal layerCounter As Integer,
+                                   ByVal hasTargetOffset As Boolean,
+                                   ByVal hasTargetElev As Boolean,
+                                   ByVal isFirstlayer As Boolean,
+                                   ByVal lastHeight As Double 'высота последнего слоя
+                                   )
+        'вычисляем вспомогательные параметры
+        Dim faceSlope As Double = faceAngle * (Math.PI / 180)
+        Dim fOffset As Double = lastHeight * Math.Tan(faceSlope) * flipValue 'last layer FaceOffset
+        Dim dOffset As Double = lastHeight * drenageSlope * flipValue 'layer DrenageOffset
+        Dim gOffset As Double = drenageWidth * flipValue 'gravel offset
+        Dim gtxtOffset = geotxtOverlap * flipValue 'перехлест геотекстиля
+        Dim gtxtLow As Double = (layerHeight * drenageSlope) * flipValue
+        Dim gtxtTop As Double = (drenageWidth + dOffset) * flipValue
+        Dim fOffsetLow As Double = layerHeight * Math.Tan(faceSlope) * flipValue 'layer FaceOffset
+        '----------------------------
+        'drenage layer
+        '----------------------------
+        'объявляем коллекции элементов
+        Dim drenagePoints As PointCollection = corridorState.Points
+        Dim drenageLinks As LinkCollection = corridorState.Links
+        Dim drenageShapes As ShapeCollection = corridorState.Shapes
+        'имена точек щебня
+        Dim drPointName1 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 1
+        Dim drPointName2 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 2
+        Dim drPointName3 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 3
+        Dim drPointName4 As String = "" ' subAsName & "_" & CStr(layerCounter) & "_" & "gravel" & 4
+        'строим слой по точкам
+        Dim drPoint1 = drenagePoints.Add(pointToInsert.Offset, pointToInsert.Elevation, drPointName1)
+        Dim drPoint2 = drenagePoints.Add(drPoint1.Offset + fOffset, drPoint1.Elevation + lastHeight, drPointName2)
+        Dim drPoint3 = drenagePoints.Add(drPoint1.Offset + gOffset + dOffset, drPoint2.Elevation, drPointName3)
+        Dim drPoint4 = drenagePoints.Add(pointToInsert.Offset + gOffset, pointToInsert.Elevation, drPointName4)
+        'declare description for links
+        'Dim drLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "gravelUp"
+        'Dim drLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "Drenagelayer"
+        'create links of gravel layer
+        Dim drLink1 = drenageLinks.Add(drPoint1, drPoint2, drenageName)
+        Dim drLink2 = drenageLinks.Add(drPoint2, drPoint3, drenageName)
+        Dim drLink3 = drenageLinks.Add(drPoint3, drPoint4, drenageName)
+        Dim drLink4 = drenageLinks.Add(drPoint1, drPoint4, drenageName)
+        'create shape for gravel layer
+        'Dim drShapeName As String = subAsName & "_" & drenageName '& CStr(grNumber)
+        Dim drShape = drenageShapes.Add(drLink1, drLink2, drLink3, drLink4, drenageName)
+        '----------------------------
+        'sand layer
+        '----------------------------
+        'создание коллекций для точек и связей
+        Dim sandPoints As PointCollection = corridorState.Points
+        Dim sandLinks As LinkCollection = corridorState.Links
+        Dim sandShapes As ShapeCollection = corridorState.Shapes
+
+        Dim sandPoint1 As Point
+        Dim sandPoint2 As Point
+        Dim sandPoint3 As Point
+        Dim sandPoint4 As Point
+
+        Dim sandLink1 As Link
+        Dim sandLink2 As Link
+        Dim sandLink3 As Link
+        Dim sandLink4 As Link
+
+        Dim sandShape As Shape
+        'имена точек при построении сечения
+        Dim sandPointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 1
+        Dim sandPointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 2
+        Dim sandPointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 3
+        Dim sandPointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 4
+        'имена связей при построении сечения
+        Dim sandLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "sandUpBase"
+        Dim sandLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "sandDownBase"
+        'создание точек контура песка
+        sandPoint1 = sandPoints.Add(drPoint4.Offset, drPoint4.Elevation, sandPointName1)
+        sandPoint2 = sandPoints.Add(drPoint3.Offset, drPoint3.Elevation, sandPointName2)
+        'проверка наличия цели для отступа(ширины стены)
+        If hasTargetOffset Then
+            sandPoint3 = sandPoints.Add(soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(soilWidth, sandPoint1.Elevation, sandPointName4)
+        Else
+            sandPoint3 = sandPoints.Add(drPoint2.Offset + soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(drPoint1.Offset + soilWidth, sandPoint1.Elevation, sandPointName4)
+        End If
+        If hasTargetElev Then
+            If wallHeightBack >= sandPoint1.Elevation Then
+                sandPoint3.Elevation = wallHeightBack
+            Else
+                Dim l1 = Abs(lastHeight * (sandPoint3.Offset - sandPoint2.Offset) / (sandPoint2.Elevation - wallHeightBack)) * flipValue
+                sandPoint3.Offset = l1
+                sandPoint3.Elevation = sandPoint1.Elevation + 0.01
+            End If
+        End If
+        'создание линий контура песка
+        sandLink1 = sandLinks.Add(sandPoint1, sandPoint2, soilName)
+        sandLink2 = sandLinks.Add(sandPoint2, sandPoint3, soilName)
+        sandLink3 = sandLinks.Add(sandPoint3, sandPoint4, soilName)
+        sandLink4 = sandLinks.Add(sandPoint4, sandPoint1, "")
+        ' создание заполнения контура песка
+        sandShape = sandShapes.Add(sandLink1, sandLink2, sandLink3, sandLink4, soilName)
+        '-------------------------
+        'geotextile
+        '-------------------------
+        Dim geotxtPoints As PointCollection = corridorState.Points
+        Dim geotxtLinks As LinkCollection = corridorState.Links
+        'объявим точки для геотекстиля
+        Dim geotextilePoint1 As Point
+        Dim geotextilePoint2 As Point
+        Dim geotextilePoint3 As Point
+        Dim geotextilePoint4 As Point
+        Dim geotextilePoint5 As Point
+        Dim geotextilePoint6 As Point
+        'объявим связи для геотекстиля
+        Dim geotextileLink1 As Link
+        Dim geotextileLink2 As Link
+        Dim geotextileLink3 As Link
+        Dim geotextileLink4 As Link
+
+        Dim geotextilePointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 1
+        Dim geotextilePointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 2
+        Dim geotextilePointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 3
+        Dim geotextilePointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 4
+        'Dim geotextilePointName5 As String = subAsName & "_" & "geotextile" & 5
+        'Dim geotextilePointName6 As String = subAsName & "_" & "geotextile" & 6
+
+        'проверка наличия сверху слоя с дренажом
+        If isFirstlayer Then
+            geotextilePoint1 = geotxtPoints.Add(sandPoint1.Offset + gtxtOffset, sandPoint1.Elevation, geotextilePointName1)
+        Else
+            geotextilePoint1 = geotxtPoints.Add(sandPoint1.Offset + (gtxtOffset + gtxtLow) - fOffsetLow, sandPoint1.Elevation, geotextilePointName1)
+        End If
+        geotextilePoint2 = geotxtPoints.Add(sandPoint1.Offset, sandPoint1.Elevation, geotextilePointName2)
+        geotextilePoint3 = geotxtPoints.Add(sandPoint2.Offset, sandPoint2.Elevation, geotextilePointName3)
+        geotextilePoint4 = geotxtPoints.Add(sandPoint2.Offset + gtxtOffset, sandPoint2.Elevation, geotextilePointName4)
+        'geotextilePoint5 = geotxtPoints.Add(geotextilePoint4.Offset, geotextilePoint4.Elevation, geotextilePointName5)
+        ' geotextilePoint6 = geotxtPoints.Add(geotextilePoint5.Offset - (gtxtOffset + gtxtTop), geotextilePoint5.Elevation, geotextilePointName6)
+
+
+        Dim geotextileLinkName1 As String = subAsName & "_" & CStr(layerCounter) & "_" & "geotextileUp"
+        Dim geotextileLinkName2 As String = subAsName & "_" & CStr(layerCounter) & "_" & "geotextileDown"
+        Dim geotextileLinkName3 As String = subAsName & "_" & "geotextileTop"
+
+        geotextileLink1 = geotxtLinks.Add(geotextilePoint1, geotextilePoint2, gtxtName)
+        geotextileLink2 = geotxtLinks.Add(geotextilePoint2, geotextilePoint3, gtxtName)
+        geotextileLink3 = geotxtLinks.Add(geotextilePoint3, geotextilePoint4, gtxtName)
+
+        'geotextileLink4 = geotxtLinks.Add(geotextilePoint5, geotextilePoint6, geotextileLinkName3)
+    End Sub
+    'создание слоя засыпки дренирующим грунтом самого верхнего слоя
+    Private Sub createLastNonDrenageLayer(ByVal corridorState As CorridorState,
+                                      ByVal soilName As String,
+                                      ByVal soilWidth As Double,
+                                      ByVal layerHeight As Double,
+                                      ByVal layerHeightBack As Double,
+                                      ByVal flipValue As Double,
+                                      ByVal pointToInsert As PointInMem,
+                                      ByVal geotxtOverlap As Double,
+                                      ByVal geotextileName As String,
+                                      ByVal hasTargetOffset As Boolean,
+                                      ByVal hasTargetElev As Boolean
+                                      )
+        '----------------------------
+        'sand layer
+        '----------------------------
+        'создание коллекций для точек,связей и форм
+        Dim sandPoints As PointCollection = corridorState.Points
+        Dim sandLinks As LinkCollection = corridorState.Links
+        Dim sandShapes As ShapeCollection = corridorState.Shapes
+
+        Dim sandPoint1 As Point
+        Dim sandPoint2 As Point
+        Dim sandPoint3 As Point
+        Dim sandPoint4 As Point
+
+        Dim sandLink1 As Link
+        Dim sandLink2 As Link
+        Dim sandLink3 As Link
+        Dim sandLink4 As Link
+
+        Dim sandShape1 As Shape
+        'имена точек при построении сечения
+        Dim sandPointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 1
+        Dim sandPointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 2
+        Dim sandPointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 3
+        Dim sandPointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "sandBase" & 4
+        'создание точек контура песка
+        sandPoint1 = sandPoints.Add(pointToInsert.Offset, pointToInsert.Elevation, sandPointName1)
+        sandPoint2 = sandPoints.Add(sandPoint1.Offset, sandPoint1.Elevation + layerHeight, sandPointName2)
+        'проверка наличия цели для отступа(ширины стены)
+        If hasTargetOffset Then
+            sandPoint3 = sandPoints.Add(soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(soilWidth, sandPoint1.Elevation, sandPointName4)
+        Else
+            sandPoint3 = sandPoints.Add(sandPoint2.Offset + soilWidth, sandPoint2.Elevation, sandPointName3)
+            sandPoint4 = sandPoints.Add(sandPoint1.Offset + soilWidth, sandPoint1.Elevation, sandPointName4)
+        End If
+        'проверка наличия цели для отметки(тыльной точки стены)
+        If hasTargetElev Then
+            sandPoint3.Elevation = layerHeightBack
+        End If
+        'создание линий контура песка
+        sandLink1 = sandLinks.Add(sandPoint1, sandPoint2, soilName)
+        sandLink2 = sandLinks.Add(sandPoint2, sandPoint3, soilName)
+        sandLink3 = sandLinks.Add(sandPoint3, sandPoint4, soilName)
+        sandLink4 = sandLinks.Add(sandPoint4, sandPoint1, "")
+        ' создание заполнения контура песка
+        sandShape1 = sandShapes.Add(sandLink1, sandLink2, sandLink3, sandLink4, soilName)
+        '-------------------------
+        'geotextile
+        '-------------------------
+        'вычисляем вспомогательные параметры
+        Dim gtxtOffset = geotxtOverlap * flipValue
+        'создание коллекций для точек и связей
+        Dim geotxtPoints As PointCollection = corridorState.Points
+        Dim geotxtLinks As LinkCollection = corridorState.Links
+        'объявим точки для геотекстиля
+        Dim geotextilePoint1 As Point
+        Dim geotextilePoint2 As Point
+        Dim geotextilePoint3 As Point
+        Dim geotextilePoint4 As Point
+        'объявим связи для геотекстиля
+        Dim geotextileLink1 As Link
+        Dim geotextileLink2 As Link
+        Dim geotextileLink3 As Link
+
+        Dim geotextilePointName1 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 1
+        Dim geotextilePointName2 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 2
+        Dim geotextilePointName3 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 3
+        Dim geotextilePointName4 As String = "" 'subAsName & "_" & CStr(layerCounter) & "_" & "geotextile" & 4
+
+        geotextilePoint1 = geotxtPoints.Add(sandPoint1.Offset + gtxtOffset, sandPoint1.Elevation, geotextilePointName1)
+        geotextilePoint2 = geotxtPoints.Add(sandPoint1.Offset, sandPoint1.Elevation, geotextilePointName2)
+        geotextilePoint3 = geotxtPoints.Add(sandPoint2.Offset, sandPoint2.Elevation, geotextilePointName3)
+        geotextilePoint4 = geotxtPoints.Add(sandPoint2.Offset + gtxtOffset, sandPoint2.Elevation, geotextilePointName4)
+
+        geotextileLink1 = geotxtLinks.Add(geotextilePoint1, geotextilePoint2, geotextileName)
+        geotextileLink2 = geotxtLinks.Add(geotextilePoint2, geotextilePoint3, geotextileName)
+        geotextileLink3 = geotxtLinks.Add(geotextilePoint3, geotextilePoint4, geotextileName)
+    End Sub
+    '
+    Private Sub createPipeAxis(ByVal corridorState As CorridorState, ByVal pipeStep As Double, ByVal pipeSlope As Double, ByVal insertPoint As PointInMem, ByRef axisPoint As Point, pipeDiam As Double, flip As Double)
+        Dim dPointCollection As PointCollection
+        dPointCollection = corridorState.Points
+        'находим переменные задающие положение трубы в пространстве (вертикальное смещение)
+        'максимально возможная отметка относительно нуля 
+        Dim tH = pipeStep * pipeSlope
+        'дельта отметки для рассматриваемого сечения
+        Dim dH = ((corridorState.CurrentStation - corridorState.CurrentRegionStartStation) Mod 2 * pipeStep) * pipeSlope
+        'направление в котором стоит откладывать дельту в текущем сечении
+        Dim dir = Math.Sin(PI / 2 + ((corridorState.CurrentStation - corridorState.CurrentRegionStartStation) \ pipeStep) * PI)
+        'определяем отметку
+
+        Dim oPipeElev As Double
+        oPipeElev = Math.Abs(tH - dH) + pipeDiam / 2
+
+        axisPoint = dPointCollection.Add(insertPoint.Offset + (pipeDiam / 2 + 0.05) * flip, insertPoint.Elevation + oPipeElev, "Ось дренажной трубы")
+
+    End Sub
+    Private Sub createPipe(ByVal corridorState As CorridorState, cPoint As Point, pDiam As Double)
+        Dim pipePoints As PointCollection
+        pipePoints = corridorState.Points
+        Dim pipeLinks As LinkCollection
+        pipeLinks = corridorState.Links
+        Dim pipeShapes As ShapeCollection
+        pipeShapes = corridorState.Shapes
+        Dim P1 As Point
+        Dim P2 As Point
+        Dim L1 As Link
+        Dim S1 As Autodesk.Civil.DatabaseServices.Shape
+
+        Dim i As Double = 0
+        Dim circleStep = PI / 6
+        Dim links As New List(Of Link)
+        Do While i < 2 * PI
+            If i <> 1.5 * PI Then
+                P1 = pipePoints.Add(cPoint.Offset + Math.Cos(i) * pDiam / 2, cPoint.Elevation + Math.Sin(i) * pDiam / 2, "")
+                P2 = pipePoints.Add(cPoint.Offset + Math.Cos(i + circleStep) * pDiam / 2, cPoint.Elevation + Math.Sin(i + circleStep) * pDiam / 2, "")
+                L1 = pipeLinks.Add(P1, P2, "")
+            Else
+                P1 = pipePoints.Add(cPoint.Offset + Math.Cos(i) * pDiam / 2, cPoint.Elevation + Math.Sin(i) * pDiam / 2, "Низ дренажной трубы")
+                P2 = pipePoints.Add(cPoint.Offset + Math.Cos(i + circleStep) * pDiam / 2, cPoint.Elevation + Math.Sin(i + circleStep) * pDiam / 2, "")
+                L1 = pipeLinks.Add(P1, P2, "")
+            End If
+            links.Add(L1)
+            i += circleStep
+        Loop
+        S1 = pipeShapes.Add(links.ToArray(), "Дренажная труба")
+    End Sub
+    Private Sub createGeomembrane(corridorState As CorridorState, ByVal insertPoint As PointInMem, pDiam As Double, drenageOffset As Double, layerHeight As Double, layerSlope As Double, faceAngle As Double, flip As Double)
+
+        Dim membranePoints As PointCollection
+        membranePoints = corridorState.Points
+        Dim membraneLinks As LinkCollection
+        membraneLinks = corridorState.Links
+
+        Dim P1 As Point
+        Dim P2 As Point
+        Dim P3 As Point
+        Dim P4 As Point
+        Dim L1 As Link
+        Dim L2 As Link
+        Dim L3 As Link
+
+        Dim membraneLow = insertPoint.Elevation
+        Dim membraneHeightFace = 0.3
+        Dim layerTan = 1 / layerSlope
+        Dim faceSlope = faceAngle * Math.PI / 180
+        Dim faceTan = Tan(faceSlope) * flip
+
+        P1 = membranePoints.Add(insertPoint.Offset + membraneHeightFace * faceTan, insertPoint.Elevation + membraneHeightFace, "")
+        P2 = membranePoints.Add(insertPoint.Offset, insertPoint.Elevation, "")
+        P3 = membranePoints.Add(P2.Offset + drenageOffset * flip, P2.Elevation, "")
+        P4 = membranePoints.Add(P3.Offset + layerHeight * layerSlope * flip, P3.Elevation + layerHeight, "")
+
+        Dim membraneName As String = "Геомембрана"
+
+        L1 = membraneLinks.Add(P1, P2, membraneName)
+        L2 = membraneLinks.Add(P2, P3, membraneName)
+        L3 = membraneLinks.Add(P3, P4, membraneName)
+    End Sub
+    Public Sub createPipeAddStations(tm As DBTransactionManager, corridorState As CorridorState, pipeStep As Double, pipeSlope As Double)
+        Dim origin As New PointInMem
+        Dim alignmentId As ObjectId
+        Utilities.GetAlignmentAndOrigin(corridorState, alignmentId, origin)
+        'пробегаем по всей области и находи пикеты "скачка" блоков
+        Dim startSt = corridorState.CurrentRegionStartStation
+        Dim stateStep As Double = 0.001
+        Dim endSt = corridorState.CurrentRegionEndStation
+        Dim stationCurr = startSt
+        Dim sectionsToAdd As New List(Of Double)
+        Dim tH = pipeStep * pipeSlope
+        Do While stationCurr < endSt
+            Dim dH = ((stationCurr - corridorState.CurrentRegionStartStation) Mod pipeStep) * pipeSlope
+            Dim remainder = tH - dH
+            If Math.Abs(remainder) < 0.0001 Then
+                sectionsToAdd.Add(stationCurr)
+                stationCurr += 0.1
+            End If
+            stationCurr += stateStep
+        Loop
+
+        Dim corridor As Corridor
+        corridor = tm.GetObject(corridorState.CurrentCorridorId, OpenMode.ForWrite)
+        Dim baselines As BaselineCollection
+        baselines = corridor.Baselines
+        Dim baseline As Baseline
+        For Each b As Baseline In baselines
+            If corridorState.CurrentProfileId = b.ProfileId Then
+                baseline = b
+                Dim regs As BaselineRegionCollection
+                regs = baseline.BaselineRegions
+                For Each reg As BaselineRegion In regs
+                    If reg.StartStation = corridorState.CurrentRegionStartStation Or reg.EndStation = corridorState.CurrentRegionEndStation Then
+                        'очищаем дополнительные сечения
+                        Dim settings = reg.AppliedAssemblySetting
+                        Dim infos = settings.AdditionalAppliedAssemblies
+                        For Each info In infos
+                            Dim description = "доп.сечения дренажной трубы " + baseline.Name
+                            If info.Description = description Then
+                                reg.DeleteStation(info.Station)
+                            End If
+                        Next
+                        'добавляем новые сечения 
+                        Dim assemblyStations As Double()
+                        assemblyStations = reg.AppliedAssemblies.Stations
+                        'если в точке нет сечения - создаем дополнительное
+                        Dim diff = sectionsToAdd.Except(assemblyStations)
+                        For Each station In diff
+                            Try
+                                reg.AddStation(station, "доп.сечения дренажной трубы " + baseline.Name)
+                            Catch
+
+                            End Try
+                        Next
+                    End If
+                Next
+            End If
+        Next
+    End Sub
+    ''' <summary>
+    ''' Добавляет пары доп. сечений (±0.0005 м) в пикетах где продольный профиль
+    ''' пересекает уровни георешёток. Уровни строятся той же логикой что и в wallCreate:
+    ''' baseLayerStep снизу, затем шаг verticalStep (или verticalStep/2 в зонах
+    ''' двойного армирования), с поправкой смещения при переходе через зону.
+    ''' </summary>
+    Public Sub createSoilAddStations(tm As DBTransactionManager,
+                                  corridorState As CorridorState,
+                                  target As SlopeElevationTarget,
+                                  baseLayerStep As Double,
+                                  verticalStep As Double,
+                                  allLayers As Integer,
+                                  IsDualReinf As Boolean,
+                                  dualReinfCountLow As Long,
+                                  dualReinfCountUp As Long,
+                                  IsAboveDualRtoMid As Boolean)
+
+        Dim origin As New PointInMem
+        Dim alignmentId As ObjectId
+        Utilities.GetAlignmentAndOrigin(corridorState, alignmentId, origin)
+
+        Dim startSt As Double = corridorState.CurrentRegionStartStation
+        Dim endSt As Double = corridorState.CurrentRegionEndStation
+
+        ' --- 1. Строим список ВЫСОТ уровней георешёток (относительно подошвы) ---
+        ' Повторяем логику reinfStep из wallCreate шаг-в-шаг.
+        Dim levelHeights As New List(Of Double)
+        Dim h As Double = baseLayerStep      ' первый уровень — над нижним слоем песка
+        levelHeights.Add(h)
+
+        Dim i As Integer = 1
+        Do While i < allLayers
+            Dim reinfStep As Double
+
+            If IsDualReinf AndAlso i < dualReinfCountLow * 2 Then
+                reinfStep = verticalStep / 2
+            ElseIf IsDualReinf AndAlso i > allLayers - dualReinfCountUp * 2 Then
+                reinfStep = verticalStep / 2
+            Else
+                reinfStep = verticalStep
+            End If
+
+            ' Поправка смещения на стыке зоны двойного армирования (как в wallCreate)
+            If IsDualReinf AndAlso i = dualReinfCountLow * 2 AndAlso IsAboveDualRtoMid Then
+                reinfStep = verticalStep - baseLayerStep
+            ElseIf IsDualReinf AndAlso i = allLayers - dualReinfCountUp * 2 AndAlso dualReinfCountUp > 0 Then
+                reinfStep = verticalStep - baseLayerStep
+            End If
+
+            h += reinfStep
+            levelHeights.Add(h)
+            i += 1
+        Loop
+
+        ' --- 2. Ищем пересечения профиля с каждым уровнем по сегментам ---
+        Dim profileH As Autodesk.Civil.DatabaseServices.Profile =
+        tm.GetObject(target.TargetId, OpenMode.ForRead)
+
+        Dim sectionsToAdd As New List(Of Double)
+
+        For Each ent In profileH.Entities
+
+            If ent.EntityType <> ProfileEntityType.Tangent Then Continue For
+            If ent.StartElevation = ent.EndElevation Then Continue For
+            If ent.EndStation <= startSt OrElse ent.StartStation >= endSt Then Continue For
+
+            Dim segStart As Double = Math.Max(ent.StartStation, startSt)
+            Dim segEnd As Double = Math.Min(ent.EndStation, endSt)
+            Dim segLen As Double = ent.EndStation - ent.StartStation
+            Dim slope As Double = (ent.EndElevation - ent.StartElevation) / segLen  ' абс. отметка / пикет
+
+            ' Высота стены (отметка профиля − отметка оси) на границах рабочего диапазона
+            Dim wallHStart As Double = ent.StartElevation + slope * (segStart - ent.StartStation) - origin.Elevation
+            Dim wallHEnd As Double = ent.StartElevation + slope * (segEnd - ent.StartStation) - origin.Elevation
+
+            Dim hMin As Double = Math.Min(wallHStart, wallHEnd)
+            Dim hMax As Double = Math.Max(wallHStart, wallHEnd)
+
+            For Each levelH As Double In levelHeights
+
+                ' Уровень должен попадать строго внутрь диапазона высот сегмента
+                If levelH <= hMin OrElse levelH >= hMax Then Continue For
+
+                ' Пикет где высота стены = levelH:
+                ' levelH = ent.StartElevation + slope*(st − ent.StartStation) − origin.Elevation
+                Dim stationExact As Double = ent.StartStation +
+                (levelH + origin.Elevation - ent.StartElevation) / slope
+
+                If stationExact <= segStart OrElse stationExact >= segEnd Then Continue For
+
+                Dim stBefore As Double = Math.Round(stationExact - 0.0005, 4)
+                Dim stAfter As Double = Math.Round(stationExact + 0.0005, 4)
+
+                If stBefore > startSt AndAlso Not sectionsToAdd.Contains(stBefore) Then sectionsToAdd.Add(stBefore)
+                If stAfter < endSt AndAlso Not sectionsToAdd.Contains(stAfter) Then sectionsToAdd.Add(stAfter)
+
+            Next
+        Next
+
+        sectionsToAdd.Sort()
+
+        ' --- 3. Запись в коридор с защитой от эха ---
+        Dim corridor As Corridor = tm.GetObject(corridorState.CurrentCorridorId, OpenMode.ForWrite)
+        Dim descSoil As String = "скачок засыпки "
+
+        For Each b As Baseline In corridor.Baselines
+            If corridorState.CurrentProfileId <> b.ProfileId Then Continue For
+
+            For Each reg As BaselineRegion In b.BaselineRegions
+                If reg.StartStation <> startSt AndAlso
+               reg.EndStation <> corridorState.CurrentRegionEndStation Then Continue For
+
+                Dim settings = reg.AppliedAssemblySetting
+                Dim infos = settings.AdditionalAppliedAssemblies
+
+                Dim existingSoil As New List(Of Double)
+                For Each info In infos
+                    If info.Description = descSoil & b.Name Then existingSoil.Add(Math.Round(info.Station, 4))
+                Next
+                existingSoil.Sort()
+
+                Dim identical As Boolean = (existingSoil.Count = sectionsToAdd.Count)
+                If identical Then
+                    For k As Integer = 0 To sectionsToAdd.Count - 1
+                        If Math.Abs(existingSoil(k) - sectionsToAdd(k)) > 0.0001 Then
+                            identical = False : Exit For
+                        End If
+                    Next
+                End If
+                If identical Then Continue For
+
+                For Each info In infos
+                    If info.Description = descSoil & b.Name Then reg.DeleteStation(info.Station)
+                Next
+
+                Dim existingAll As New HashSet(Of Double)(reg.AppliedAssemblies.Stations)
+                For Each st As Double In sectionsToAdd
+                    If existingAll.Contains(st) Then Continue For
+                    Try
+                        reg.AddStation(st, descSoil & b.Name)
+                    Catch
+                    End Try
+                Next
+
+            Next
+        Next
+    End Sub
+
+#End Region
+#Region "Создание облицовки"
+    'создание конструкции
+    Public Sub createFacingTW(ByVal corridorState As CorridorState, ByVal dWallHeight As Double, ByVal flipValue As Double, ByVal blockRows As Integer, ByVal blockVerticalStep As Double, ByVal delHeight As Double, ByVal levelingWidth As Double, ByVal origin As PointInMem, ByRef outputPoint As PointInMem)
+
+        Dim paramsLong As ParamLongCollection
+        paramsLong = corridorState.ParamsLong
+
+        Dim paramsDouble As ParamDoubleCollection
+        paramsDouble = corridorState.ParamsDouble
+
+        'создание облицовочных блоков
+        Dim totalOffset = dWallHeight * dBlockOffset / blockVerticalStep
+        Dim totalHeight = blockRows * blockVerticalStep
+
+        'точки вставки облицовочных блоков
+        Dim newAddPoint As New PointInMem With {
+        .Offset = origin.Offset - totalOffset * flipValue,
+        .Elevation = origin.Elevation
+        }
+        'точка вставки омоноличивания
+        Dim levelingTopPoint As New PointInMem With {
+        .Elevation = origin.Elevation + dWallHeight,
+        .Offset = 0
+        }
+        'точка вывода середины первого блока
+        outputPoint.Offset = newAddPoint.Offset + flipValue * dBlockWidth / 2
+        outputPoint.Elevation = newAddPoint.Elevation
+        Dim i As Integer = 1
+        createLowerBlock(corridorState, newAddPoint, i, flipValue)
+        i += 1
+        Dim topPntAdd As New PointInMem With {
+             .Offset = origin.Offset,
+            .Elevation = origin.Elevation + blockRows * (dBlockHeight + delHeight)
+            }
+        levelingTop(corridorState, levelingTopPoint, topPntAdd, levelingWidth, flipValue)
+        While i <= blockRows
+            newAddPoint.Offset += dBlockOffset * flipValue
+            newAddPoint.Elevation += blockVerticalStep
+            createBlock(corridorState, newAddPoint, i, flipValue)
+            i += 1
+        End While
+        'newAddPoint.Offset += dBlockOffset * flipValue
+        'newAddPoint.Elevation += blockVerticalStep
+
+        'Dim oParam As IParam
+        'oParam = paramsLong.Add("BlocksCount", blockRows)
+        'If oParam IsNot Nothing Then
+        '    oParam.Access = ParamAccessType.Output
+        'End If
+        'oParam = paramsDouble.Add("BlockHeight", dBlockHeight)
+        'If oParam IsNot Nothing Then
+        '    oParam.Access = ParamAccessType.Output
+        'End If
+    End Sub
+    'создание облицовочного блока
+    Public Sub createBlock(corridorState As CorridorState, addPoint As PointInMem, rowNum As Integer, flip As Double)
+        '--------------
+        Dim blockPoints As PointCollection
+        blockPoints = corridorState.Points
+
+        Dim blockLinks As LinkCollection
+        blockLinks = corridorState.Links
+
+        Dim blockShapes As ShapeCollection
+        blockShapes = corridorState.Shapes
+
+        Dim P1 As Point
+        Dim P2 As Point
+        Dim P3 As Point
+        Dim P4 As Point
+        Dim P5 As Point
+        Dim P6 As Point
+        Dim P7 As Point
+        Dim P8 As Point
+        Dim P9 As Point
+        Dim P10 As Point
+        Dim P11 As Point
+        Dim P12 As Point
+        Dim P13 As Point
+        Dim P14 As Point
+        Dim P15 As Point
+        Dim P16 As Point
+
+        'Dim P5 As Point
+
+        Dim L1 As Link
+        Dim L2 As Link
+        Dim L3 As Link
+        Dim L4 As Link
+        Dim L5 As Link
+        Dim L6 As Link
+        Dim L7 As Link
+        Dim L8 As Link
+        Dim L9 As Link
+        Dim L10 As Link
+        Dim L11 As Link
+        Dim L12 As Link
+        Dim L13 As Link
+        Dim L14 As Link
+        Dim L15 As Link
+        Dim L16 As Link
+
+        Dim Shape As Autodesk.Civil.DatabaseServices.Shape
+        '-------------------------------------------------
+        Dim oFillet As Double = 0.01
+
+        P1 = blockPoints.Add(addPoint.Offset + oFillet * flip, addPoint.Elevation, "")
+        P2 = blockPoints.Add(P1.Offset - oFillet * flip, P1.Elevation + oFillet, "")
+        P3 = blockPoints.Add(P2.Offset, P2.Elevation + dBlockHeight - 2 * oFillet, "")
+        P4 = blockPoints.Add(P3.Offset + oFillet * flip, P3.Elevation + oFillet, "")
+        P5 = blockPoints.Add(P3.Offset + 0.045 * flip, P4.Elevation, "")
+        P6 = blockPoints.Add(P5.Offset + 0.009 * flip, P5.Elevation - 0.025, "")
+        P7 = blockPoints.Add(P5.Offset + 0.105 * flip, P6.Elevation, "")
+        P8 = blockPoints.Add(P7.Offset, P5.Elevation, "")
+        P9 = blockPoints.Add(P8.Offset + 0.054 * flip, P8.Elevation, "")
+        P10 = blockPoints.Add(P9.Offset + oFillet * flip, P9.Elevation - oFillet, "")
+        P11 = blockPoints.Add(P10.Offset, P10.Elevation - dBlockHeight + 2 * oFillet, "")
+        P12 = blockPoints.Add(P11.Offset - oFillet * flip, P11.Elevation - oFillet, "")
+        P13 = blockPoints.Add(P12.Offset - 0.111 * flip, P12.Elevation, "")
+        P14 = blockPoints.Add(P13.Offset - 0.009 * flip, P13.Elevation - 0.024, "")
+        P15 = blockPoints.Add(P14.Offset - 0.041 * flip, P14.Elevation, "")
+
+        P16 = blockPoints.Add(P15.Offset - 0.009 * flip, P1.Elevation, "ось раскладки блоков")
+
+        Dim blockName As String = "TW1"
+        Dim blockFace As String = "Лицевая грань блока"
+        Dim nameFace As String() = {blockName, blockFace}
+
+        L1 = blockLinks.Add(P1, P2, nameFace)
+        L2 = blockLinks.Add(P2, P3, nameFace)
+        L3 = blockLinks.Add(P3, P4, nameFace)
+        L4 = blockLinks.Add(P4, P5, blockName)
+        L5 = blockLinks.Add(P5, P6, blockName)
+        L6 = blockLinks.Add(P6, P7, blockName)
+        L7 = blockLinks.Add(P7, P8, blockName)
+        L8 = blockLinks.Add(P8, P9, blockName)
+        L9 = blockLinks.Add(P9, P10, blockName)
+        L10 = blockLinks.Add(P10, P11, blockName)
+        L11 = blockLinks.Add(P11, P12, blockName)
+        L12 = blockLinks.Add(P12, P13, blockName)
+        L13 = blockLinks.Add(P13, P14, blockName)
+        L14 = blockLinks.Add(P14, P15, blockName)
+        L15 = blockLinks.Add(P15, P16, blockName)
+        L16 = blockLinks.Add(P16, P1, blockName)
+
+        'Dim blockName As String = CType(rowNum, String) + "_" + "TW1"
+
+        Dim shapeLinks() = {L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12, L13, L14, L15, L16}
+        Shape = blockShapes.Add(shapeLinks, blockName)
+
+    End Sub
+    'создание нижнего блока
+    Public Sub createLowerBlock(corridorState As CorridorState, addPoint As PointInMem, rowNum As Integer, flip As Double)
+        '--------------
+        Dim blockPoints As PointCollection
+        blockPoints = corridorState.Points
+
+        Dim blockLinks As LinkCollection
+        blockLinks = corridorState.Links
+
+        Dim blockShapes As ShapeCollection
+        blockShapes = corridorState.Shapes
+
+        Dim P1 As Point
+        Dim P2 As Point
+        Dim P3 As Point
+        Dim P4 As Point
+        Dim P5 As Point
+        Dim P6 As Point
+        Dim P7 As Point
+        Dim P8 As Point
+        Dim P9 As Point
+        Dim P10 As Point
+        Dim P11 As Point
+        Dim P12 As Point
+        Dim P13 As Point
+
+        Dim L1 As Link
+        Dim L2 As Link
+        Dim L3 As Link
+        Dim L4 As Link
+        Dim L5 As Link
+        Dim L6 As Link
+        Dim L7 As Link
+        Dim L8 As Link
+        Dim L9 As Link
+        Dim L10 As Link
+        Dim L11 As Link
+        Dim L12 As Link
+
+        Dim Shape As Autodesk.Civil.DatabaseServices.Shape
+        '-------------------------------------------------
+        Dim oFillet As Double = 0.01
+
+        P1 = blockPoints.Add(addPoint.Offset + oFillet * flip, addPoint.Elevation, "")
+        P2 = blockPoints.Add(P1.Offset - oFillet * flip, P1.Elevation + oFillet, "")
+        P3 = blockPoints.Add(P2.Offset, P2.Elevation + dBlockHeight - 2 * oFillet, "")
+        P4 = blockPoints.Add(P3.Offset + oFillet * flip, P3.Elevation + oFillet, "")
+        P5 = blockPoints.Add(P3.Offset + 0.045 * flip, P4.Elevation, "")
+        P6 = blockPoints.Add(P5.Offset + 0.009 * flip, P5.Elevation - 0.025, "")
+        P7 = blockPoints.Add(P5.Offset + 0.105 * flip, P6.Elevation, "")
+        P8 = blockPoints.Add(P7.Offset, P5.Elevation, "")
+        P9 = blockPoints.Add(P8.Offset + 0.054 * flip, P8.Elevation, "")
+        P10 = blockPoints.Add(P9.Offset + oFillet * flip, P9.Elevation - oFillet, "")
+        P11 = blockPoints.Add(P10.Offset, P10.Elevation - dBlockHeight + 2 * oFillet, "")
+        P12 = blockPoints.Add(P11.Offset - oFillet * flip, P11.Elevation - oFillet, "")
+
+        P13 = blockPoints.Add(addPoint.Offset + (dBlockWidth) * flip / 2, addPoint.Elevation, "Ось первого ряда блоков")
+
+        Dim blockName As String = "TW1"
+        Dim blockFace As String = "Лицевая грань блока"
+        Dim nameFace As String() = {blockName, blockFace}
+
+        L1 = blockLinks.Add(P1, P2, nameFace)
+        L2 = blockLinks.Add(P2, P3, nameFace)
+        L3 = blockLinks.Add(P3, P4, nameFace)
+        L4 = blockLinks.Add(P4, P5, blockName)
+        L5 = blockLinks.Add(P5, P6, blockName)
+        L6 = blockLinks.Add(P6, P7, blockName)
+        L7 = blockLinks.Add(P7, P8, blockName)
+        L8 = blockLinks.Add(P8, P9, blockName)
+        L9 = blockLinks.Add(P9, P10, blockName)
+        L10 = blockLinks.Add(P10, P11, blockName)
+        L11 = blockLinks.Add(P11, P12, blockName)
+        L12 = blockLinks.Add(P12, P1, blockName)
+
+
+        Dim shapeLinks() = {L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12}
+        Shape = blockShapes.Add(shapeLinks, blockName)
+
+    End Sub
+    'метод для добавления шага блока
+
+    Public Sub createAddStations(tm As DBTransactionManager,
+                             corridorState As CorridorState,
+                             blockStep As Double,
+                             blockLength As Double,
+                             target As SlopeElevationTarget)
+
+        Dim origin As New PointInMem
+        Dim alignmentId As ObjectId
+        Utilities.GetAlignmentAndOrigin(corridorState, alignmentId, origin)
+
+        Dim startSt As Double = corridorState.CurrentRegionStartStation
+        Dim endSt As Double = corridorState.CurrentRegionEndStation
+        Dim sliceStep As Double = blockLength / 2
+
+        Dim profileH As Autodesk.Civil.DatabaseServices.Profile =
+        tm.GetObject(target.TargetId, OpenMode.ForRead)
+        ''----
+        'Dim diagMsg As String = $"Profile: {profileH.Name}, Entities: {profileH.Entities.Count}, Region: {startSt:F3}-{endSt:F3}"
+        'For Each ent In profileH.Entities
+        '    diagMsg &= $"| Type = {ent.EntityType} Start=({ent.StartStation:F3},{ent.StartElevation:F3}) End=({ent.EndStation:F3},{ent.EndElevation:F3})"
+        'Next
+        'Utilities.RecordWarning(corridorState, CorridorError.LogicalNameNotFound, diagMsg, "createAddStation")
+        '----
+        Dim sectionsToAdd As New List(Of Double)
+        Dim sectionsToAddStep As New List(Of Double)
+
+        For Each ent In profileH.Entities
+
+            If ent.EntityType <> ProfileEntityType.Tangent Then Continue For
+            If ent.StartElevation = ent.EndElevation Then Continue For
+            If ent.EndStation <= startSt Then Continue For
+            If ent.StartStation >= endSt Then Continue For
+
+            Dim segStart As Double = Math.Max(ent.StartStation, startSt)
+            Dim segEnd As Double = Math.Min(ent.EndStation, endSt)
+            Dim segLen As Double = ent.EndStation - ent.StartStation
+            Dim slope As Double = (ent.EndElevation - ent.StartElevation) / segLen
+
+            Dim elevAtSegStart As Double = ent.StartElevation + slope * (segStart - ent.StartStation) - origin.Elevation
+            Dim elevAtSegEnd As Double = ent.StartElevation + slope * (segEnd - ent.StartStation) - origin.Elevation
+
+            Dim levelMin As Double = Math.Min(elevAtSegStart, elevAtSegEnd)
+            Dim levelMax As Double = Math.Max(elevAtSegStart, elevAtSegEnd)
+
+            Dim firstLevel As Integer = CInt(Math.Ceiling(levelMin / blockStep))
+            Dim lastLevel As Integer = CInt(Math.Floor(levelMax / blockStep))
+
+            For level As Integer = firstLevel To lastLevel
+
+                Dim levelH As Double = level * blockStep
+
+                ' Точный пикет пересечения профиля с уровнем
+                Dim stationExact As Double = ent.StartStation +
+                (levelH + origin.Elevation - ent.StartElevation) / slope
+
+                If stationExact <= segStart OrElse stationExact >= segEnd Then Continue For
+
+                ' Вычисляем backSlice и frontSlice — ближайшие границы сетки слева и справа
+                ' Сетка строится от startSt с шагом sliceStep
+                Dim distFromStart As Double = stationExact - startSt
+                Dim gridIndex As Double = Math.Floor(distFromStart / sliceStep)
+
+                Dim backSlice As Double = Math.Round(startSt + gridIndex * sliceStep, 4)
+                Dim frontSlice As Double = Math.Round(startSt + (gridIndex + 1) * sliceStep, 4)
+
+                ' Оба должны быть внутри области и внутри сегмента
+                If backSlice <= startSt Then backSlice = frontSlice
+                If frontSlice >= endSt Then frontSlice = backSlice
+                If backSlice <= startSt AndAlso frontSlice >= endSt Then Continue For
+
+                ' Сравниваем высоты профиля в backSlice и frontSlice — как в оригинале
+                Dim backH As Double = target.GetElevation(alignmentId, backSlice)
+                Dim frontH As Double = target.GetElevation(alignmentId, frontSlice)
+
+                Dim chosenStation As Double
+                If frontH <= backH Then
+                    ' профиль падает — скачок уже произошёл, ставим backSlice
+                    chosenStation = backSlice
+                Else
+                    ' профиль растёт — скачок ещё впереди, ставим frontSlice
+                    chosenStation = frontSlice
+                End If
+
+                If Not sectionsToAdd.Contains(chosenStation) Then
+                    sectionsToAdd.Add(chosenStation)
+                    sectionsToAddStep.Add(Math.Round(chosenStation + 0.001, 4))
+                End If
+
+            Next
+        Next
+
+        sectionsToAdd.Sort()
+        sectionsToAddStep.Sort()
+
+        ' --- Запись в коридор с защитой от эха ---
+        Dim corridor As Corridor = tm.GetObject(corridorState.CurrentCorridorId, OpenMode.ForWrite)
+
+        For Each b As Baseline In corridor.Baselines
+            If corridorState.CurrentProfileId <> b.ProfileId Then Continue For
+
+            For Each reg As BaselineRegion In b.BaselineRegions
+                If reg.StartStation <> startSt AndAlso
+               reg.EndStation <> corridorState.CurrentRegionEndStation Then Continue For
+
+                Dim settings = reg.AppliedAssemblySetting
+                Dim infos = settings.AdditionalAppliedAssemblies
+
+                ' Собираем существующие пикеты наших описаний
+                Dim existing As New List(Of Double)
+                For Each info In infos
+                    If info.Description = "доп.сечения облицовочных блоков " & b.Name OrElse
+                   info.Description = "скачок облицовки " & b.Name Then
+                        existing.Add(Math.Round(info.Station, 4))
+                    End If
+                Next
+                existing.Sort()
+
+                ' Объединённый список для сравнения
+                Dim allNew As New List(Of Double)(sectionsToAdd)
+                allNew.AddRange(sectionsToAddStep)
+                allNew.Sort()
+
+                ' Защита от эха
+                Dim identical As Boolean = (existing.Count = allNew.Count)
+                If identical Then
+                    For k As Integer = 0 To allNew.Count - 1
+                        If Math.Abs(existing(k) - allNew(k)) > 0.0001 Then
+                            identical = False : Exit For
+                        End If
+                    Next
+                End If
+                If identical Then Continue For
+
+                ' Удаляем устаревшие
+                For Each info In infos
+                    If info.Description = "доп.сечения облицовочных блоков " & b.Name OrElse
+                   info.Description = "скачок облицовки " & b.Name Then
+                        reg.DeleteStation(info.Station)
+                    End If
+                Next
+
+                ' Добавляем новые
+                Dim existingAll As New HashSet(Of Double)(reg.AppliedAssemblies.Stations)
+                For Each st As Double In sectionsToAdd
+                    If existingAll.Contains(st) Then Continue For
+                    Try
+                        reg.AddStation(st, "доп.сечения облицовочных блоков " & b.Name)
+                    Catch
+                    End Try
+                Next
+                For Each st As Double In sectionsToAddStep
+                    If existingAll.Contains(st) Then Continue For
+                    Try
+                        reg.AddStation(st, "скачок облицовки " & b.Name)
+                    Catch
+                    End Try
+                Next
+
+            Next
+        Next
+    End Sub
+
+
+
+    'условие для пересчета высоты облицовки (создание ступени)
+    Public Function isStep(tm As DBTransactionManager, corridorState As CorridorState, stationCurr As Double)
+        Dim result As Boolean = False
+        Dim corridor As Corridor
+        corridor = tm.GetObject(corridorState.CurrentCorridorId, OpenMode.ForWrite)
+        Dim baselines As BaselineCollection
+        baselines = corridor.Baselines
+        Dim baseline As Baseline
+        For Each b As Baseline In baselines
+            If corridorState.CurrentProfileId = b.ProfileId Then
+                baseline = b
+                Dim regs As BaselineRegionCollection
+                regs = baseline.BaselineRegions
+                For Each reg As BaselineRegion In regs
+                    If reg.StartStation = corridorState.CurrentRegionStartStation Or reg.EndStation = corridorState.CurrentRegionEndStation Then
+                        'получаем свойства доп сечений
+                        Dim settings = reg.AppliedAssemblySetting
+                        Dim infos = settings.AdditionalAppliedAssemblies
+                        For Each info In infos
+                            Dim description = "скачок облицовки " + baseline.Name
+                            If info.Description = description And stationCurr = info.Station Then
+                                result = True
+                            End If
+                        Next
+                    End If
+                Next
+            End If
+        Next
+        Return result
+    End Function
+    'метод для создания выравнивающей ленты
+    Public Sub levelingTop(ByVal corridorState As CorridorState,
+                           ByVal topPoint As PointInMem,
+                           ByVal lowPoint As PointInMem,
+                           ByVal Width As Double,
+                           ByVal flip As Double)
+        Dim linkName As String = "Выравнивающий слой под МШБ"
+
+        Dim levelPoints As PointCollection
+        levelPoints = corridorState.Points
+
+        Dim levelLinks As LinkCollection
+        levelLinks = corridorState.Links
+
+        Dim levelShapes As ShapeCollection
+        levelShapes = corridorState.Shapes
+
+        Dim oLevelP1 As Point
+        Dim oLevelP2 As Point
+        Dim oLevelP3 As Point
+        Dim oLevelP4 As Point
+
+        Dim oLevelL1 As Link
+        Dim oLevelL2 As Link
+        Dim oLevelL3 As Link
+        Dim oLevelL4 As Link
+
+        Dim oLevelShape As Autodesk.Civil.DatabaseServices.Shape
+        If topPoint.Elevation < lowPoint.Elevation Then
+            topPoint.Elevation = lowPoint.Elevation
+        End If
+        oLevelP1 = levelPoints.Add(0, lowPoint.Elevation, "Низ выравнивающего слоя")
+        oLevelP2 = levelPoints.Add(0, topPoint.Elevation, "Верх выравнивающего слоя")
+        oLevelP3 = levelPoints.Add(oLevelP2.Offset + Width * flip, oLevelP2.Elevation, "")
+        oLevelP4 = levelPoints.Add(oLevelP1.Offset + Width * flip, oLevelP1.Elevation, "")
+
+        oLevelL1 = levelLinks.Add(oLevelP1, oLevelP2, linkName)
+        oLevelL2 = levelLinks.Add(oLevelP2, oLevelP3, linkName)
+        oLevelL3 = levelLinks.Add(oLevelP3, oLevelP4, linkName)
+        oLevelL4 = levelLinks.Add(oLevelP4, oLevelP1, linkName)
+
+        oLevelShape = levelShapes.Add(oLevelL1, oLevelL2, oLevelL3, oLevelL4, linkName)
+    End Sub
+    ''' <summary>
+    ''' Добавляет доп. сечения по целевому профилю облицовки.
+    ''' Ставит пару сечений (-0.0005 / +0.0005) на каждой границе сегментов
+    ''' целевого профиля внутри области. Защита от эха: сравнивает с уже
+    ''' существующими сечениями и пишет в коридор только при реальном изменении.
+    ''' </summary>
+    Public Sub createAddStationsForProfile(tm As DBTransactionManager,
+                                        corridorState As CorridorState,
+                                        target As SlopeElevationTarget)
+
+        Dim origin As New PointInMem
+        Dim alignmentId As ObjectId
+        Utilities.GetAlignmentAndOrigin(corridorState, alignmentId, origin)
+
+        Dim startSt As Double = corridorState.CurrentRegionStartStation
+        Dim endSt As Double = corridorState.CurrentRegionEndStation
+
+        Dim profileH As Autodesk.Civil.DatabaseServices.Profile =
+        tm.GetObject(target.TargetId, OpenMode.ForRead)
+
+        ' --- Вычисляем нужный набор пикетов аналитически ---
+        Dim sectionsToAdd As New List(Of Double)
+
+        For Each ent In profileH.Entities
+
+            ' Только наклонные тангенсы с границами внутри области
+            If ent.EntityType <> ProfileEntityType.Tangent Then Continue For
+            If ent.StartElevation = ent.EndElevation Then Continue For
+
+            ' Граница сегмента — это точка излома профиля.
+            ' Нам интересны StartStation каждого наклонного сегмента:
+            ' именно здесь профиль меняет направление → нужна пара сечений.
+
+            ' Начало сегмента (= конец предыдущего): ставим пару если внутри области
+            Dim stStart As Double = ent.StartStation
+            If stStart > startSt + 0.001 AndAlso stStart < endSt - 0.001 Then
+                Dim stBefore As Double = Math.Round(stStart - 0.0005, 4)
+                Dim stAfter As Double = Math.Round(stStart + 0.0005, 4)
+                If Not sectionsToAdd.Contains(stBefore) Then sectionsToAdd.Add(stBefore)
+                If Not sectionsToAdd.Contains(stAfter) Then sectionsToAdd.Add(stAfter)
+            End If
+
+            ' Конец сегмента: аналогично
+            Dim stEnd As Double = ent.EndStation
+            If stEnd > startSt + 0.001 AndAlso stEnd < endSt - 0.001 Then
+                Dim stBefore As Double = Math.Round(stEnd - 0.0005, 4)
+                Dim stAfter As Double = Math.Round(stEnd + 0.0005, 4)
+                If Not sectionsToAdd.Contains(stBefore) Then sectionsToAdd.Add(stBefore)
+                If Not sectionsToAdd.Contains(stAfter) Then sectionsToAdd.Add(stAfter)
+            End If
+
+        Next
+
+        sectionsToAdd.Sort()
+
+        ' --- Записываем в коридор только при реальном изменении (защита от эха) ---
+        Dim corridor As Corridor = tm.GetObject(corridorState.CurrentCorridorId, OpenMode.ForWrite)
+        Dim descMain As String = "доп.сечения облицовочных блоков "
+        Dim descStep As String = "скачок облицовки "
+
+        For Each b As Baseline In corridor.Baselines
+            If corridorState.CurrentProfileId <> b.ProfileId Then Continue For
+
+            For Each reg As BaselineRegion In b.BaselineRegions
+                If reg.StartStation <> startSt AndAlso
+               reg.EndStation <> corridorState.CurrentRegionEndStation Then Continue For
+
+                Dim settings = reg.AppliedAssemblySetting
+                Dim infos = settings.AdditionalAppliedAssemblies
+
+                ' Собираем уже существующие пикеты наших описаний
+                Dim existingProfile As New List(Of Double)
+                For Each info In infos
+                    If info.Description = descMain & b.Name OrElse
+                   info.Description = descStep & b.Name Then
+                        existingProfile.Add(Math.Round(info.Station, 4))
+                    End If
+                Next
+                existingProfile.Sort()
+
+                ' --- Защита от эха: если наборы совпадают — ничего не делаем ---
+                Dim identical As Boolean = (existingProfile.Count = sectionsToAdd.Count)
+                If identical Then
+                    For k As Integer = 0 To sectionsToAdd.Count - 1
+                        If Math.Abs(existingProfile(k) - sectionsToAdd(k)) > 0.0001 Then
+                            identical = False
+                            Exit For
+                        End If
+                    Next
+                End If
+                If identical Then Continue For  ' реального изменения нет — коридор не трогаем
+
+                ' --- Удаляем устаревшие сечения ---
+                For Each info In infos
+                    If info.Description = descMain & b.Name OrElse
+                   info.Description = descStep & b.Name Then
+                        reg.DeleteStation(info.Station)
+                    End If
+                Next
+
+                ' --- Добавляем новые ---
+                Dim existingAll As New HashSet(Of Double)(reg.AppliedAssemblies.Stations)
+                For Each st As Double In sectionsToAdd
+                    If existingAll.Contains(st) Then Continue For
+                    Try
+                        ' Чётные по индексу (0,2,4...) = "до излома", нечётные = "после"
+                        Dim desc As String = If(sectionsToAdd.IndexOf(st) Mod 2 = 0,
+                                           descMain & b.Name,
+                                           descStep & b.Name)
+                        reg.AddStation(st, desc)
+                    Catch
+                    End Try
+                Next
+
+            Next ' reg
+        Next ' baseline
+    End Sub
+    'метод для определения пикета с первой в данной области ступенью(необходимо для проверки при понижении стены)
+    Public Sub firstStepAtCurrRegion(tm As DBTransactionManager, corridorState As CorridorState, ByRef station As Double)
+        Dim corridor As Corridor
+        corridor = tm.GetObject(corridorState.CurrentCorridorId, OpenMode.ForWrite)
+        Dim baselines As BaselineCollection
+        baselines = corridor.Baselines
+        Dim baseline As Baseline
+        Dim firstStat As Double
+        For Each b As Baseline In baselines
+            If corridorState.CurrentProfileId = b.ProfileId Then
+                baseline = b
+                Dim regs As BaselineRegionCollection
+                regs = baseline.BaselineRegions
+                For Each reg As BaselineRegion In regs
+                    If reg.StartStation = corridorState.CurrentRegionStartStation Or reg.EndStation = corridorState.CurrentRegionEndStation Then
+                        'находим необходимое сечение
+                        Dim settings = reg.AppliedAssemblySetting
+                        Dim infos = settings.AdditionalAppliedAssemblies
+                        For Each info In infos
+                            Dim description = "скачок облицовки " + baseline.Name
+                            If info.Description = description Then
+                                firstStat = info.Station
+                                Exit For
+                            End If
+                        Next
+                    End If
+                Next
+            End If
+        Next
+        station = firstStat
+    End Sub
+#End Region
+#Region "Создание щебеночной подготовки"
+    'метод для создания фундаментного блока
+    Public Sub Foundation(corridorState As CorridorState,
+                                 flip As Double,
+                                 fWidth As Double,
+                                 fHeight As Double,
+                                 blockWidth As Double,
+                                 prepHeight As Double,
+                                 insertPoint As PointInMem,
+                                 oSubAsName As String,
+                                 ByRef outputPoint As PointInMem)
+
+        Dim concLeveling As String = "Цементная подготовка"
+        Dim foundationConcrete As String = "Бетон фундамента"
+        Dim gidro As String = "Гидроизоляция фундамента"
+        Dim plenka As String = "Полиэтиленовая пленка"
+
+        Dim plenkaLength As Double = 1.0
+        '---------------------------------------------------------
+        ' Create points
+        '---------------------------------------------------------
+        'объявляем коллекции точек, связей и форм
+        Dim foundPoints As PointCollection
+        foundPoints = corridorState.Points
+        Dim foundLinks As LinkCollection
+        foundLinks = corridorState.Links
+        Dim Shapes As ShapeCollection
+        Shapes = corridorState.Shapes
+        '------------------------------------
+        Dim preparePoints As PointCollection
+        preparePoints = corridorState.Points
+        Dim prepareLinks As LinkCollection
+        prepareLinks = corridorState.Links
+        '------------------------------------
+        Dim gidroPoints As PointCollection
+        gidroPoints = corridorState.Points
+        Dim gidroLinks As LinkCollection
+        gidroLinks = corridorState.Links
+        '------------------------------------
+        Dim foundatP1 As Point
+        Dim foundatP2 As Point
+        Dim foundatP3 As Point
+        Dim foundatP4 As Point
+        Dim foundatP5 As Point
+        Dim foundatP6 As Point
+        Dim foundatP7 As Point
+        Dim foundatP8 As Point
+
+        Dim gidroP1 As Point
+        Dim gidroP2 As Point
+        Dim gidroP3 As Point
+        Dim gidroP4 As Point
+        Dim gidroP5 As Point
+        Dim gidroP6 As Point
+
+        'Dim helpPoint As Point
+
+        Dim foundatLink1 As Link
+        Dim foundatLink2 As Link
+        Dim foundatLink3 As Link
+        Dim foundatLink4 As Link
+        Dim foundatLink5 As Link
+        Dim foundatLink6 As Link
+        Dim foundatLink7 As Link
+        Dim foundatLink8 As Link
+        Dim gidroL1 As Link
+        Dim gidroL2 As Link
+        Dim gidroL3 As Link
+        Dim gidroL4 As Link
+        Dim gidroL5 As Link
+
+        Dim foundShape As Shape
+        Dim prepareShape As Shape
+        '--------------------------------------------------------
+        'создаем фундамент
+        foundatP1 = foundPoints.Add(insertPoint.Offset, insertPoint.Elevation, "")
+        foundatP2 = foundPoints.Add(foundatP1.Offset + fWidth / 2 * flip, foundatP1.Elevation - prepHeight, "")
+        foundatP3 = foundPoints.Add(foundatP2.Offset, foundatP2.Elevation - fHeight, "")
+        foundatP4 = foundPoints.Add(foundatP3.Offset - fWidth * flip, foundatP3.Elevation, "")
+        foundatP5 = foundPoints.Add(foundatP4.Offset, foundatP4.Elevation + fHeight, "")
+        foundatP6 = foundPoints.Add(foundatP1.Offset, foundatP1.Elevation - fHeight - prepHeight, "Ось фундамента")
+
+        Dim foundGidro As String() = {foundationConcrete, gidro}
+
+        foundatLink1 = foundLinks.Add(foundatP2, foundatP3, foundGidro)
+        foundatLink2 = foundLinks.Add(foundatP3, foundatP4, foundationConcrete)
+        foundatLink3 = foundLinks.Add(foundatP4, foundatP5, foundGidro)
+        foundatLink4 = foundLinks.Add(foundatP5, foundatP2, foundationConcrete)
+
+        Dim fLinks As Link() = {foundatLink1, foundatLink2, foundatLink3, foundatLink4}
+
+        foundShape = Shapes.Add(fLinks, foundationConcrete)
+
+        'Dim off = foundatP1.Offset
+        'Dim ele = foundatP1.Elevation
+
+        'создаем подготовку под блоки
+        foundatP7 = preparePoints.Add(foundatP1.Offset + blockWidth / 2 * flip, foundatP1.Elevation, "")
+        foundatP8 = preparePoints.Add(foundatP1.Offset - blockWidth / 2 * flip, foundatP1.Elevation, "")
+
+        'helpPoint = foundPoints.Add(foundatP7.Offset, foundatP2.Elevation, "")
+        Dim levelGidro As String() = {concLeveling, gidro}
+
+        foundatLink5 = prepareLinks.Add(foundatP2, foundatP7, levelGidro)
+        foundatLink6 = prepareLinks.Add(foundatP7, foundatP8, levelGidro)
+        foundatLink7 = prepareLinks.Add(foundatP8, foundatP5, levelGidro)
+        foundatLink8 = prepareLinks.Add(foundatP5, foundatP2, concLeveling)
+
+        Dim prepLinks As Link() = {foundatLink5, foundatLink6, foundatLink7, foundatLink8}
+        prepareShape = Shapes.Add(prepLinks, concLeveling)
+        'создаем гидроизоляцию
+        gidroP1 = gidroPoints.Add(foundatP4.Offset - 0.001, foundatP4.Elevation, "")
+        gidroP2 = gidroPoints.Add(foundatP5.Offset, foundatP5.Elevation, "")
+        gidroP3 = gidroPoints.Add(foundatP8.Offset, foundatP8.Elevation, "")
+        gidroP4 = gidroPoints.Add(foundatP7.Offset, foundatP7.Elevation, "")
+        gidroP5 = gidroPoints.Add(foundatP2.Offset, foundatP2.Elevation, "")
+        gidroP6 = gidroPoints.Add(foundatP3.Offset + 0.001, foundatP3.Elevation, "")
+
+        gidroL1 = gidroLinks.Add(gidroP1, gidroP2, gidro)
+        gidroL2 = gidroLinks.Add(gidroP2, gidroP3, gidro)
+        gidroL3 = gidroLinks.Add(gidroP3, gidroP4, gidro)
+        gidroL4 = gidroLinks.Add(gidroP4, gidroP5, gidro)
+        gidroL5 = gidroLinks.Add(gidroP5, gidroP6, gidro)
+        'создаем полиэтиленовую подготовку под бетон
+        Dim plenkaP1 As Point = foundPoints.Add(foundatP6.Offset - plenkaLength / 2, foundatP6.Elevation, "")
+        Dim plenkaP2 As Point = foundPoints.Add(foundatP6.Offset + plenkaLength / 2, foundatP6.Elevation, "")
+        Dim plenkaL1 As Link = foundLinks.Add(plenkaP1, plenkaP2, plenka)
+
+        outputPoint.Offset = foundatP2.Offset
+        outputPoint.Elevation = foundatP2.Elevation
+    End Sub
+    'метод для создания щебеночной подушки
+    Public Sub SubBase(corridorState As CorridorState,
+                       flip As Double,
+                       fWidth As Double,
+                       fHeight As Double,
+                       tWidth As Double,
+                       geotextileOverlap As Double,
+                       geogridElev As Double,
+                       blockWidth As Double,
+                       prepHeight As Double,
+                       faceAngle As Double,
+                       insertPoint As PointInMem,
+                       hasTargetOffset As Boolean,
+                       oSubAsName As String)
+
+        Dim gridTXName As String = "Георешетка TX"
+        Dim baseName As String = "Щебень основания"
+        Dim pitName As String = "Котлован"
+        Dim slopeName As String = "Откосы"
+        Dim geotextileName As String = "Геотекстиль"
+        '---------------------------------------------------------
+        'Create points
+        '---------------------------------------------------------
+        'объявляем коллекции точек, связей и форм
+        Dim subPoints As PointCollection = corridorState.Points
+        Dim subLinks As LinkCollection = corridorState.Links
+        Dim Shapes As ShapeCollection
+        Shapes = corridorState.Shapes
+        '------------------------------------
+        Dim gridPoints As PointCollection
+        gridPoints = corridorState.Points
+        Dim gridLinks As LinkCollection
+        gridLinks = corridorState.Links
+        '------------------------------------
+        Dim sandPoints As PointCollection
+        sandPoints = corridorState.Points
+        Dim sandLinks As LinkCollection
+        sandLinks = corridorState.Links
+        '------------------------------------
+        Dim geotxtPoints As PointCollection
+        geotxtPoints = corridorState.Points
+        Dim geotxtLinks As LinkCollection
+        geotxtLinks = corridorState.Links
+        '------------------------------------
+        Dim subP1 As Point
+        Dim subP2 As Point
+        Dim subP3 As Point
+        Dim subP4 As Point
+        Dim subP5 As Point
+        Dim subP6 As Point
+        Dim subP7 As Point
+        Dim subP8 As Point
+        Dim subP9 As Point
+        Dim subP10 As Point
+        Dim subP11 As Point
+        Dim subP12 As Point
+
+        Dim subL1 As Link
+        Dim subL2 As Link
+        Dim subL3 As Link
+        Dim subL4 As Link
+        Dim subL5 As Link
+        Dim subL6 As Link
+        Dim subL7 As Link
+        Dim subL8 As Link
+        Dim subL9 As Link
+        Dim subL10 As Link
+        Dim subL11 As Link
+        Dim subL12 As Link
+
+        Dim geotxtLink13 As Link
+        Dim geotxtLink14 As Link
+        Dim geotxtLink15 As Link
+        Dim geotxtLink16 As Link
+
+        Dim gravShape As Autodesk.Civil.DatabaseServices.Shape
+        Dim faceSlope As Double = faceAngle * (Math.PI / 180)
+        Dim fOffset As Double = geogridElev * Tan(faceSlope) * flip
+        'создаем щебеночную подушку
+        subP1 = subPoints.Add(insertPoint.Offset, insertPoint.Elevation, "")
+        subP2 = subPoints.Add(subP1.Offset, subP1.Elevation - fHeight, "")
+        subP3 = subPoints.Add(subP2.Offset - flip * fWidth, subP2.Elevation, "")
+        subP4 = subPoints.Add(subP3.Offset, subP1.Elevation, "")
+        subP5 = subPoints.Add(subP4.Offset - flip * 0.3, subP4.Elevation, "")
+        subP6 = subPoints.Add(subP5.Offset - flip * 0.3, subP5.Elevation - 0.3, "")
+        subP7 = subPoints.Add(subP6.Offset + flip * 0.15, subP6.Elevation - 0.3, "")
+        subP8 = subPoints.Add(subP7.Offset + flip * 0.15, subP7.Elevation - 0.3, pitName)
+        subP9 = subPoints.Add(subP8.Offset + flip * 1.5, subP8.Elevation, pitName)
+        subP10 = subPoints.Add(subP9.Offset + flip * 0.3, subP9.Elevation + 0.3, pitName)
+        If hasTargetOffset Then
+            subP11 = subPoints.Add(tWidth, subP10.Elevation, pitName)
+            subP12 = subPoints.Add(subP11.Offset, subP1.Elevation, "")
+        Else
+            Dim offsToP11 = ((fWidth - blockWidth) / 2 + Abs(subP10.Offset) - Abs(subP1.Offset))
+            subP11 = subPoints.Add(subP10.Offset + (tWidth - offsToP11 * flip), subP10.Elevation, pitName)
+            subP12 = subPoints.Add(subP11.Offset + flip * 0.6, subP1.Elevation, "")
+        End If
+        'Dim upperLinks As String = "crushedStone_Up"
+        'Dim lowerLinks As String = "crushedStone_Down"
+        subL1 = subLinks.Add(subP1, subP2, baseName)
+        subL2 = subLinks.Add(subP2, subP3, baseName)
+        subL3 = subLinks.Add(subP3, subP4, baseName)
+        subL4 = subLinks.Add(subP4, subP5, baseName)
+        subL5 = subLinks.Add(subP5, subP6, baseName)
+        subL6 = subLinks.Add(subP6, subP7, baseName)
+        subL7 = subLinks.Add(subP7, subP8, baseName)
+        subL8 = subLinks.Add(subP8, subP9, baseName)
+        subL9 = subLinks.Add(subP9, subP10, baseName)
+        subL10 = subLinks.Add(subP10, subP11, baseName)
+        subL11 = subLinks.Add(subP11, subP12, baseName)
+        subL12 = subLinks.Add(subP12, subP1, baseName)
+
+        Dim links As Link() = {subL1, subL2, subL3, subL4, subL5, subL6, subL7, subL8, subL9, subL10, subL11, subL12}
+        gravShape = Shapes.Add(links, baseName)
+
+        'создаем геотекстиль
+
+        Dim geotxtP1 As Point = geotxtPoints.Add(subP12.Offset, subP12.Elevation, "")
+        Dim geotxtP2 As Point = geotxtPoints.Add(subP1.Offset, subP1.Elevation, "")
+        Dim geotxtP3 As Point = geotxtPoints.Add(subP1.Offset - flip * (fWidth - blockWidth) / 2, subP1.Elevation + prepHeight, "")
+        Dim geotxtP4 As Point = geotxtPoints.Add(geotxtP3.Offset + flip * faceSlope * geogridElev, geogridElev, "")
+        Dim geotxtP5 As Point = geotxtPoints.Add(geotxtP4.Offset + flip * geotextileOverlap, geotxtP4.Elevation, "")
+
+
+        geotxtLink13 = geotxtLinks.Add(geotxtP1, geotxtP2, geotextileName)
+        geotxtLink14 = geotxtLinks.Add(geotxtP2, geotxtP3, geotextileName)
+        geotxtLink15 = geotxtLinks.Add(geotxtP3, geotxtP4, geotextileName)
+        geotxtLink16 = geotxtLinks.Add(geotxtP4, geotxtP5, geotextileName)
+
+        'создаем георешетки
+        Dim lowGrid1 As Point = gridPoints.Add(subP8.Offset, subP8.Elevation, "")
+        Dim lowGrid2 As Point = gridPoints.Add(subP9.Offset, subP9.Elevation, "")
+        Dim lowGrid As Link = gridLinks.Add(lowGrid1, lowGrid2, gridTXName)
+
+        Dim medGrid1 As Point = gridPoints.Add(subP7.Offset, subP7.Elevation, "")
+        Dim medGrid2 As Point = gridPoints.Add(subP11.Offset, subP11.Elevation, "")
+        Dim medGrid As Link = gridLinks.Add(medGrid1, medGrid2, gridTXName)
+
+        Dim upGrid1 As Point = gridPoints.Add(subP2.Offset, subP2.Elevation, "")
+        Dim upGrid2 As Point = gridPoints.Add((subP12.Offset + subP11.Offset) / 2, subP2.Elevation, "")
+        If hasTargetOffset Then
+            upGrid2 = gridPoints.Add(subP11.Offset, subP2.Elevation, "")
+        End If
+        Dim upGrid As Link = gridLinks.Add(upGrid1, upGrid2, gridTXName)
+
+
+    End Sub
+
+#End Region
+End Class
+
