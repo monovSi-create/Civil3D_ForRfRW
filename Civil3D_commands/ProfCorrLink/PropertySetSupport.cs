@@ -239,6 +239,22 @@ namespace Civil3D_commands.AssociativeBreaks
             }
         }
 
+        /// <summary>
+        /// Записать флаг «Включить» на профиль, чтобы галочка в палитре
+        /// показывала то же, что действует на самом деле.
+        /// </summary>
+        public static void WriteEditFlag(Transaction tr, ObjectId profileId, bool on)
+        {
+            var obj = tr.GetObject(profileId, OpenMode.ForWrite);
+
+            foreach (ObjectId psId in PropertyDataServices.GetPropertySets(obj))
+            {
+                var ps = (PropertySet)tr.GetObject(psId, OpenMode.ForWrite);
+                if (ps.PropertySetDefinitionName != EditPsd) continue;
+                SetIf(ps, EditProp, on);
+            }
+        }
+
         /// <summary>Прочитать значение булевого свойства "Включить" с профиля.</summary>
         public static bool ReadEditFlag(Transaction tr, ObjectId profileId)
         {

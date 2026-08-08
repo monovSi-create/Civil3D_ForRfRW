@@ -26,9 +26,11 @@ namespace Civil3D_commands.AssociativeBreaks
 
         // --- Счётчики для RW_BREAKDIAG. Путь через палитру в чертеже не проверен,
         // --- и без них непонятно, на каком шаге он обрывается.
-        public static int PropEvents;    // сколько правок набора вообще замечено
-        public static int PropMatched;   // из них опознано как набор нашего прокси
-        public static int PropApplied;   // из них привело к перестроению
+        public static int PropEvents;       // сколько правок набора вообще замечено
+        public static int PropMatched;      // из них опознано как набор нашего прокси
+        public static int PropApplied;      // из них привело к перестроению
+        public static int PropEditMatched;  // правок набора «Режим редактирования» на профиле
+        public static int PropEditApplied;  // из них изменивших режим
         private bool _idleHooked;
         private int _commandDepth; // счётчик вложенных команд; Idle не дренирует пока > 0
 
@@ -192,7 +194,22 @@ namespace Civil3D_commands.AssociativeBreaks
                 using (var tr = doc.Database.TransactionManager.StartTransaction())
                 {
                     var ps = tr.GetObject(psId, OpenMode.ForRead) as PropertySet;
-                    if (ps == null || ps.PropertySetDefinitionName != PropertySetSupport.MarkerPsd)
+                    if (ps == null)
+                    {
+                        tr.Commit();
+                        return;
+                    }
+
+                    // Набор «Режим редактирования» висит на профиле, а не на прокси,
+                    // и обрабатывается отдельно.
+                    if (ps.PropertySetDefinitionName == PropertySetSupport.EditPsd)
+                    {
+                        ApplyEditFlag(tr, doc, ps);
+                        tr.Commit();
+                        return;
+                    }
+
+                    if (ps.PropertySetDefinitionName != PropertySetSupport.MarkerPsd)
                     {
                         tr.Commit();
                         return;
@@ -240,6 +257,45 @@ namespace Civil3D_commands.AssociativeBreaks
             if (changedProps) _session.Manager.ApplyProperties(markerId, isStep, stepHeight, gap);
 
             if (changedStation || changedProps) PropApplied++;
+        }
+
+        /// <summary>
+        /// Галочка «Режим редактирования» в палитре свойств профиля.
+        ///
+        /// Владелец набора ищется тем же подъёмом по цепочке владения, что и для
+        /// прокси, только опознаётся не линия, а Profile. Раньше этот набор
+        /// создавался и вешался на профиль, но не читался никем — галочка
+        /// не делала ничего.
+        /// </summary>
+        private void ApplyEditFlag(Transaction tr, Document doc, PropertySet ps)
+        {
+            ObjectId ownerId = ps.OwnerId;
+            Profile profile = null;
+
+            for (int i = 0; i < 5 && !ownerId.IsNull; i++)
+            {
+                var owner = tr.GetObject(ownerId, OpenMode.ForRead);
+                if (owner == null) break;
+
+                profile = owner as Profile;
+                if (profile != null) break;
+
+                ownerId = owner.OwnerId;
+            }
+
+            if (profile == null) return;
+
+            PropEditMatched++;
+
+            bool wanted = PropertySetSupport.ReadEditFlag(tr, profile.ObjectId);
+            Handle h = profile.Handle;
+
+            if (_session.IsEditMode(h) == wanted) return;
+
+            _session.SetEditMode(h, wanted);
+            PropEditApplied++;
+
+            try { doc.Editor.Regen(); } catch (System.Exception) { }
         }
 
         /// <summary>Текущий пикет, вычисленный из геометрии именно того прокси, что двигали.</summary>

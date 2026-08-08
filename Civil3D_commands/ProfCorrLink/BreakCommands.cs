@@ -370,7 +370,9 @@ namespace Civil3D_commands.AssociativeBreaks
 
             bool now = !session.IsEditMode(link.ProfileHandle);
             session.SetEditMode(link.ProfileHandle, now);
-            doc.Editor.WriteMessage($"\nРежим редактирования: {(now ? "ВКЛ" : "ВЫКЛ")}");
+            doc.Editor.WriteMessage(
+                $"\nРежим редактирования: {(now ? "ВКЛ" : "ВЫКЛ")}" +
+                " (сохранён в чертеже, переживёт перезапуск)");
             doc.Editor.Regen();
         }
 
@@ -676,8 +678,10 @@ namespace Civil3D_commands.AssociativeBreaks
                 // палитра правит набор не через ObjectModified; события есть, а
                 // опознанных нет — не сходится цепочка владения от набора к прокси.
                 ed.WriteMessage(
-                    $"\nпалитра: событий {BreakReactor.PropEvents}, " +
-                    $"опознано {BreakReactor.PropMatched}, применено {BreakReactor.PropApplied}");
+                    $"\nпалитра (разрыв): событий {BreakReactor.PropEvents}, " +
+                    $"опознано {BreakReactor.PropMatched}, применено {BreakReactor.PropApplied}" +
+                    $"\nпалитра (режим): опознано {BreakReactor.PropEditMatched}, " +
+                    $"применено {BreakReactor.PropEditApplied}");
 
                 if (link != null)
                 {

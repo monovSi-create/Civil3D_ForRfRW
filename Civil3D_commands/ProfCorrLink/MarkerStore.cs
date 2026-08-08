@@ -225,6 +225,77 @@ namespace Civil3D_commands.AssociativeBreaks
     }
 
     /// <summary>
+    /// Режим редактирования в словаре чертежа: список хэндлов профилей,
+    /// у которых он включён.
+    ///
+    /// Раньше режим жил только в сеансе: после перезапуска Civil 3D ручки
+    /// пропадали, и связать это с `RW_EDITMODE` было невозможно.
+    /// </summary>
+    public static class EditModeStore
+    {
+        private const string AppDict = "EditMode";
+        private const string XrecKey = "Profiles";
+
+        public static HashSet<long> Load(Database db)
+        {
+            var result = new HashSet<long>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                ObjectId dictId = MarkerStore.GetDictionaryId(tr, db, AppDict, false);
+                if (dictId.IsNull) { tr.Commit(); return result; }
+
+                var dict = (DBDictionary)tr.GetObject(dictId, OpenMode.ForRead);
+                if (!dict.Contains(XrecKey)) { tr.Commit(); return result; }
+
+                var xrec = tr.GetObject(dict.GetAt(XrecKey), OpenMode.ForRead) as Xrecord;
+                if (xrec?.Data != null)
+                {
+                    foreach (TypedValue tv in xrec.Data)
+                    {
+                        if (tv.TypeCode != (int)DxfCode.Text) continue;
+
+                        Handle h = RwHandles.Parse(tv.Value.ToString());
+                        // Профиль мог быть удалён — тогда и режим ни к чему.
+                        if (RwHandles.Exists(db, h)) result.Add(h.Value);
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            return result;
+        }
+
+        public static void Save(Database db, IEnumerable<long> profileHandles)
+        {
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                ObjectId dictId = MarkerStore.GetDictionaryId(tr, db, AppDict, true);
+                var dict = (DBDictionary)tr.GetObject(dictId, OpenMode.ForWrite);
+
+                var rb = new ResultBuffer();
+                foreach (long value in profileHandles)
+                    rb.Add(new TypedValue((int)DxfCode.Text, RwHandles.ToText(new Handle(value))));
+
+                if (dict.Contains(XrecKey))
+                {
+                    var existing = (Xrecord)tr.GetObject(dict.GetAt(XrecKey), OpenMode.ForWrite);
+                    existing.Data = rb;
+                }
+                else
+                {
+                    var xrec = new Xrecord { Data = rb };
+                    dict.SetAt(XrecKey, xrec);
+                    tr.AddNewlyCreatedDBObject(xrec, true);
+                }
+
+                tr.Commit();
+            }
+        }
+    }
+
+    /// <summary>
     /// Активная связь «профиль ↔ вид профиля ↔ ось ↔ коридор» в словаре чертежа.
     /// Лежит в ОТДЕЛЬНОМ подсловаре: MarkerStore при сохранении полностью переписывает
     /// свой, так что положить связь туда — значит терять её при каждой правке разрыва.

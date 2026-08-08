@@ -36,8 +36,9 @@ namespace Civil3D_commands.AssociativeBreaks
         public bool Suspended { get; private set; }
 
         private readonly Document _doc;
-        // Кэш "режим редактирования вкл" по Handle профиля.
-        private readonly HashSet<long> _editProfiles = new HashSet<long>();
+        // "Режим редактирования вкл" по Handle профиля. Живёт в чертеже
+        // (EditModeStore), в сеансе только зеркалится.
+        private HashSet<long> _editProfiles = new HashSet<long>();
 
         private BreakSession(Document doc)
         {
@@ -59,6 +60,11 @@ namespace Civil3D_commands.AssociativeBreaks
             session.Store.LoadFromDatabase(doc.Database);
             session.ActiveLink = LinkStore.Load(doc.Database)
                                  ?? RestoreLinkFromMarkers(doc.Database, session.Store);
+
+            // Режим редактирования переживает перезапуск: иначе после открытия
+            // чертежа ручек нет, и догадаться про RW_EDITMODE невозможно.
+            session._editProfiles = EditModeStore.Load(doc.Database);
+
             return session;
         }
 
@@ -127,10 +133,43 @@ namespace Civil3D_commands.AssociativeBreaks
         /// </summary>
         public StationMarker ActiveLink { get; set; }
 
+        /// <summary>
+        /// Переключить режим и запомнить это в чертеже.
+        ///
+        /// Флаг пишется и в набор характеристик профиля, чтобы галочка
+        /// в палитре свойств показывала правду: править режим можно с обеих
+        /// сторон, и расходиться им нельзя.
+        /// </summary>
         public void SetEditMode(Handle profileHandle, bool on)
         {
             if (on) _editProfiles.Add(profileHandle.Value);
             else _editProfiles.Remove(profileHandle.Value);
+
+            try
+            {
+                // Под подавлением: иначе реактор увидит нашу же запись в набор
+                // и попробует применить её обратно.
+                using (_doc.LockDocument())
+                using (Suspend())
+                {
+                    EditModeStore.Save(_doc.Database, _editProfiles);
+
+                    ObjectId profId = RwHandles.Resolve(_doc.Database, profileHandle);
+                    if (profId.IsNull) return;
+
+                    using (var tr = _doc.Database.TransactionManager.StartTransaction())
+                    {
+                        PropertySetSupport.Attach(
+                            tr, profId, PropertySetSupport.EnsureEditPsd(_doc.Database));
+                        PropertySetSupport.WriteEditFlag(tr, profId, on);
+                        tr.Commit();
+                    }
+                }
+            }
+            catch (System.Exception)
+            {
+                // Не сохранилось — режим всё равно действует в этом сеансе.
+            }
         }
 
         /// <summary>Базовая линия коридора, построенная на профиле маркера.</summary>
