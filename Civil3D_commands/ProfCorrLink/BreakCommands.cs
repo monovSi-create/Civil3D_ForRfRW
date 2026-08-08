@@ -222,7 +222,10 @@ namespace Civil3D_commands.AssociativeBreaks
                     "\nЗадать конструкцию (Assembly) коридора?");
                 asmKw.Keywords.Add("Yes", "Да", "Да");
                 asmKw.Keywords.Add("No", "Нет", "Нет");
-                asmKw.Keywords.Default = "Нет";
+                // Default — ГЛОБАЛЬНОЕ имя. Русское здесь бросает eInvalidInput
+                // («значение не попадает в ожидаемый диапазон») ещё до показа
+                // запроса, и команда обрывается молча.
+                asmKw.Keywords.Default = "No";
                 var asmKwRes = ed.GetKeywords(asmKw);
                 if (asmKwRes.Status != PromptStatus.OK) return;
 
@@ -427,7 +430,7 @@ namespace Civil3D_commands.AssociativeBreaks
             var stepKw = new PromptKeywordOptions("\nЭто ступень профиля?");
             stepKw.Keywords.Add("Yes", "Да", "Да");
             stepKw.Keywords.Add("No", "Нет", "Нет");
-            stepKw.Keywords.Default = "Да";
+            stepKw.Keywords.Default = "Yes";   // глобальное имя, не подпись
             var stepRes = ed.GetKeywords(stepKw);
             if (stepRes.Status != PromptStatus.OK) return;
             bool isStep = stepRes.StringResult == "Yes";
@@ -586,7 +589,7 @@ namespace Civil3D_commands.AssociativeBreaks
             var stepKw = new PromptKeywordOptions("\nСтупень профиля?");
             stepKw.Keywords.Add("Yes", "Да", "Да");
             stepKw.Keywords.Add("No", "Нет", "Нет");
-            stepKw.Keywords.Default = m.IsStep ? "Да" : "Нет";
+            stepKw.Keywords.Default = m.IsStep ? "Yes" : "No";   // глобальное имя
             var stepRes = ed.GetKeywords(stepKw);
             if (stepRes.Status != PromptStatus.OK) return;
             bool isStep = stepRes.StringResult == "Yes";
@@ -743,7 +746,7 @@ namespace Civil3D_commands.AssociativeBreaks
             var kw = new PromptKeywordOptions($"\nМенять конструкцию {what}?");
             kw.Keywords.Add("Yes", "Да", "Да");
             kw.Keywords.Add("No", "Нет", "Нет");
-            kw.Keywords.Default = "Нет";
+            kw.Keywords.Default = "No";   // глобальное имя
 
             var res = ed.GetKeywords(kw);
             if (res.Status != PromptStatus.OK || res.StringResult != "Yes") return ObjectId.Null;
