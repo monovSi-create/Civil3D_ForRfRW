@@ -14,9 +14,16 @@ namespace Civil3D_commands.AssociativeBreaks
     public static class BreakProxyFactory
     {
         public const string XAppName = "RW_BREAK";
-        // Полувысота линии в виде профиля и полудлина "чёрточки" в плане.
-        public const double ProfileProxyHalfHeight = 2.0; // АДАПТ: подберите под масштаб вида
+
+        /// <summary>Полудлина "чёрточки" в плане.</summary>
         public const double PlanProxyHalfWidth = 3.0;     // АДАПТ: полуширина ортогонали в плане
+
+        /// <summary>
+        /// Тип линии прокси в виде профиля. Штрихпунктир отличает служебную
+        /// линию от геометрии чертежа. Если в чертеже такого типа нет, он
+        /// подгружается из стандартного файла; не вышло — остаётся сплошная.
+        /// </summary>
+        public const string ProxyLinetype = "DASHDOT";
 
         public static void EnsureRegApp(Database db)
         {
@@ -75,20 +82,23 @@ namespace Civil3D_commands.AssociativeBreaks
         public static void UpdateProxyGeometry(Transaction tr, StationMarker m,
                                                ProfileView profileView, Alignment alignment)
         {
-            // --- Вид профиля: вертикальная линия в точке (station, base..base+halfH) ---
+            // --- Вид профиля: вертикаль во всю высоту вида ---
+            // Не «отметка низа плюс два метра»: разрыв делит вид целиком, и
+            // короткая чёрточка у основания заставляла целиться в неё мышью.
             ObjectId profProxyId = ResolveId(m.ProfileProxyHandle);
-            if (!profProxyId.IsNull)
+            if (!profProxyId.IsNull && profileView != null)
             {
                 Point3d[] pts = RwGeometry.ProfileSegment(
                     profileView,
-                    m.Station, m.BaseElevation,
-                    m.Station, m.BaseElevation + ProfileProxyHalfHeight);
+                    m.Station, profileView.ElevationMin,
+                    m.Station, profileView.ElevationMax);
 
                 if (pts != null)
                 {
                     var ln = (Line)tr.GetObject(profProxyId, OpenMode.ForWrite);
                     ln.StartPoint = pts[0];
                     ln.EndPoint = pts[1];
+                    ApplyProxyLinetype(tr, ln);
                 }
             }
 
@@ -132,6 +142,45 @@ namespace Civil3D_commands.AssociativeBreaks
             return RwGeometry.TryStationInProfileView(pv, viewPoint, out station)
                 ? station
                 : double.NaN;
+        }
+
+        /// <summary>
+        /// Назначить прокси штрихпунктир. Тип линии в чертеже может
+        /// отсутствовать — тогда он подгружается из acad.lin/acadiso.lin.
+        /// Ничего не вышло — линия остаётся сплошной, это не повод падать.
+        /// </summary>
+        private static void ApplyProxyLinetype(Transaction tr, Line line)
+        {
+            try
+            {
+                Database db = line.Database;
+                if (db == null) return;
+
+                var ltt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+
+                if (!ltt.Has(ProxyLinetype))
+                {
+                    foreach (string file in new[] { "acadiso.lin", "acad.lin" })
+                    {
+                        try
+                        {
+                            db.LoadLineTypeFile(ProxyLinetype, file);
+                            break;
+                        }
+                        catch (System.Exception) { }
+                    }
+
+                    ltt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+                    if (!ltt.Has(ProxyLinetype)) return;
+                }
+
+                ObjectId ltId = ltt[ProxyLinetype];
+                if (line.LinetypeId != ltId) line.LinetypeId = ltId;
+            }
+            catch (System.Exception)
+            {
+                // Тип линии — оформление, а не механика разрывов.
+            }
         }
 
         private static ObjectId ResolveId(Handle h)

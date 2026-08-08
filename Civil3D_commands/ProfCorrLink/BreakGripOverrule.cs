@@ -61,10 +61,98 @@ namespace Civil3D_commands.AssociativeBreaks
         public override void MoveGripPointsAt(Autodesk.AutoCAD.DatabaseServices.Entity entity, GripDataCollection grips,
             Vector3d offset, MoveGripPointsFlags bitFlags)
         {
-            // Отдаём перемещение AutoCAD — grip-система двигает линию стандартно.
-            // Ресинк профиля / областей / второго прокси выполнит реактор в CommandEnded.
-            try { base.MoveGripPointsAt(entity, grips, offset, bitFlags); }
+            // Ресинк профиля / областей / второго прокси выполнит реактор
+            // в CommandEnded; здесь только ограничиваем само перемещение.
+            try { base.MoveGripPointsAt(entity, grips, Constrain(entity, offset), bitFlags); }
             catch { }
+        }
+
+        /// <summary>
+        /// Разрыв живёт на пикете, а пикет в виде профиля — это координата X.
+        /// Поэтому вертикальная составляющая перемещения отбрасывается: линия
+        /// ходит строго горизонтально и остаётся во всю высоту вида.
+        ///
+        /// Горизонталь дополнительно зажимается пределами вида профиля и
+        /// участка коридора. Модель клампится ещё раз в оркестраторе (там же
+        /// учитываются соседние разрывы), но без этого линию было видно
+        /// уехавшей за край вида прямо во время перетаскивания.
+        /// </summary>
+        private Vector3d Constrain(Autodesk.AutoCAD.DatabaseServices.Entity entity, Vector3d offset)
+        {
+            var session = BreakSession.Current;
+            if (session == null || entity.ObjectId.IsNull) return offset;
+
+            var m = session.Store.GetByProxy(entity.ObjectId.Handle);
+            if (m == null) return offset;
+
+            // В плане ось может идти как угодно, «горизонтально» там смысла
+            // не имеет — ограничение только для вида профиля.
+            if (entity.ObjectId.Handle != m.ProfileProxyHandle) return offset;
+
+            var flat = new Vector3d(offset.X, 0.0, 0.0);
+
+            var doc = Autodesk.AutoCAD.ApplicationServices.Application
+                        .DocumentManager.MdiActiveDocument;
+            if (doc == null) return flat;
+
+            try
+            {
+                using (var tr = doc.Database.TransactionManager.StartTransaction())
+                {
+                    var pv = RwHandles.Open<ProfileView>(
+                        tr, doc.Database, m.ProfileViewHandle, OpenMode.ForRead);
+
+                    if (pv == null) { tr.Commit(); return flat; }
+
+                    var line = entity as Line;
+                    if (line == null) { tr.Commit(); return flat; }
+
+                    Point3d mid = RwGeometry.Midpoint(line);
+                    Vector3d result;
+
+                    double station;
+                    if (!RwGeometry.TryStationInProfileView(pv, mid + flat, out station))
+                    {
+                        // Утащили за пределы вида — дальше не пускаем.
+                        result = new Vector3d(0.0, 0.0, 0.0);
+                    }
+                    else
+                    {
+                        double lo = pv.StationStart;
+                        double hi = pv.StationEnd;
+
+                        Baseline bl = session.GetBaseline(tr, m);
+                        if (bl != null)
+                        {
+                            lo = Math.Max(lo, bl.StartStation);
+                            hi = Math.Min(hi, bl.EndStation);
+                        }
+
+                        double clamped = RwGeometry.Clamp(station, lo, hi);
+
+                        if (Math.Abs(clamped - station) < 1e-9)
+                        {
+                            result = flat;
+                        }
+                        else
+                        {
+                            // Пикет зажат — пересчитываем смещение под него.
+                            Point3d edge;
+                            result = RwGeometry.TryPointInProfileView(
+                                         pv, clamped, pv.ElevationMin, out edge)
+                                ? new Vector3d(edge.X - mid.X, 0.0, 0.0)
+                                : new Vector3d(0.0, 0.0, 0.0);
+                        }
+                    }
+
+                    tr.Commit();
+                    return result;
+                }
+            }
+            catch (System.Exception)
+            {
+                return flat;
+            }
         }
     }
 

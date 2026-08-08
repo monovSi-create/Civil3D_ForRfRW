@@ -92,17 +92,80 @@ namespace Civil3D_commands.AssociativeBreaks
             var pvRes = ed.GetEntity(pvOpt);
             if (pvRes.Status != PromptStatus.OK) return;
 
-            // 2) Отметка
-            var elRes = ed.GetDouble("\nОтметка продольного профиля");
-            if (elRes.Status != PromptStatus.OK) return;
+            // ------------------------------------------------------------------
+            // Данные вида профиля нужны раньше вопросов: из них берётся
+            // и подсказка по отметке, и пределы оси.
+            // ------------------------------------------------------------------
+            ObjectId alignmentId;
+            Handle pvHandle, alHandle;
+            double alStart, alEnd, elevLow, elevHigh;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var pv = (ProfileView)tr.GetObject(pvRes.ObjectId, OpenMode.ForRead);
+                alignmentId = pv.AlignmentId;
+                pvHandle = pv.Handle;
+                elevLow = pv.ElevationMin;
+                elevHigh = pv.ElevationMax;
+
+                var al = (Alignment)tr.GetObject(alignmentId, OpenMode.ForRead);
+                alHandle = al.Handle;
+                alStart = al.StartingStation;
+                alEnd = al.EndingStation;
+                tr.Commit();
+            }
+
+            // 2) Отметка ПЛОСКОГО ПРОФИЛЯ-ОСНОВАНИЯ, который создаёт мастер.
+            //    Коридор строится по нему, а разрывы потом режут в нём ступени,
+            //    поэтому отметка задаёт исходный уровень всей стены. Значение
+            //    по умолчанию — середина вида, чтобы профиль заведомо оказался
+            //    в видимой части.
+            double baseElevation = Math.Round((elevLow + elevHigh) / 2.0, 3);
+
+            var elOpt = new PromptDoubleOptions(
+                "\nОтметка плоского профиля-основания (по нему построится коридор)")
+            {
+                DefaultValue = baseElevation,
+                UseDefaultValue = true,
+                AllowNegative = true,
+                AllowZero = true
+            };
+            elOpt.Keywords.Add("Pick", "Указать", "Указать");
+            elOpt.AppendKeywordsToMessage = true;
+
+            var elRes = ed.GetDouble(elOpt);
+
+            if (elRes.Status == PromptStatus.Keyword && elRes.StringResult == "Pick")
+            {
+                var ptRes = ed.GetPoint("\nУкажите точку в виде профиля на нужной отметке");
+                if (ptRes.Status != PromptStatus.OK) return;
+
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var pv = (ProfileView)tr.GetObject(pvRes.ObjectId, OpenMode.ForRead);
+                    double st, el;
+                    if (RwGeometry.TryStationInProfileView(pv, ptRes.Value, out st, out el))
+                        baseElevation = el;
+                    else
+                        ed.WriteMessage("\nТочка вне вида профиля — оставлена отметка по умолчанию.");
+                    tr.Commit();
+                }
+            }
+            else if (elRes.Status == PromptStatus.OK)
+            {
+                baseElevation = elRes.Value;
+            }
+            else return;
 
             // 3) Новый коридор или существующий?
             var corrKw = new PromptKeywordOptions(
                 "\nКоридор: создать новый или выбрать существующий?");
-            // Ключевые слова латиницей с русскими подписями: кириллицу
-            // не ввести при английской раскладке.
-            corrKw.Keywords.Add("Create", "Create", "Создать");
-            corrKw.Keywords.Add("Select", "Select", "Выбрать");
+            // Первый параметр — глобальное имя (латиницей, оно же возвращается
+            // в StringResult), второй и третий — то, что показано и вводится.
+            // Латиница во втором параметре ломает ввод: AutoCAD отвергает
+            // показанное русское слово как неправильное ключевое.
+            corrKw.Keywords.Add("Create", "Создать", "Создать");
+            corrKw.Keywords.Add("Select", "Выбрать", "Выбрать");
             corrKw.Keywords.Default = "Create";
             var corrKwRes = ed.GetKeywords(corrKw);
             if (corrKwRes.Status != PromptStatus.OK) return;
@@ -134,9 +197,9 @@ namespace Civil3D_commands.AssociativeBreaks
             {
                 var asmKw = new PromptKeywordOptions(
                     "\nЗадать конструкцию (Assembly) коридора?");
-                asmKw.Keywords.Add("Yes", "Yes", "Да");
-                asmKw.Keywords.Add("No", "No", "Нет");
-                asmKw.Keywords.Default = "No";
+                asmKw.Keywords.Add("Yes", "Да", "Да");
+                asmKw.Keywords.Add("No", "Нет", "Нет");
+                asmKw.Keywords.Default = "Нет";
                 var asmKwRes = ed.GetKeywords(asmKw);
                 if (asmKwRes.Status != PromptStatus.OK) return;
 
@@ -152,44 +215,41 @@ namespace Civil3D_commands.AssociativeBreaks
             }
 
             // ------------------------------------------------------------------
-            // Транзакция 1: читаем данные ProfileView / Alignment
-            // ------------------------------------------------------------------
-            ObjectId alignmentId;
-            Handle pvHandle, alHandle;
-            double alStart, alEnd;
-
-            using (var tr = db.TransactionManager.StartTransaction())
-            {
-                var pv = (ProfileView)tr.GetObject(pvRes.ObjectId, OpenMode.ForRead);
-                alignmentId = pv.AlignmentId;
-                pvHandle = pv.Handle;
-                var al = (Alignment)tr.GetObject(alignmentId, OpenMode.ForRead);
-                alHandle = al.Handle;
-                alStart = al.StartingStation;
-                alEnd = al.EndingStation;
-                tr.Commit();
-            }
-
-            // ------------------------------------------------------------------
-            // Транзакция 2: создаём профиль, коридор (если нужно), базовую линию
+            // Создаём профиль, коридор (если нужно), базовую линию
             // ------------------------------------------------------------------
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 // --- Стиль профиля и набор меток ---
-                ObjectId styleId    = civDoc.Styles.ProfileStyles[0];
-                ObjectId labelSetId = civDoc.Styles.LabelSetStyles
-                                            .ProfileLabelSetStyles[0];
+                // Набор меток берётся пустой: иначе у каждого перелома профиля
+                // вырастает группа меток, а переломов здесь ровно столько,
+                // сколько разрывов, и подписывать их незачем.
+                ObjectId styleId = civDoc.Styles.ProfileStyles[0];
+                ObjectId labelSetId = FindEmptyLabelSet(civDoc, tr);
 
                 // --- Создаём плоский профиль ---
-                ObjectId profId = Profile.CreateByLayout(
-                    "Профиль-основание_" + DateTime.Now.Ticks,
-                    alignmentId, db.LayerZero,
-                    styleId, labelSetId);
+                string profName = "Профиль-основание_" + DateTime.Now.Ticks;
+                ObjectId profId;
+
+                try
+                {
+                    profId = Profile.CreateByLayout(
+                        profName, alignmentId, db.LayerZero, styleId, labelSetId);
+                }
+                catch (System.Exception)
+                {
+                    // Пустой набор меток не принят — берём первый из списка.
+                    // Лишние метки лучше, чем несозданный профиль.
+                    profId = Profile.CreateByLayout(
+                        profName, alignmentId, db.LayerZero, styleId,
+                        civDoc.Styles.LabelSetStyles.ProfileLabelSetStyles[0]);
+                    ed.WriteMessage(
+                        "\nПустой набор меток профиля не применился — метки придётся снять вручную.");
+                }
 
                 var profile = (Profile)tr.GetObject(profId, OpenMode.ForWrite);
-                profile.PVIs.AddPVI(alStart, elRes.Value);
-                profile.PVIs.AddPVI(alEnd,   elRes.Value);
+                profile.PVIs.AddPVI(alStart, baseElevation);
+                profile.PVIs.AddPVI(alEnd,   baseElevation);
 
                 // --- Свойство режима редактирования ---
                 PropertySetSupport.Attach(tr, profId,
@@ -295,9 +355,9 @@ namespace Civil3D_commands.AssociativeBreaks
 
             // Ступень?
             var stepKw = new PromptKeywordOptions("\nЭто ступень профиля?");
-            stepKw.Keywords.Add("Yes", "Yes", "Да");
-            stepKw.Keywords.Add("No", "No", "Нет");
-            stepKw.Keywords.Default = "Yes";
+            stepKw.Keywords.Add("Yes", "Да", "Да");
+            stepKw.Keywords.Add("No", "Нет", "Нет");
+            stepKw.Keywords.Default = "Да";
             var stepRes = ed.GetKeywords(stepKw);
             if (stepRes.Status != PromptStatus.OK) return;
             bool isStep = stepRes.StringResult == "Yes";
@@ -419,9 +479,9 @@ namespace Civil3D_commands.AssociativeBreaks
             // Ключевые слова латиницей с русскими подписями: кириллицу
             // не ввести при английской раскладке.
             var stepKw = new PromptKeywordOptions("\nСтупень профиля?");
-            stepKw.Keywords.Add("Yes", "Yes", "Да");
-            stepKw.Keywords.Add("No", "No", "Нет");
-            stepKw.Keywords.Default = m.IsStep ? "Yes" : "No";
+            stepKw.Keywords.Add("Yes", "Да", "Да");
+            stepKw.Keywords.Add("No", "Нет", "Нет");
+            stepKw.Keywords.Default = m.IsStep ? "Да" : "Нет";
             var stepRes = ed.GetKeywords(stepKw);
             if (stepRes.Status != PromptStatus.OK) return;
             bool isStep = stepRes.StringResult == "Yes";
@@ -457,7 +517,20 @@ namespace Civil3D_commands.AssociativeBreaks
             if (Math.Abs(gap - gapRes.Value) > 1e-12)
                 ed.WriteMessage($"\nМикроразрыв приведён к допустимому: {gap:F4}");
 
-            session.Manager.ApplyProperties(m.Id, isStep, stepH, gap);
+            // Конструкции соседних участков. «Предыдущий» и «следующий» —
+            // по ходу пикетажа, то есть те же левый и правый, что у границы.
+            string leftName, rightName;
+            using (var tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                Baseline bl = session.GetBaseline(tr, m);
+                ProfileGeometryOps.DescribeRegions(bl, m, out leftName, out rightName);
+                tr.Commit();
+            }
+
+            ObjectId leftAsm = AskAssembly(ed, $"предыдущего участка «{leftName}»");
+            ObjectId rightAsm = AskAssembly(ed, $"следующего участка «{rightName}»");
+
+            session.Manager.ApplyProperties(m.Id, isStep, stepH, gap, leftAsm, rightAsm);
             ed.WriteMessage("\nСвойства разрыва изменены, коридор перестроен.");
         }
 
@@ -554,6 +627,60 @@ namespace Civil3D_commands.AssociativeBreaks
         private static string Short(Guid g) =>
             g == Guid.Empty ? "—" : g.ToString("N").Substring(0, 8);
 
+        /// <summary>
+        /// Спросить конструкцию участка. «Нет» означает «оставить как есть» —
+        /// в 99 случаях из 100 менять надо одну сторону, а не обе.
+        /// </summary>
+        private static ObjectId AskAssembly(Editor ed, string what)
+        {
+            var kw = new PromptKeywordOptions($"\nМенять конструкцию {what}?");
+            kw.Keywords.Add("Yes", "Да", "Да");
+            kw.Keywords.Add("No", "Нет", "Нет");
+            kw.Keywords.Default = "Нет";
+
+            var res = ed.GetKeywords(kw);
+            if (res.Status != PromptStatus.OK || res.StringResult != "Yes") return ObjectId.Null;
+
+            var opt = new PromptEntityOptions("\nВыберите конструкцию (Assembly)");
+            opt.SetRejectMessage("\nНужна Assembly");
+            opt.AddAllowedClass(typeof(Assembly), true);
+
+            var entRes = ed.GetEntity(opt);
+            return entRes.Status == PromptStatus.OK ? entRes.ObjectId : ObjectId.Null;
+        }
+
         private static ObjectId Resolve(Database db, Handle h) => RwHandles.Resolve(db, h);
+
+        /// <summary>
+        /// Набор меток профиля, который ничего не подписывает.
+        ///
+        /// В шаблонах Civil он обычно называется «_No Labels» / «Нет меток».
+        /// Не нашли — отдаём ObjectId.Null: CreateByLayout принимает его как
+        /// «без меток». Если и это не пройдёт, вызывающий откатится на первый
+        /// набор из списка — метки лучше, чем несозданный профиль.
+        /// </summary>
+        private static ObjectId FindEmptyLabelSet(CivilDocument civDoc, Transaction tr)
+        {
+            try
+            {
+                foreach (ObjectId id in civDoc.Styles.LabelSetStyles.ProfileLabelSetStyles)
+                {
+                    var style = tr.GetObject(id, OpenMode.ForRead)
+                                as Autodesk.Civil.DatabaseServices.Styles.StyleBase;
+                    if (style == null) continue;
+
+                    string name = (style.Name ?? string.Empty).ToLowerInvariant();
+                    if (name.Contains("no label") || name.Contains("_no")
+                        || name.Contains("нет мет") || name.Contains("без мет"))
+                        return id;
+                }
+            }
+            catch (System.Exception)
+            {
+                // Стилями заведует чертёж, а не мы: не нашли — не беда.
+            }
+
+            return ObjectId.Null;
+        }
     }
 }

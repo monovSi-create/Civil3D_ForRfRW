@@ -198,6 +198,48 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>
+        /// Назначить конструкции участкам по обе стороны разрыва.
+        /// ObjectId.Null — не менять. Участки ищутся по тем же GUID, что хранит
+        /// маркер, так что «слева» и «справа» здесь ровно то же, что и у границы.
+        /// </summary>
+        public static void SetAssemblies(Baseline baseline, StationMarker m,
+                                         ObjectId leftAssembly, ObjectId rightAssembly)
+        {
+            if (leftAssembly.IsNull && rightAssembly.IsNull) return;
+
+            var regions = baseline.BaselineRegions;
+
+            if (!leftAssembly.IsNull)
+            {
+                BaselineRegion left = FindByGuid(regions, m.LeftRegionId);
+                if (left != null) left.AssemblyId = leftAssembly;
+            }
+
+            if (!rightAssembly.IsNull)
+            {
+                BaselineRegion right = FindByGuid(regions, m.RightRegionId);
+                if (right != null) right.AssemblyId = rightAssembly;
+            }
+        }
+
+        /// <summary>Имена участков по обе стороны разрыва — для подсказки в команде.</summary>
+        public static void DescribeRegions(Baseline baseline, StationMarker m,
+                                           out string left, out string right)
+        {
+            left = "—";
+            right = "—";
+            if (baseline == null) return;
+
+            var regions = baseline.BaselineRegions;
+
+            BaselineRegion l = FindByGuid(regions, m.LeftRegionId);
+            BaselineRegion r = FindByGuid(regions, m.RightRegionId);
+
+            if (l != null) left = l.Name;
+            if (r != null) right = r.Name;
+        }
+
+        /// <summary>
         /// Убрать разрыв: правая область исчезает, левая растягивается на её место
         /// (то есть выживают настройки левого участка). removed/surviving нужны
         /// вызывающему, чтобы перепривязать соседний маркер справа.

@@ -144,6 +144,17 @@ namespace Civil3D_commands.AssociativeBreaks
         /// </summary>
         public void ApplyProperties(Guid id, bool isStep, double stepHeight, double gap)
         {
+            ApplyProperties(id, isStep, stepHeight, gap, ObjectId.Null, ObjectId.Null);
+        }
+
+        /// <summary>
+        /// То же плюс конструкции участков слева и справа от разрыва
+        /// (по ходу пикетажа: предыдущий и следующий).
+        /// ObjectId.Null означает «не менять».
+        /// </summary>
+        public void ApplyProperties(Guid id, bool isStep, double stepHeight, double gap,
+                                    ObjectId leftAssembly, ObjectId rightAssembly)
+        {
             var m = _session.Store.Get(id);
             if (m == null) return;
 
@@ -174,7 +185,11 @@ namespace Civil3D_commands.AssociativeBreaks
 
                 // Зазор мог измениться — границы областей переставляются под него.
                 Baseline bl = _session.GetBaseline(tr, m);
-                if (bl != null) ProfileGeometryOps.ApplyBreak(bl, m, m.Station);
+                if (bl != null)
+                {
+                    ProfileGeometryOps.ApplyBreak(bl, m, m.Station);
+                    ProfileGeometryOps.SetAssemblies(bl, m, leftAssembly, rightAssembly);
+                }
 
                 BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, alignment);
                 WriteProps(tr, m);
