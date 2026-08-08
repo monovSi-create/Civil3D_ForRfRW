@@ -83,15 +83,10 @@ namespace Civil3D_commands.AssociativeBreaks
                                                ProfileView profileView, Alignment alignment)
         {
             // --- Вид профиля: вертикаль во всю высоту вида ---
-            // Не «отметка низа плюс два метра»: разрыв делит вид целиком, и
-            // короткая чёрточка у основания заставляла целиться в неё мышью.
             ObjectId profProxyId = ResolveId(m.ProfileProxyHandle);
             if (!profProxyId.IsNull && profileView != null)
             {
-                Point3d[] pts = RwGeometry.ProfileSegment(
-                    profileView,
-                    m.Station, profileView.ElevationMin,
-                    m.Station, profileView.ElevationMax);
+                Point3d[] pts = ProfilePoints(profileView, m);
 
                 if (pts != null)
                 {
@@ -116,6 +111,42 @@ namespace Civil3D_commands.AssociativeBreaks
                 }
             }
         }
+
+        /// <summary>
+        /// Геометрия профильного прокси: вертикаль **во всю высоту вида**.
+        /// Не «отметка низа плюс два метра»: разрыв делит вид целиком, и
+        /// короткая чёрточка у основания терялась среди геометрии.
+        ///
+        /// Отметки берутся с отступом внутрь диапазона вида. Ровно на границе
+        /// `FindXYAtStationAndElevation` возвращает NaN, отрезок не строился
+        /// вовсе, и линия оставалась нулевой длины — невидимой и невыбираемой.
+        /// Именно так и выглядела «пропавшая» линия на профиле.
+        ///
+        /// Запасной вариант — от отметки низа вверх: лучше короткая линия,
+        /// чем никакой.
+        /// </summary>
+        public static Point3d[] ProfilePoints(ProfileView view, StationMarker m)
+        {
+            if (view == null) return null;
+
+            double lo = view.ElevationMin;
+            double hi = view.ElevationMax;
+
+            if (hi < lo) { double t = lo; lo = hi; hi = t; }
+
+            double inset = Math.Max((hi - lo) * 1e-4, 1e-6);
+
+            Point3d[] pts = RwGeometry.ProfileSegment(
+                view, m.Station, lo + inset, m.Station, hi - inset);
+
+            if (pts != null) return pts;
+
+            return RwGeometry.ProfileSegment(
+                view, m.Station, m.BaseElevation, m.Station, m.BaseElevation + FallbackHeight);
+        }
+
+        /// <summary>Высота запасной вертикали, если во всю высоту вида не вышло.</summary>
+        private const double FallbackHeight = 2.0;
 
         /// <summary>
         /// Геометрия планового прокси: **начало на оси**, конец в стороне на

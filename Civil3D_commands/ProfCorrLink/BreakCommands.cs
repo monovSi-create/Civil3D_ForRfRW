@@ -782,6 +782,54 @@ namespace Civil3D_commands.AssociativeBreaks
             ed.WriteMessage("\nСвойства разрыва изменены, коридор перестроен.");
         }
 
+        // ------------------------------------------------------------------
+        //  ПЕРЕСТРОИТЬ ПРОКСИ ВСЕХ РАЗРЫВОВ
+        //
+        //  Нужна для чертежей, где прокси уже созданы прежней версией: там
+        //  профильная линия могла остаться короткой или вовсе вырожденной.
+        //  Модель не трогается — только геометрия линий.
+        // ------------------------------------------------------------------
+        [CommandMethod("RW_REFRESHBREAKS")]
+        public void RefreshBreaks()
+        {
+            var doc = AcAp.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+            var session = BreakSession.Current;
+            if (session == null) { ed.WriteMessage("\nСессии нет."); return; }
+
+            int done = 0, failed = 0;
+
+            using (doc.LockDocument())
+            using (session.Suspend())
+            using (var tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                var db = doc.Database;
+
+                foreach (var m in session.Store.All)
+                {
+                    var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
+                    var al = RwHandles.Open<Alignment>(tr, db, m.AlignmentHandle, OpenMode.ForRead);
+
+                    if (pv == null && al == null) { failed++; continue; }
+
+                    try
+                    {
+                        BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, al);
+                        done++;
+                    }
+                    catch (System.Exception)
+                    {
+                        failed++;
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage($"\nПрокси перестроены: {done}, не удалось: {failed}.");
+            ed.Regen();
+        }
+
         [CommandMethod("RW_SAVEBREAKS")]
         public void SaveBreaks() =>
             BreakSession.Current?.Store.SaveToDatabase(AcAp.DocumentManager.MdiActiveDocument.Database);
@@ -812,9 +860,17 @@ namespace Civil3D_commands.AssociativeBreaks
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
                 foreach (var m in session.Store.All.OrderBy(x => x.Station))
+                {
                     ed.WriteMessage(
                         $"\nразрыв {m.Station:F3}  ступень={(m.IsStep ? m.StepHeight.ToString("F3") : "нет")}" +
                         $"  зазор={m.Gap:F4}  области {Short(m.LeftRegionId)}/{Short(m.RightRegionId)}");
+
+                    // Длины прокси: ноль означает вырожденную линию — её не видно
+                    // и не выбрать, хотя объект в чертеже есть.
+                    ed.WriteMessage(
+                        $"\n    прокси: профиль {LineInfo(tr, doc.Database, m.ProfileProxyHandle)}," +
+                        $" план {LineInfo(tr, doc.Database, m.PlanProxyHandle)}");
+                }
 
                 // Путь «правка в палитре → перестроение» в чертеже не проверялся.
                 // Счётчики показывают, на каком шаге он обрывается: ноль событий —
@@ -872,6 +928,18 @@ namespace Civil3D_commands.AssociativeBreaks
             ed.WriteMessage(orphans == 0
                 ? "\nЧужих прокси-линий нет."
                 : $"\nВсего ничьих прокси-линий: {orphans}. Их можно просто стереть.");
+        }
+
+        /// <summary>Есть ли прокси и какой он длины — вырожденный виден сразу.</summary>
+        private static string LineInfo(Transaction tr, Database db, Handle h)
+        {
+            var ln = RwHandles.Open<Line>(tr, db, h, OpenMode.ForRead);
+            if (ln == null) return "НЕТ";
+
+            double len = ln.StartPoint.DistanceTo(ln.EndPoint);
+            return len < 1e-9
+                ? $"{h} ВЫРОЖДЕН (длина 0)"
+                : $"{h} длина {len:F3}";
         }
 
         private static string Short(Guid g) =>
