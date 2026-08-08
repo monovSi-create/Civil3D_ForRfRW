@@ -1,4 +1,4 @@
-# Civil3D_For_RF_RW
+# Civil3D_ForRfRW
 
 Инструменты Autodesk Civil 3D 2024 для проектирования **армогрунтовых подпорных
 стен** (Reinforced Fill Retaining Wall). Два независимых проекта: плагин с набором
