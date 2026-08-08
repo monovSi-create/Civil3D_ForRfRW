@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
+using Autodesk.Aec.PropertyData.DatabaseServices;
 using Autodesk.Civil.DatabaseServices;
 using Civil3D_commands.Shared;
 
@@ -19,6 +20,15 @@ namespace Civil3D_commands.AssociativeBreaks
         // guid -> хэндл именно того прокси, который двигали (план или профиль).
         private readonly Dictionary<Guid, Handle> _dirtyStation = new Dictionary<Guid, Handle>();
         private readonly HashSet<Guid> _pendingDelete = new HashSet<Guid>();
+        // Наборы характеристик, тронутые в палитре свойств. Владелец ищется
+        // не здесь, а в Drain: открывать транзакцию внутри ObjectModified не стоит.
+        private readonly HashSet<ObjectId> _dirtyProps = new HashSet<ObjectId>();
+
+        // --- Счётчики для RW_BREAKDIAG. Путь через палитру в чертеже не проверен,
+        // --- и без них непонятно, на каком шаге он обрывается.
+        public static int PropEvents;    // сколько правок набора вообще замечено
+        public static int PropMatched;   // из них опознано как набор нашего прокси
+        public static int PropApplied;   // из них привело к перестроению
         private bool _idleHooked;
         private int _commandDepth; // счётчик вложенных команд; Idle не дренирует пока > 0
 
@@ -52,6 +62,16 @@ namespace Civil3D_commands.AssociativeBreaks
         private void OnObjectModified(object sender, ObjectEventArgs e)
         {
             if (_session.Suspended) return;            // собственные правки — пропускаем
+
+            // Правка поля в палитре свойств меняет не прокси, а его набор
+            // характеристик — отдельный объект, и приходит он сюда же.
+            if (e.DBObject is PropertySet ps)
+            {
+                PropEvents++;
+                if (!ps.ObjectId.IsNull) { _dirtyProps.Add(ps.ObjectId); HookIdle(); }
+                return;
+            }
+
             if (!(e.DBObject is Line ln)) return;      // нас интересуют только прокси-линии
             var m = OwnerOf(ln);
             if (m == null) return;
@@ -109,7 +129,7 @@ namespace Civil3D_commands.AssociativeBreaks
         private void Drain()
         {
             if (_session.Suspended) return;
-            if (_dirtyStation.Count == 0 && _pendingDelete.Count == 0)
+            if (_dirtyStation.Count == 0 && _pendingDelete.Count == 0 && _dirtyProps.Count == 0)
             {
                 if (_idleHooked) { Application.Idle -= OnIdle; _idleHooked = false; }
                 return;
@@ -117,8 +137,11 @@ namespace Civil3D_commands.AssociativeBreaks
 
             var toMove = new Dictionary<Guid, Handle>(_dirtyStation); _dirtyStation.Clear();
             var toDelete = new List<Guid>(_pendingDelete); _pendingDelete.Clear();
+            var toRead = new List<ObjectId>(_dirtyProps); _dirtyProps.Clear();
 
             foreach (var id in toDelete) { _session.Manager.DeleteBreak(id); toMove.Remove(id); }
+
+            foreach (ObjectId psId in toRead) ApplyPropertySet(psId);
 
             foreach (var kv in toMove)
             {
@@ -142,6 +165,81 @@ namespace Civil3D_commands.AssociativeBreaks
             }
 
             if (_idleHooked) { Application.Idle -= OnIdle; _idleHooked = false; }
+        }
+
+        /// <summary>
+        /// Правка в палитре свойств: прочитать набор и применить его к маркеру.
+        ///
+        /// Владелец набора ищется подъёмом по цепочке владения: набор лежит
+        /// в словаре AEC_PROPERTY_SETS, тот — в расширенном словаре объекта,
+        /// и только его владелец есть сам прокси. Сколько именно звеньев —
+        /// в живом сеансе не проверялось, поэтому идём вверх до пяти,
+        /// проверяя каждое на принадлежность маркеру.
+        /// </summary>
+        private void ApplyPropertySet(ObjectId psId)
+        {
+            if (psId.IsNull || psId.IsErased) return;
+
+            Guid markerId = Guid.Empty;
+            double station = 0.0, stepHeight = 0.0, gap = 0.0;
+            bool isStep = false, changedProps = false, changedStation = false;
+
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            try
+            {
+                using (var tr = doc.Database.TransactionManager.StartTransaction())
+                {
+                    var ps = tr.GetObject(psId, OpenMode.ForRead) as PropertySet;
+                    if (ps == null || ps.PropertySetDefinitionName != PropertySetSupport.MarkerPsd)
+                    {
+                        tr.Commit();
+                        return;
+                    }
+
+                    StationMarker m = null;
+                    ObjectId ownerId = ps.OwnerId;
+
+                    for (int i = 0; i < 5 && !ownerId.IsNull; i++)
+                    {
+                        m = _session.Store.GetByProxy(ownerId.Handle);
+                        if (m != null) break;
+
+                        var owner = tr.GetObject(ownerId, OpenMode.ForRead);
+                        if (owner == null) break;
+                        ownerId = owner.OwnerId;
+                    }
+
+                    if (m == null) { tr.Commit(); return; }
+
+                    PropMatched++;
+                    markerId = m.Id;
+
+                    PropertySetSupport.ReadMarkerProps(
+                        tr, ownerId, m, out station, out isStep, out stepHeight, out gap);
+
+                    changedStation = Math.Abs(station - m.Station) > 1e-6;
+                    changedProps = isStep != m.IsStep
+                                   || Math.Abs(stepHeight - m.StepHeight) > 1e-9
+                                   || Math.Abs(gap - m.Gap) > 1e-9;
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception)
+            {
+                return;
+            }
+
+            if (markerId == Guid.Empty) return;
+
+            // Пикет и остальное — разные операции оркестратора; пикет первым,
+            // чтобы ступень встала уже на новом месте.
+            if (changedStation) _session.Manager.ApplyStationChange(markerId, station);
+            if (changedProps) _session.Manager.ApplyProperties(markerId, isStep, stepHeight, gap);
+
+            if (changedStation || changedProps) PropApplied++;
         }
 
         /// <summary>Текущий пикет, вычисленный из геометрии именно того прокси, что двигали.</summary>

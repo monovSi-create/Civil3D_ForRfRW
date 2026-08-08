@@ -34,16 +34,19 @@ namespace Civil3D_commands.AssociativeBreaks
                 Baseline bl = _session.GetBaseline(tr, template);
                 ClampToNeighbors(template, bl);
 
-                template.BaseElevation = ProfileGeometryOps.BaseElevationAt(profile, template.Station);
+                template.BaseElevation =
+                    ProfileGeometryOps.BaseElevationAt(profile, template.Station, template.HalfGap);
 
                 if (template.IsStep)
-                    ProfileGeometryOps.InsertStep(profile, template.Station, template.StepHeight);
+                    ProfileGeometryOps.InsertStep(
+                        profile, template.Station, template.StepHeight, template.HalfGap);
 
                 BreakProxyFactory.CreateProxies(tr, Doc.Database, template, pv, alignment);
                 _session.Store.Add(template);
 
                 // Режет ровно одну область — ту, внутрь которой попал разрыв.
                 if (bl != null) ProfileGeometryOps.ApplyBreak(bl, template, template.Station);
+                WriteProps(tr, template);
                 RebuildCorridor(tr, template);
 
                 tr.Commit();
@@ -65,7 +68,7 @@ namespace Civil3D_commands.AssociativeBreaks
                 var profile = (Profile)tr.GetObject(Resolve(m.ProfileHandle), OpenMode.ForWrite);
 
                 if (m.IsStep)
-                    ProfileGeometryOps.RemoveStep(profile, m.Station, m.StepHeight);
+                    ProfileGeometryOps.RemoveStep(profile, m.Station, m.StepHeight, m.HalfGap);
 
                 EraseIfValid(tr, m.ProfileProxyHandle);
                 EraseIfValid(tr, m.PlanProxyHandle);
@@ -112,8 +115,9 @@ namespace Civil3D_commands.AssociativeBreaks
                 {
                     if (m.IsStep)
                     {
-                        ProfileGeometryOps.MoveStep(profile, old, m.Station, m.StepHeight);
-                        m.BaseElevation = ProfileGeometryOps.BaseElevationAt(profile, m.Station);
+                        ProfileGeometryOps.MoveStep(profile, old, m.Station, m.StepHeight, m.HalfGap);
+                        m.BaseElevation =
+                            ProfileGeometryOps.BaseElevationAt(profile, m.Station, m.HalfGap);
                     }
 
                     if (bl != null) ProfileGeometryOps.ApplyBreak(bl, m, old);
@@ -124,12 +128,92 @@ namespace Civil3D_commands.AssociativeBreaks
                 // перемещение: пикет не изменился, но линию пользователь уже утащил,
                 // и без этого она осталась бы стоять мимо модели.
                 BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, alignment);
+                WriteProps(tr, m);
+                tr.Commit();
+            }
+            _session.Store.SaveToDatabase(Doc.Database);
+        }
+
+        /// <summary>
+        /// Изменить свойства разрыва: ступень, её высоту и микроразрыв.
+        /// Пикет при этом не меняется — для него есть ApplyStationChange.
+        ///
+        /// Порядок важен: старая ступень снимается по СТАРЫМ значениям (пара PVI
+        /// стоит на прежнем полузазоре и по новому не найдётся), и только потом
+        /// в маркер пишутся новые.
+        /// </summary>
+        public void ApplyProperties(Guid id, bool isStep, double stepHeight, double gap)
+        {
+            var m = _session.Store.Get(id);
+            if (m == null) return;
+
+            using (Doc.LockDocument())
+            using (_session.Suspend())
+            using (var tr = Doc.Database.TransactionManager.StartTransaction())
+            {
+                var db = Doc.Database;
+                var profile = RwHandles.Open<Profile>(tr, db, m.ProfileHandle, OpenMode.ForWrite);
+                var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
+                var alignment = RwHandles.Open<Alignment>(tr, db, m.AlignmentHandle, OpenMode.ForRead);
+
+                if (m.IsStep && profile != null)
+                    ProfileGeometryOps.RemoveStep(profile, m.Station, m.StepHeight, m.HalfGap);
+
+                m.IsStep = isStep;
+                m.StepHeight = isStep ? stepHeight : 0.0;
+                m.Gap = ProfileGeometryOps.SanitizeGap(gap);
+
+                if (profile != null)
+                {
+                    if (m.IsStep)
+                        ProfileGeometryOps.InsertStep(profile, m.Station, m.StepHeight, m.HalfGap);
+
+                    m.BaseElevation =
+                        ProfileGeometryOps.BaseElevationAt(profile, m.Station, m.HalfGap);
+                }
+
+                // Зазор мог измениться — границы областей переставляются под него.
+                Baseline bl = _session.GetBaseline(tr, m);
+                if (bl != null) ProfileGeometryOps.ApplyBreak(bl, m, m.Station);
+
+                BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, alignment);
+                WriteProps(tr, m);
+                RebuildCorridor(tr, m);
+
                 tr.Commit();
             }
             _session.Store.SaveToDatabase(Doc.Database);
         }
 
         // ----------------------------------------------------------------------
+
+        /// <summary>
+        /// Обновить набор характеристик на обоих прокси. Вызывается после КАЖДОЙ
+        /// правки: прежде набор писался только при создании и после первого же
+        /// перетаскивания показывал неправду.
+        /// </summary>
+        private void WriteProps(Transaction tr, StationMarker m)
+        {
+            try
+            {
+                ObjectId psd = PropertySetSupport.EnsureMarkerPsd(Doc.Database);
+                if (psd.IsNull) return;
+
+                foreach (Handle h in new[] { m.ProfileProxyHandle, m.PlanProxyHandle })
+                {
+                    ObjectId id = Resolve(h);
+                    if (id.IsNull) continue;
+
+                    PropertySetSupport.Attach(tr, id, psd);
+                    PropertySetSupport.WriteMarkerProps(tr, id, m);
+                }
+            }
+            catch (System.Exception)
+            {
+                // Набор характеристик — удобство, а не механика: если он
+                // не применился к Line, разрывы обязаны работать по-прежнему.
+            }
+        }
 
         private void ClampToNeighbors(StationMarker m, Baseline bl)
         {

@@ -23,7 +23,8 @@ namespace Civil3D_commands.AssociativeBreaks
         // падало на первом же поле, а исключение гасилось вызывающим кодом —
         // маркер молча исчезал. Прежние записи читаются позиционным путём.
         private const string Tag = "RWBREAK";
-        private const int FormatVersion = 1;
+        // 2 — собственный микроразрыв у каждого разрыва.
+        private const int FormatVersion = 2;
 
         /// <summary>
         /// Вид записи. LinkStore хранит связь этим же классом (заполнены только
@@ -49,6 +50,27 @@ namespace Civil3D_commands.AssociativeBreaks
 
         /// <summary>Базовая отметка ровного участка перед ступенью (для размещения прокси по вертикали).</summary>
         public double BaseElevation { get; set; }
+
+        /// <summary>
+        /// Микроразрыв: полная ширина зазора между соседними участками коридора.
+        /// Левый кончается на S − Gap/2, правый начинается на S + Gap/2, туда же
+        /// становится пара PVI ступени — поэтому вертикаль профиля и стык
+        /// областей это одно место.
+        ///
+        /// Своё значение у каждого разрыва: один стык бывает нужно сделать
+        /// плотнее другого. Раньше зазор был константой в коде.
+        /// </summary>
+        public double Gap { get; set; } = ProfileGeometryOps.DefaultGap;
+
+        /// <summary>
+        /// Полузазор — то, на что расходится каждая сторона. Всегда в разумных
+        /// пределах: значение из чертежа могли поправить руками, а нулевой или
+        /// отрицательный зазор схлопнул бы участки.
+        /// </summary>
+        public double HalfGap
+        {
+            get { return ProfileGeometryOps.SanitizeGap(Gap) / 2.0; }
+        }
 
         /// <summary>Слой прокси-объектов.</summary>
         public string Layer { get; set; } = "0";
@@ -94,7 +116,9 @@ namespace Civil3D_commands.AssociativeBreaks
                 new TypedValue((int)DxfCode.Text, RwHandles.ToText(ProfileProxyHandle)),
                 new TypedValue((int)DxfCode.Text, RwHandles.ToText(PlanProxyHandle)),
                 new TypedValue((int)DxfCode.Text, LeftRegionId.ToString("N")),
-                new TypedValue((int)DxfCode.Text, RightRegionId.ToString("N")));
+                new TypedValue((int)DxfCode.Text, RightRegionId.ToString("N")),
+                // формат 2
+                new TypedValue((int)DxfCode.Real, Gap));
         }
 
         /// <summary>
@@ -156,6 +180,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 m.LeftRegionId = ParseGuid(v[i++].Value.ToString());
                 m.RightRegionId = ParseGuid(v[i++].Value.ToString());
             }
+
+            // Формат 2. В записях формата 1 зазора нет — берётся значение
+            // по умолчанию, то самое, что раньше было константой.
+            if (v.Length > i)
+                m.Gap = ProfileGeometryOps.SanitizeGap(Convert.ToDouble(v[i++].Value));
 
             return m;
         }

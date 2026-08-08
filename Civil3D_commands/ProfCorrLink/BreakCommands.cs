@@ -99,12 +99,14 @@ namespace Civil3D_commands.AssociativeBreaks
             // 3) Новый коридор или существующий?
             var corrKw = new PromptKeywordOptions(
                 "\nКоридор: создать новый или выбрать существующий?");
-            corrKw.Keywords.Add("Создать");
-            corrKw.Keywords.Add("Выбрать");
-            corrKw.Keywords.Default = "Создать";
+            // Ключевые слова латиницей с русскими подписями: кириллицу
+            // не ввести при английской раскладке.
+            corrKw.Keywords.Add("Create", "Create", "Создать");
+            corrKw.Keywords.Add("Select", "Select", "Выбрать");
+            corrKw.Keywords.Default = "Create";
             var corrKwRes = ed.GetKeywords(corrKw);
             if (corrKwRes.Status != PromptStatus.OK) return;
-            bool createNew = corrKwRes.StringResult == "Создать";
+            bool createNew = corrKwRes.StringResult == "Create";
 
             // 4) Имя нового коридора ИЛИ выбор существующего
             string corrName = null;
@@ -132,13 +134,13 @@ namespace Civil3D_commands.AssociativeBreaks
             {
                 var asmKw = new PromptKeywordOptions(
                     "\nЗадать конструкцию (Assembly) коридора?");
-                asmKw.Keywords.Add("Да");
-                asmKw.Keywords.Add("Нет");
-                asmKw.Keywords.Default = "Нет";
+                asmKw.Keywords.Add("Yes", "Yes", "Да");
+                asmKw.Keywords.Add("No", "No", "Нет");
+                asmKw.Keywords.Default = "No";
                 var asmKwRes = ed.GetKeywords(asmKw);
                 if (asmKwRes.Status != PromptStatus.OK) return;
 
-                if (asmKwRes.StringResult == "Да")
+                if (asmKwRes.StringResult == "Yes")
                 {
                     var asmOpt = new PromptEntityOptions("\nВыберите конструкцию (Assembly)");
                     asmOpt.SetRejectMessage("\nНужна Assembly");
@@ -293,11 +295,12 @@ namespace Civil3D_commands.AssociativeBreaks
 
             // Ступень?
             var stepKw = new PromptKeywordOptions("\nЭто ступень профиля?");
-            stepKw.Keywords.Add("Да"); stepKw.Keywords.Add("Нет");
-            stepKw.Keywords.Default = "Да";
+            stepKw.Keywords.Add("Yes", "Yes", "Да");
+            stepKw.Keywords.Add("No", "No", "Нет");
+            stepKw.Keywords.Default = "Yes";
             var stepRes = ed.GetKeywords(stepKw);
             if (stepRes.Status != PromptStatus.OK) return;
-            bool isStep = stepRes.StringResult == "Да";
+            bool isStep = stepRes.StringResult == "Yes";
 
             double stepH = 0;
             if (isStep)
@@ -307,11 +310,23 @@ namespace Civil3D_commands.AssociativeBreaks
                 stepH = hRes.Value;
             }
 
+            // Микроразрыв: по умолчанию тот же, что был константой.
+            var gapOpt = new PromptDoubleOptions("\nМикроразрыв между участками")
+            {
+                DefaultValue = ProfileGeometryOps.DefaultGap,
+                UseDefaultValue = true,
+                AllowNegative = false,
+                AllowZero = false
+            };
+            var gapRes = ed.GetDouble(gapOpt);
+            if (gapRes.Status != PromptStatus.OK) return;
+
             var marker = new StationMarker
             {
                 Station = station,
                 IsStep = isStep,
                 StepHeight = stepH,
+                Gap = ProfileGeometryOps.SanitizeGap(gapRes.Value),
                 Layer = "0",                       // АДАПТ: слой по умолчанию
                 ProfileHandle = link.ProfileHandle,
                 ProfileViewHandle = link.ProfileViewHandle,
@@ -319,23 +334,13 @@ namespace Civil3D_commands.AssociativeBreaks
                 CorridorHandle = link.CorridorHandle
             };
 
-            Guid id = session.Manager.CreateBreak(marker);
+            // Набор характеристик на прокси пишет сам оркестратор — и при
+            // создании, и после каждой правки, иначе палитра врёт.
+            session.Manager.CreateBreak(marker);
 
-            // Записать свойства в набор прокси (для палитры).
-            using (var tr = doc.Database.TransactionManager.StartTransaction())
-            {
-                var m = session.Store.Get(id);
-                ObjectId psd = PropertySetSupport.EnsureMarkerPsd(doc.Database);
-                foreach (var h in new[] { m.ProfileProxyHandle, m.PlanProxyHandle })
-                {
-                    ObjectId pid = Resolve(doc.Database, h);
-                    if (pid.IsNull) continue;
-                    PropertySetSupport.Attach(tr, pid, psd);
-                    PropertySetSupport.WriteMarkerProps(tr, pid, m);
-                }
-                tr.Commit();
-            }
-            ed.WriteMessage($"\nРазрыв создан на пикете {station:F3}.");
+            ed.WriteMessage(
+                $"\nРазрыв создан на пикете {station:F3}, микроразрыв {marker.Gap:F4}." +
+                "\nИзменить свойства: RW_EDITBREAK.");
         }
 
         // ------------------------------------------------------------------
@@ -382,6 +387,80 @@ namespace Civil3D_commands.AssociativeBreaks
             ed.WriteMessage("\nРазрыв удалён.");
         }
 
+        // ------------------------------------------------------------------
+        //  ИЗМЕНИТЬ СВОЙСТВА РАЗРЫВА
+        //  До этого свойства задавались только при создании и потом не менялись.
+        // ------------------------------------------------------------------
+        [CommandMethod("RW_EDITBREAK")]
+        public void EditBreak()
+        {
+            var doc = AcAp.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+            var session = BreakSession.Current;
+            if (session == null) return;
+
+            var opt = new PromptEntityOptions("\nВыберите прокси разрыва");
+            opt.SetRejectMessage("\nНужен прокси разрыва");
+            opt.AddAllowedClass(typeof(Line), false);
+            var res = ed.GetEntity(opt);
+            if (res.Status != PromptStatus.OK) return;
+
+            StationMarker m = session.Store.GetByProxy(res.ObjectId.Handle);
+            if (m == null)
+            {
+                ed.WriteMessage("\nЭта линия в модели не числится — не прокси разрыва или его копия.");
+                return;
+            }
+
+            ed.WriteMessage(
+                $"\nРазрыв на пикете {m.Station:F3}: ступень={(m.IsStep ? m.StepHeight.ToString("F3") : "нет")}, " +
+                $"микроразрыв={m.Gap:F4}");
+
+            // Ключевые слова латиницей с русскими подписями: кириллицу
+            // не ввести при английской раскладке.
+            var stepKw = new PromptKeywordOptions("\nСтупень профиля?");
+            stepKw.Keywords.Add("Yes", "Yes", "Да");
+            stepKw.Keywords.Add("No", "No", "Нет");
+            stepKw.Keywords.Default = m.IsStep ? "Yes" : "No";
+            var stepRes = ed.GetKeywords(stepKw);
+            if (stepRes.Status != PromptStatus.OK) return;
+            bool isStep = stepRes.StringResult == "Yes";
+
+            double stepH = m.StepHeight;
+            if (isStep)
+            {
+                var hOpt = new PromptDoubleOptions(
+                    "\nВысота ступени (знак: + вверх, - вниз по ходу пикета)")
+                {
+                    DefaultValue = m.StepHeight == 0.0 ? 1.0 : m.StepHeight,
+                    UseDefaultValue = true,
+                    AllowNegative = true,
+                    AllowZero = true
+                };
+                var hRes = ed.GetDouble(hOpt);
+                if (hRes.Status != PromptStatus.OK) return;
+                stepH = hRes.Value;
+            }
+
+            var gapOpt = new PromptDoubleOptions(
+                $"\nМикроразрыв между участками ({ProfileGeometryOps.MinGap}..{ProfileGeometryOps.MaxGap})")
+            {
+                DefaultValue = m.Gap,
+                UseDefaultValue = true,
+                AllowNegative = false,
+                AllowZero = false
+            };
+            var gapRes = ed.GetDouble(gapOpt);
+            if (gapRes.Status != PromptStatus.OK) return;
+
+            double gap = ProfileGeometryOps.SanitizeGap(gapRes.Value);
+            if (Math.Abs(gap - gapRes.Value) > 1e-12)
+                ed.WriteMessage($"\nМикроразрыв приведён к допустимому: {gap:F4}");
+
+            session.Manager.ApplyProperties(m.Id, isStep, stepH, gap);
+            ed.WriteMessage("\nСвойства разрыва изменены, коридор перестроен.");
+        }
+
         [CommandMethod("RW_SAVEBREAKS")]
         public void SaveBreaks() =>
             BreakSession.Current?.Store.SaveToDatabase(AcAp.DocumentManager.MdiActiveDocument.Database);
@@ -414,7 +493,15 @@ namespace Civil3D_commands.AssociativeBreaks
                 foreach (var m in session.Store.All.OrderBy(x => x.Station))
                     ed.WriteMessage(
                         $"\nразрыв {m.Station:F3}  ступень={(m.IsStep ? m.StepHeight.ToString("F3") : "нет")}" +
-                        $"  области {Short(m.LeftRegionId)}/{Short(m.RightRegionId)}");
+                        $"  зазор={m.Gap:F4}  области {Short(m.LeftRegionId)}/{Short(m.RightRegionId)}");
+
+                // Путь «правка в палитре → перестроение» в чертеже не проверялся.
+                // Счётчики показывают, на каком шаге он обрывается: ноль событий —
+                // палитра правит набор не через ObjectModified; события есть, а
+                // опознанных нет — не сходится цепочка владения от набора к прокси.
+                ed.WriteMessage(
+                    $"\nпалитра: событий {BreakReactor.PropEvents}, " +
+                    $"опознано {BreakReactor.PropMatched}, применено {BreakReactor.PropApplied}");
 
                 if (link != null)
                 {

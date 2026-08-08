@@ -21,14 +21,35 @@ namespace Civil3D_commands.AssociativeBreaks
     /// </summary>
     public static class ProfileGeometryOps
     {
-        /// <summary>Полузазор: на столько разъезжаются области и PVI по обе стороны от разрыва.</summary>
-        public const double HalfGap = 0.0005;
+        /// <summary>
+        /// Зазор по умолчанию — то самое значение, что раньше было константой.
+        /// Достаётся новым разрывам и записям прежнего формата.
+        /// </summary>
+        public const double DefaultGap = 0.001;
 
-        /// <summary>Полный зазор между областями (и между парой PVI ступени).</summary>
-        public const double StepGap = 2.0 * HalfGap;
+        /// <summary>
+        /// Минимальный зазор. Ниже него пара PVI ступени становится неразличимой
+        /// для поиска по допуску, а участки — вырожденно близкими.
+        /// </summary>
+        public const double MinGap = 0.0002;
+
+        /// <summary>Максимальный зазор: дальше это уже не микроразрыв, а дыра в коридоре.</summary>
+        public const double MaxGap = 10.0;
 
         /// <summary>Допуск поиска PVI. Заметно меньше зазора, чтобы не спутать пару.</summary>
         private const double PviTol = 1e-4;
+
+        /// <summary>
+        /// Привести зазор к допустимому. Значение приходит из записи в чертеже
+        /// и из ввода пользователя, поэтому проверяется в одном месте.
+        /// </summary>
+        public static double SanitizeGap(double gap)
+        {
+            if (double.IsNaN(gap) || double.IsInfinity(gap)) return DefaultGap;
+            if (gap < MinGap) return MinGap;
+            if (gap > MaxGap) return MaxGap;
+            return gap;
+        }
 
         /// <summary>
         /// Допуск восстановления привязки к областям по геометрии. Крупный намеренно:
@@ -47,12 +68,12 @@ namespace Civil3D_commands.AssociativeBreaks
             profile.ElevationAt(Clamp(profile, station));
 
         /// <summary>
-        /// Отметка ровного участка ПЕРЕД разрывом. Берётся на S-0.0005, а не на S:
+        /// Отметка ровного участка ПЕРЕД разрывом. Берётся на S − полузазор, а не на S:
         /// в самой точке S профиль в этот момент вертикален, и что вернёт ElevationAt —
         /// низ или верх ступени — не определено.
         /// </summary>
-        public static double BaseElevationAt(Profile profile, double station) =>
-            profile.ElevationAt(Clamp(profile, station - HalfGap));
+        public static double BaseElevationAt(Profile profile, double station, double halfGap) =>
+            profile.ElevationAt(Clamp(profile, station - halfGap));
 
         private static double Clamp(Profile profile, double station)
         {
@@ -66,9 +87,9 @@ namespace Civil3D_commands.AssociativeBreaks
         /// на stepHeight и поставить пару PVI (station-HalfGap / station+HalfGap).
         /// stepHeight со знаком: + вверх по ходу пикетажа.
         /// </summary>
-        public static void InsertStep(Profile profile, double station, double stepHeight)
+        public static void InsertStep(Profile profile, double station, double stepHeight, double halfGap)
         {
-            double baseElev = BaseElevationAt(profile, station);
+            double baseElev = BaseElevationAt(profile, station, halfGap);
 
             // Сдвигаем по высоте всё, что строго правее разрыва. Пары PVI ранее
             // поставленных ступеней уезжают целиком — обе точки строго правее.
@@ -76,15 +97,19 @@ namespace Civil3D_commands.AssociativeBreaks
                                               .Where(p => p.Station > station).ToList())
                 pvi.Elevation += stepHeight;
 
-            profile.PVIs.AddPVI(station - HalfGap, baseElev);
-            profile.PVIs.AddPVI(station + HalfGap, baseElev + stepHeight);
+            profile.PVIs.AddPVI(station - halfGap, baseElev);
+            profile.PVIs.AddPVI(station + halfGap, baseElev + stepHeight);
         }
 
-        /// <summary>Удалить ступень в station (обратная к InsertStep).</summary>
-        public static void RemoveStep(Profile profile, double station, double stepHeight)
+        /// <summary>
+        /// Удалить ступень в station (обратная к InsertStep).
+        /// halfGap должен быть ТОТ ЖЕ, с которым ступень ставилась, иначе пара
+        /// PVI не найдётся и в профиле останется вертикаль.
+        /// </summary>
+        public static void RemoveStep(Profile profile, double station, double stepHeight, double halfGap)
         {
-            RemovePviNear(profile, station - HalfGap);
-            RemovePviNear(profile, station + HalfGap);
+            RemovePviNear(profile, station - halfGap, halfGap);
+            RemovePviNear(profile, station + halfGap, halfGap);
 
             foreach (ProfilePVI pvi in profile.PVIs.Cast<ProfilePVI>()
                                               .Where(p => p.Station > station).ToList())
@@ -92,28 +117,39 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>Перенести ступень с oldStation на newStation, сохранив stepHeight.</summary>
-        public static void MoveStep(Profile profile, double oldStation, double newStation, double stepHeight)
+        public static void MoveStep(Profile profile, double oldStation, double newStation,
+                                    double stepHeight, double halfGap)
         {
             // Снять и поставить заново: устойчивее, чем править две точки на месте.
-            RemoveStep(profile, oldStation, stepHeight);
-            InsertStep(profile, newStation, stepHeight);
+            RemoveStep(profile, oldStation, stepHeight, halfGap);
+            InsertStep(profile, newStation, stepHeight, halfGap);
         }
 
-        private static void RemovePviNear(Profile profile, double station)
+        /// <summary>
+        /// Допуск поиска сужается вместе с зазором: при узком стыке две точки
+        /// пары ближе друг к другу, чем PviTol, и по нему нашлась бы не та.
+        /// </summary>
+        private static void RemovePviNear(Profile profile, double station, double halfGap)
         {
+            double tol = Math.Min(PviTol, halfGap / 2.0);
+
             var pvi = profile.PVIs.Cast<ProfilePVI>()
-                             .FirstOrDefault(p => Math.Abs(p.Station - station) <= PviTol);
+                             .FirstOrDefault(p => Math.Abs(p.Station - station) <= tol);
             if (pvi != null) profile.PVIs.Remove(pvi);
         }
 
-        /// <summary>Станции всех "скачков" профиля (середина каждой почти-вертикали).</summary>
-        public static List<double> GetStepStations(Profile profile)
+        /// <summary>
+        /// Станции всех "скачков" профиля (середина каждой почти-вертикали).
+        /// maxGap — какой зазор ещё считать ступенью; у разрывов он теперь свой,
+        /// поэтому берётся наибольший из интересующих.
+        /// </summary>
+        public static List<double> GetStepStations(Profile profile, double maxGap = DefaultGap)
         {
             var stations = new List<double>();
             var pvis = profile.PVIs.Cast<ProfilePVI>().OrderBy(p => p.Station).ToArray();
             for (int i = 1; i < pvis.Length; i++)
                 if (Math.Abs(pvis[i].Elevation - pvis[i - 1].Elevation) > 1e-6 &&
-                    Math.Abs(pvis[i].Station - pvis[i - 1].Station) <= StepGap + PviTol)
+                    Math.Abs(pvis[i].Station - pvis[i - 1].Station) <= maxGap + PviTol)
                     stations.Add((pvis[i].Station + pvis[i - 1].Station) / 2.0);
             return stations;
         }
@@ -138,23 +174,23 @@ namespace Civil3D_commands.AssociativeBreaks
             BaselineRegion right = FindByGuid(regions, m.RightRegionId);
 
             if (left == null || right == null)
-                Rebind(regions, oldStation, ref left, ref right);
+                Rebind(regions, oldStation, m.HalfGap, ref left, ref right);
 
             if (left != null && right != null)
             {
-                MoveBoundary(left, right, m.Station);
+                MoveBoundary(left, right, m.Station, m.HalfGap);
                 m.LeftRegionId = left.RegionGUID;
                 m.RightRegionId = right.RegionGUID;
                 return true;
             }
 
             // Разрыва в коридоре ещё нет: режем область, внутри которой стоит маркер.
-            BaselineRegion host = FindRegionAt(regions, m.Station);
+            BaselineRegion host = FindRegionAt(regions, m.Station, m.HalfGap);
             if (host == null) return false;
 
             BaselineRegion created = host.Split(m.Station);
             created.Name = "Участок " + regions.Count;
-            MoveBoundary(host, created, m.Station);
+            MoveBoundary(host, created, m.Station, m.HalfGap);
 
             m.LeftRegionId = host.RegionGUID;
             m.RightRegionId = created.RegionGUID;
@@ -176,7 +212,7 @@ namespace Civil3D_commands.AssociativeBreaks
             BaselineRegion left = FindByGuid(regions, m.LeftRegionId);
             BaselineRegion right = FindByGuid(regions, m.RightRegionId);
             if (left == null || right == null)
-                Rebind(regions, m.Station, ref left, ref right);
+                Rebind(regions, m.Station, m.HalfGap, ref left, ref right);
             if (left == null || right == null) return false;
 
             removed = right.RegionGUID;
@@ -190,11 +226,16 @@ namespace Civil3D_commands.AssociativeBreaks
             return true;
         }
 
-        /// <summary>Переставить общую границу пары областей на пикет station.</summary>
-        private static void MoveBoundary(BaselineRegion left, BaselineRegion right, double station)
+        /// <summary>
+        /// Переставить общую границу пары областей на пикет station.
+        /// Один участок при этом удлиняется, соседний ровно на столько же
+        /// сжимается — между ними остаётся зазор шириной 2·halfGap.
+        /// </summary>
+        private static void MoveBoundary(BaselineRegion left, BaselineRegion right,
+                                         double station, double halfGap)
         {
-            double leftEnd = station - HalfGap;
-            double rightStart = station + HalfGap;
+            double leftEnd = station - halfGap;
+            double rightStart = station + halfGap;
 
             // Порядок обязателен: сначала ужимаем ту область, что отдаёт кусок,
             // потом расширяем принимающую. Наоборот — промежуточное перекрытие.
@@ -211,14 +252,14 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>Восстановить пару областей разрыва по его прежнему пикету.</summary>
-        private static void Rebind(BaselineRegionCollection regions, double station,
+        private static void Rebind(BaselineRegionCollection regions, double station, double halfGap,
                                    ref BaselineRegion left, ref BaselineRegion right)
         {
             foreach (BaselineRegion r in regions)
             {
-                if (left == null && Math.Abs(r.EndStation - station) <= HalfGap + RebindTol)
+                if (left == null && Math.Abs(r.EndStation - station) <= halfGap + RebindTol)
                     left = r;
-                if (right == null && Math.Abs(r.StartStation - station) <= HalfGap + RebindTol)
+                if (right == null && Math.Abs(r.StartStation - station) <= halfGap + RebindTol)
                     right = r;
             }
             // Одна область не может быть обеими сторонами одного разрыва.
@@ -238,10 +279,11 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>Область, внутрь которой попадает пикет (с запасом на будущий зазор).</summary>
-        private static BaselineRegion FindRegionAt(BaselineRegionCollection regions, double station)
+        private static BaselineRegion FindRegionAt(BaselineRegionCollection regions,
+                                                   double station, double halfGap)
         {
             foreach (BaselineRegion r in regions)
-                if (station > r.StartStation + HalfGap && station < r.EndStation - HalfGap)
+                if (station > r.StartStation + halfGap && station < r.EndStation - halfGap)
                     return r;
             return null;
         }
