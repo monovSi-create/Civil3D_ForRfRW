@@ -91,7 +91,7 @@
     <Compile Include="GeoPanel_Typical.vb" />
     <Compile Include="MB1_Soil.vb" />
     <Compile Include="MB1_Typical.vb" />
-    <Compile Include="Soil_LENGIPROTRANS.vb" />
+    <Compile Include="Soil_TypedGeogrids.vb" />
     <Compile Include="SubBaseElement.vb" />
     <Compile Include="FacingElementTW1.vb" />
     <Compile Include="Soil.vb" />

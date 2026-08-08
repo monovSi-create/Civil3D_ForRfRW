@@ -6,7 +6,7 @@ Imports System.Math
 Imports Shape = Autodesk.Civil.DatabaseServices.Shape
 
 
-Public Class Soil_LENGIPROTRANS
+Public Class Soil_TypedGeogrids
     Inherits SATemplate
 
     ' *************************************************************************
