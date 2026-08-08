@@ -30,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   добавить в `<ItemGroup>` с `<Compile Include=...>`**, иначе он молча не компилируется.
 - Результат — `Civil3D_commands\bin\Debug\Civil3D_commands.dll`, его и грузят
   `NETLOAD`. Конфигурация только Debug; платформа `AnyCPU` (в
-  `CorridorLinker/README.md` написано «x64» — там неверно, менять не нужно:
+  `ProfCorrLink/README.md` написано «x64» — там неверно, менять не нужно:
   AnyCPU-сборка грузится в 64-битный хост как есть).
 - **Civil 3D держит DLL после `NETLOAD`.** Выгрузить .NET-сборку из сеанса нельзя,
   пересборка в `bin\Debug` падает с MSB3027. Перед сборкой попросить пользователя
@@ -68,8 +68,7 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 | Путь | Что |
 |------|-----|
 | `FaceArr/` | Facing Wall — параметрическая облицовка стены. **Есть свой `README.md` — читать его первым при работе с модулем.** |
-| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_DELETEBREAK`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). Живая версия, включена в сборку; архитектура описана в `CorridorLinker/README.md`. |
-| `CorridorLinker/` | **Устаревшая копия `ProfCorrLink`** — те же классы в том же namespace, в `.csproj` не включена. Её `README.md` описывает архитектуру модуля и актуален. Не редактировать; при добавлении в сборку получите дубликаты классов. |
+| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_DELETEBREAK`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
 | `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`, плюс служебная `UpdateRegions`). |
 | `RetrieveReinfSoilMaterials.cs` | Ведомость материалов стены + таблица через `EntityJig` (`RW_MATERIALS`, `RW_WallPolylines`). |
 | `CorridorPolylineExtractor.cs` | Полилинии из коридора по группировке Z (`RW_ExtractCorridorPolylines`). |
