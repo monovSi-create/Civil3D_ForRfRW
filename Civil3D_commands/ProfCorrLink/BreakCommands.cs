@@ -115,49 +115,7 @@ namespace Civil3D_commands.AssociativeBreaks
                 tr.Commit();
             }
 
-            // 2) Отметка ПЛОСКОГО ПРОФИЛЯ-ОСНОВАНИЯ, который создаёт мастер.
-            //    Коридор строится по нему, а разрывы потом режут в нём ступени,
-            //    поэтому отметка задаёт исходный уровень всей стены. Значение
-            //    по умолчанию — середина вида, чтобы профиль заведомо оказался
-            //    в видимой части.
-            double baseElevation = Math.Round((elevLow + elevHigh) / 2.0, 3);
-
-            var elOpt = new PromptDoubleOptions(
-                "\nОтметка плоского профиля-основания (по нему построится коридор)")
-            {
-                DefaultValue = baseElevation,
-                UseDefaultValue = true,
-                AllowNegative = true,
-                AllowZero = true
-            };
-            elOpt.Keywords.Add("Pick", "Указать", "Указать");
-            elOpt.AppendKeywordsToMessage = true;
-
-            var elRes = ed.GetDouble(elOpt);
-
-            if (elRes.Status == PromptStatus.Keyword && elRes.StringResult == "Pick")
-            {
-                var ptRes = ed.GetPoint("\nУкажите точку в виде профиля на нужной отметке");
-                if (ptRes.Status != PromptStatus.OK) return;
-
-                using (var tr = db.TransactionManager.StartTransaction())
-                {
-                    var pv = (ProfileView)tr.GetObject(pvRes.ObjectId, OpenMode.ForRead);
-                    double st, el;
-                    if (RwGeometry.TryStationInProfileView(pv, ptRes.Value, out st, out el))
-                        baseElevation = el;
-                    else
-                        ed.WriteMessage("\nТочка вне вида профиля — оставлена отметка по умолчанию.");
-                    tr.Commit();
-                }
-            }
-            else if (elRes.Status == PromptStatus.OK)
-            {
-                baseElevation = elRes.Value;
-            }
-            else return;
-
-            // 3) Новый коридор или существующий?
+            // 2) Новый коридор или существующий?
             var corrKw = new PromptKeywordOptions(
                 "\nКоридор: создать новый или выбрать существующий?");
             // Первый параметр — глобальное имя (латиницей, оно же возвращается
@@ -171,9 +129,14 @@ namespace Civil3D_commands.AssociativeBreaks
             if (corrKwRes.Status != PromptStatus.OK) return;
             bool createNew = corrKwRes.StringResult == "Create";
 
-            // 4) Имя нового коридора ИЛИ выбор существующего
+            // 3) Имя нового коридора ИЛИ выбор существующего
             string corrName = null;
             ObjectId existingCorrId = ObjectId.Null;
+
+            // Профиль существующей базовой линии. Не пуст — мастер ничего
+            // не создаёт и об отметке не спрашивает.
+            ObjectId existingProfileId = ObjectId.Null;
+            string existingBaselineName = null;
 
             if (createNew)
             {
@@ -189,6 +152,66 @@ namespace Civil3D_commands.AssociativeBreaks
                 var corrRes = ed.GetEntity(corrOpt);
                 if (corrRes.Status != PromptStatus.OK) return;
                 existingCorrId = corrRes.ObjectId;
+
+                // У существующего коридора базовая линия уже построена по своему
+                // профилю — берём его, вместо того чтобы городить второй.
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    if (!TryPickBaselineProfile(tr, ed, existingCorrId, alignmentId,
+                                                out existingProfileId, out existingBaselineName))
+                        existingProfileId = ObjectId.Null;
+                    tr.Commit();
+                }
+
+                if (existingProfileId.IsNull)
+                    ed.WriteMessage(
+                        "\nУ этого коридора нет базовой линии по оси выбранного вида профиля." +
+                        "\nБудет создан плоский профиль-основание и добавлена новая базовая линия.");
+            }
+
+            // 4) Отметка ПЛОСКОГО ПРОФИЛЯ-ОСНОВАНИЯ — только если его вообще
+            //    нужно создавать. Коридор строится по нему, а разрывы потом
+            //    режут в нём ступени, поэтому отметка задаёт исходный уровень
+            //    всей стены. По умолчанию — середина вида, чтобы профиль
+            //    заведомо оказался в видимой части.
+            double baseElevation = Math.Round((elevLow + elevHigh) / 2.0, 3);
+
+            if (existingProfileId.IsNull)
+            {
+                var elOpt = new PromptDoubleOptions(
+                    "\nОтметка плоского профиля-основания (по нему построится коридор)")
+                {
+                    DefaultValue = baseElevation,
+                    UseDefaultValue = true,
+                    AllowNegative = true,
+                    AllowZero = true
+                };
+                elOpt.Keywords.Add("Pick", "Указать", "Указать");
+                elOpt.AppendKeywordsToMessage = true;
+
+                var elRes = ed.GetDouble(elOpt);
+
+                if (elRes.Status == PromptStatus.Keyword && elRes.StringResult == "Pick")
+                {
+                    var ptRes = ed.GetPoint("\nУкажите точку в виде профиля на нужной отметке");
+                    if (ptRes.Status != PromptStatus.OK) return;
+
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        var pv = (ProfileView)tr.GetObject(pvRes.ObjectId, OpenMode.ForRead);
+                        double st, el;
+                        if (RwGeometry.TryStationInProfileView(pv, ptRes.Value, out st, out el))
+                            baseElevation = el;
+                        else
+                            ed.WriteMessage("\nТочка вне вида профиля — оставлена отметка по умолчанию.");
+                        tr.Commit();
+                    }
+                }
+                else if (elRes.Status == PromptStatus.OK)
+                {
+                    baseElevation = elRes.Value;
+                }
+                else return;
             }
 
             // 5) Конструкция (Assembly) — только при создании нового коридора
@@ -220,36 +243,53 @@ namespace Civil3D_commands.AssociativeBreaks
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                // --- Стиль профиля и набор меток ---
-                // Набор меток берётся пустой: иначе у каждого перелома профиля
-                // вырастает группа меток, а переломов здесь ровно столько,
-                // сколько разрывов, и подписывать их незачем.
-                ObjectId styleId = civDoc.Styles.ProfileStyles[0];
-                ObjectId labelSetId = FindEmptyLabelSet(civDoc, tr);
-
-                // --- Создаём плоский профиль ---
-                string profName = "Профиль-основание_" + DateTime.Now.Ticks;
                 ObjectId profId;
+                Handle profHandle;
 
-                try
+                if (!existingProfileId.IsNull)
                 {
-                    profId = Profile.CreateByLayout(
-                        profName, alignmentId, db.LayerZero, styleId, labelSetId);
-                }
-                catch (System.Exception)
-                {
-                    // Пустой набор меток не принят — берём первый из списка.
-                    // Лишние метки лучше, чем несозданный профиль.
-                    profId = Profile.CreateByLayout(
-                        profName, alignmentId, db.LayerZero, styleId,
-                        civDoc.Styles.LabelSetStyles.ProfileLabelSetStyles[0]);
+                    // --- Профиль уже есть: это профиль базовой линии коридора ---
+                    profId = existingProfileId;
+                    var existing = (Profile)tr.GetObject(profId, OpenMode.ForRead);
+                    profHandle = existing.Handle;
+
                     ed.WriteMessage(
-                        "\nПустой набор меток профиля не применился — метки придётся снять вручную.");
+                        $"\nСвязь с существующей базовой линией «{existingBaselineName}»," +
+                        $" профиль «{existing.Name}». Ничего не создавалось.");
                 }
+                else
+                {
+                    // --- Стиль профиля и набор меток ---
+                    // Набор меток берётся пустой: иначе у каждого перелома профиля
+                    // вырастает группа меток, а переломов здесь ровно столько,
+                    // сколько разрывов, и подписывать их незачем.
+                    ObjectId styleId = civDoc.Styles.ProfileStyles[0];
+                    ObjectId labelSetId = FindEmptyLabelSet(civDoc, tr);
 
-                var profile = (Profile)tr.GetObject(profId, OpenMode.ForWrite);
-                profile.PVIs.AddPVI(alStart, baseElevation);
-                profile.PVIs.AddPVI(alEnd,   baseElevation);
+                    // --- Создаём плоский профиль ---
+                    string profName = "Профиль-основание_" + DateTime.Now.Ticks;
+
+                    try
+                    {
+                        profId = Profile.CreateByLayout(
+                            profName, alignmentId, db.LayerZero, styleId, labelSetId);
+                    }
+                    catch (System.Exception)
+                    {
+                        // Пустой набор меток не принят — берём первый из списка.
+                        // Лишние метки лучше, чем несозданный профиль.
+                        profId = Profile.CreateByLayout(
+                            profName, alignmentId, db.LayerZero, styleId,
+                            civDoc.Styles.LabelSetStyles.ProfileLabelSetStyles[0]);
+                        ed.WriteMessage(
+                            "\nПустой набор меток профиля не применился — метки придётся снять вручную.");
+                    }
+
+                    var profile = (Profile)tr.GetObject(profId, OpenMode.ForWrite);
+                    profile.PVIs.AddPVI(alStart, baseElevation);
+                    profile.PVIs.AddPVI(alEnd,   baseElevation);
+                    profHandle = profile.Handle;
+                }
 
                 // --- Свойство режима редактирования ---
                 PropertySetSupport.Attach(tr, profId,
@@ -286,17 +326,22 @@ namespace Civil3D_commands.AssociativeBreaks
                 }
                 else
                 {
-                    // Существующий коридор: добавляем базовую линию
                     corrId = existingCorrId;
-                    var corridor = (Corridor)tr.GetObject(corrId, OpenMode.ForWrite);
-                    corridor.Baselines.Add("Базовая линия", alignmentId, profId);
-                    ed.WriteMessage("\nБазовая линия добавлена в существующий коридор.");
+
+                    // Базовую линию добавляем, только если своей подходящей
+                    // у коридора не нашлось.
+                    if (existingProfileId.IsNull)
+                    {
+                        var corridor = (Corridor)tr.GetObject(corrId, OpenMode.ForWrite);
+                        corridor.Baselines.Add("Базовая линия", alignmentId, profId);
+                        ed.WriteMessage("\nБазовая линия добавлена в существующий коридор.");
+                    }
                 }
 
                 // --- Запоминаем активную связь ---
                 session.ActiveLink = new StationMarker
                 {
-                    ProfileHandle     = profile.Handle,
+                    ProfileHandle     = profHandle,
                     ProfileViewHandle = pvHandle,
                     AlignmentHandle   = alHandle,
                     CorridorHandle    = corrId.Handle
@@ -650,6 +695,65 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         private static ObjectId Resolve(Database db, Handle h) => RwHandles.Resolve(db, h);
+
+        /// <summary>
+        /// Профиль базовой линии существующего коридора, построенной по той же
+        /// оси, что и выбранный вид профиля.
+        ///
+        /// Именно он и есть «профиль коридора»: создавать рядом второй, плоский,
+        /// незачем — коридор уже стоит на этом. Если подходящих базовых линий
+        /// несколько, спрашиваем номер: выбрать не ту значит резать не тот
+        /// коридор.
+        /// </summary>
+        private static bool TryPickBaselineProfile(
+            Transaction tr, Editor ed, ObjectId corridorId, ObjectId alignmentId,
+            out ObjectId profileId, out string baselineName)
+        {
+            profileId = ObjectId.Null;
+            baselineName = null;
+
+            var corridor = tr.GetObject(corridorId, OpenMode.ForRead) as Corridor;
+            if (corridor == null) return false;
+
+            var names = new System.Collections.Generic.List<string>();
+            var profiles = new System.Collections.Generic.List<ObjectId>();
+
+            foreach (Baseline bl in corridor.Baselines)
+            {
+                if (bl.AlignmentId != alignmentId) continue;
+                if (bl.ProfileId.IsNull) continue;   // базовая линия по отметкам, без профиля
+
+                names.Add(bl.Name);
+                profiles.Add(bl.ProfileId);
+            }
+
+            if (profiles.Count == 0) return false;
+
+            int index = 0;
+
+            if (profiles.Count > 1)
+            {
+                ed.WriteMessage("\nБазовые линии коридора по этой оси:");
+                for (int i = 0; i < names.Count; i++)
+                    ed.WriteMessage($"\n  {i + 1}. {names[i]}");
+
+                var opt = new PromptIntegerOptions("\nНомер базовой линии")
+                {
+                    DefaultValue = 1,
+                    UseDefaultValue = true,
+                    LowerLimit = 1,
+                    UpperLimit = profiles.Count
+                };
+
+                var res = ed.GetInteger(opt);
+                if (res.Status != PromptStatus.OK) return false;
+                index = res.Value - 1;
+            }
+
+            profileId = profiles[index];
+            baselineName = names[index];
+            return true;
+        }
 
         /// <summary>
         /// Набор меток профиля, который ничего не подписывает.
