@@ -87,8 +87,28 @@ namespace Civil3D_commands.AssociativeBreaks
         /// на stepHeight и поставить пару PVI (station-HalfGap / station+HalfGap).
         /// stepHeight со знаком: + вверх по ходу пикетажа.
         /// </summary>
-        public static void InsertStep(Profile profile, double station, double stepHeight, double halfGap)
+        /// <summary>
+        /// Помещается ли пара PVI ступени внутрь профиля.
+        ///
+        /// За его пределами `AddPVI` бросает «значение не попадает в ожидаемый
+        /// диапазон», а NaN доходил туда же от точки, не попавшей в вид профиля.
+        /// Профиль существующего коридора к тому же бывает короче вида, так что
+        /// проверка нужна и при вполне осмысленном щелчке.
+        /// </summary>
+        public static bool CanPlaceStep(Profile profile, double station, double halfGap)
         {
+            if (profile == null) return false;
+            if (double.IsNaN(station) || double.IsInfinity(station)) return false;
+
+            return station - halfGap > profile.StartingStation
+                && station + halfGap < profile.EndingStation;
+        }
+
+        /// <summary>Ставит ступень. false — не поместилась, профиль не тронут.</summary>
+        public static bool InsertStep(Profile profile, double station, double stepHeight, double halfGap)
+        {
+            if (!CanPlaceStep(profile, station, halfGap)) return false;
+
             double baseElev = BaseElevationAt(profile, station, halfGap);
 
             // Сдвигаем по высоте всё, что строго правее разрыва. Пары PVI ранее
@@ -99,6 +119,7 @@ namespace Civil3D_commands.AssociativeBreaks
 
             profile.PVIs.AddPVI(station - halfGap, baseElev);
             profile.PVIs.AddPVI(station + halfGap, baseElev + stepHeight);
+            return true;
         }
 
         /// <summary>
@@ -168,6 +189,11 @@ namespace Civil3D_commands.AssociativeBreaks
         /// </summary>
         public static bool ApplyBreak(Baseline baseline, StationMarker m, double oldStation)
         {
+            // Негодный пикет до границ областей доводить нельзя: присваивание
+            // NaN в StartStation/EndStation роняет команду целиком.
+            if (baseline == null || double.IsNaN(m.Station) || double.IsInfinity(m.Station))
+                return false;
+
             var regions = baseline.BaselineRegions;
 
             BaselineRegion left = FindByGuid(regions, m.LeftRegionId);

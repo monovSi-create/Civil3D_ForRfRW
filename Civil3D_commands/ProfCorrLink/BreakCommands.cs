@@ -386,17 +386,40 @@ namespace Civil3D_commands.AssociativeBreaks
             var link = session?.ActiveLink;
             if (link == null) { ed.WriteMessage("\nСначала RW_LINKPROFILECORRIDOR"); return; }
 
-            // Точка в виде профиля -> пикет.
-            var ptRes = ed.GetPoint("\nУкажите положение разрыва в виде профиля");
+            // Точка в виде профиля ИЛИ в плане -> пикет.
+            var ptRes = ed.GetPoint("\nУкажите положение разрыва (в виде профиля или в плане)");
             if (ptRes.Status != PromptStatus.OK) return;
 
             double station;
+            string source;
+
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
-                var pv = (ProfileView)tr.GetObject(Resolve(doc.Database, link.ProfileViewHandle), OpenMode.ForRead);
-                station = BreakProxyFactory.ProfilePointToStation(pv, ptRes.Value);
+                var db = doc.Database;
+                var pv = RwHandles.Open<ProfileView>(tr, db, link.ProfileViewHandle, OpenMode.ForRead);
+                var al = RwHandles.Open<Alignment>(tr, db, link.AlignmentHandle, OpenMode.ForRead);
+
+                if (RwGeometry.TryStationInProfileView(pv, ptRes.Value, out station))
+                    source = "вид профиля";
+                else if (RwGeometry.TryStationOnAlignment(al, ptRes.Value, out station))
+                    source = "план";
+                else
+                    source = null;
+
                 tr.Commit();
             }
+
+            if (source == null)
+            {
+                // Раньше пикет в этом случае получался NaN и доходил до AddPVI,
+                // где Civil бросал «значение не попадает в ожидаемый диапазон».
+                ed.WriteMessage(
+                    "\nТочка не попала ни в вид профиля, ни на трассу — разрыв не создан." +
+                    "\nЩёлкайте внутри сетки вида профиля либо рядом с осью в плане.");
+                return;
+            }
+
+            ed.WriteMessage($"\nПикет {station:F3} (источник: {source}).");
 
             // Ступень?
             var stepKw = new PromptKeywordOptions("\nЭто ступень профиля?");
@@ -439,9 +462,44 @@ namespace Civil3D_commands.AssociativeBreaks
                 CorridorHandle = link.CorridorHandle
             };
 
-            // Набор характеристик на прокси пишет сам оркестратор — и при
-            // создании, и после каждой правки, иначе палитра врёт.
-            session.Manager.CreateBreak(marker);
+            // Разрыв обязан попасть внутрь и профиля, и участка коридора: ступень
+            // ставится парой PVI, и за пределами профиля Civil их не принимает.
+            // Профиль существующего коридора бывает короче вида — тогда часть
+            // вида для разрывов недоступна, и сказать об этом надо до, а не после.
+            double lo, hi;
+            using (var tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                bool ok = TryBreakRange(tr, doc.Database, session, marker, out lo, out hi);
+                tr.Commit();
+
+                if (!ok)
+                {
+                    ed.WriteMessage("\nНе удалось определить пределы профиля и коридора — разрыв не создан.");
+                    return;
+                }
+            }
+
+            if (station < lo || station > hi)
+            {
+                ed.WriteMessage(
+                    $"\nПикет {station:F3} вне допустимого диапазона {lo:F3}..{hi:F3}" +
+                    " (пересечение профиля и участка коридора) — разрыв не создан.");
+                return;
+            }
+
+            try
+            {
+                // Набор характеристик на прокси пишет сам оркестратор — и при
+                // создании, и после каждой правки, иначе палитра врёт.
+                session.Manager.CreateBreak(marker);
+            }
+            catch (System.Exception ex)
+            {
+                // Лучше внятная строка, чем окно «необработанное исключение»:
+                // оно к тому же оставляет сеанс в непонятном состоянии.
+                ed.WriteMessage($"\nРазрыв создать не удалось: {ex.Message}");
+                return;
+            }
 
             ed.WriteMessage(
                 $"\nРазрыв создан на пикете {station:F3}, микроразрыв {marker.Gap:F4}." +
@@ -695,6 +753,37 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         private static ObjectId Resolve(Database db, Handle h) => RwHandles.Resolve(db, h);
+
+        /// <summary>
+        /// Пикеты, в которых разрыв вообще возможен: пересечение профиля
+        /// и участка коридора, ужатое на полузазор с каждой стороны — пара PVI
+        /// ступени должна поместиться внутрь профиля.
+        /// </summary>
+        private static bool TryBreakRange(Transaction tr, Database db, BreakSession session,
+                                          StationMarker m, out double lo, out double hi)
+        {
+            lo = 0.0;
+            hi = 0.0;
+
+            var profile = RwHandles.Open<Profile>(tr, db, m.ProfileHandle, OpenMode.ForRead);
+            if (profile == null) return false;
+
+            lo = profile.StartingStation;
+            hi = profile.EndingStation;
+
+            Baseline bl = session.GetBaseline(tr, m);
+            if (bl != null)
+            {
+                lo = Math.Max(lo, bl.StartStation);
+                hi = Math.Min(hi, bl.EndStation);
+            }
+
+            double margin = m.HalfGap + BreakGripOverrule.Buffer;
+            lo += margin;
+            hi -= margin;
+
+            return hi > lo;
+        }
 
         /// <summary>
         /// Профиль базовой линии существующего коридора, построенной по той же
