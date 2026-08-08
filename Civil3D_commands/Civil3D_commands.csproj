@@ -92,6 +92,8 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Shared\RwGeometry.cs" />
+    <Compile Include="Shared\RwHandles.cs" />
     <Compile Include="FaceArr\FacingWallArray.cs" />
     <Compile Include="FaceArr\FacingWallCommands.cs" />
     <Compile Include="FaceArr\FacingWallController.cs" />

@@ -7,6 +7,7 @@ using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.Civil.ApplicationServices;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 using AcAp = Autodesk.AutoCAD.ApplicationServices.Application;
 
 [assembly: ExtensionApplication(typeof(Civil3D_commands.AssociativeBreaks.BreakCommands))]
@@ -466,7 +467,6 @@ namespace Civil3D_commands.AssociativeBreaks
         private static string Short(Guid g) =>
             g == Guid.Empty ? "—" : g.ToString("N").Substring(0, 8);
 
-        private static ObjectId Resolve(Database db, Handle h) =>
-            (h.Value != 0 && db.TryGetObjectId(h, out ObjectId id)) ? id : ObjectId.Null;
+        private static ObjectId Resolve(Database db, Handle h) => RwHandles.Resolve(db, h);
     }
 }

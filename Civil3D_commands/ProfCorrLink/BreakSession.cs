@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.Civil.ApplicationServices;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 using AcAp = Autodesk.AutoCAD.ApplicationServices.Application;
 
 namespace Civil3D_commands.AssociativeBreaks
@@ -136,18 +137,19 @@ namespace Civil3D_commands.AssociativeBreaks
         public Baseline GetBaseline(Transaction tr, StationMarker m)
         {
             var db = _doc.Database;
-            if (!db.TryGetObjectId(m.CorridorHandle, out ObjectId corrId) || corrId.IsNull) return null;
 
-            var corridor = tr.GetObject(corrId, OpenMode.ForWrite) as Corridor;
+            var corridor = RwHandles.Open<Corridor>(tr, db, m.CorridorHandle, OpenMode.ForWrite);
             if (corridor == null) return null;
 
             // Сначала ищем по профилю (точное совпадение).
-            if (db.TryGetObjectId(m.ProfileHandle, out ObjectId profId) && !profId.IsNull)
+            ObjectId profId = RwHandles.Resolve(db, m.ProfileHandle);
+            if (!profId.IsNull)
                 foreach (Baseline bl in corridor.Baselines)
                     if (bl.ProfileId == profId) return bl;
 
             // Фоллбэк: ищем по оси — надёжнее если профиль ещё не сохранён в BL.
-            if (db.TryGetObjectId(m.AlignmentHandle, out ObjectId alId) && !alId.IsNull)
+            ObjectId alId = RwHandles.Resolve(db, m.AlignmentHandle);
+            if (!alId.IsNull)
                 foreach (Baseline bl in corridor.Baselines)
                     if (bl.AlignmentId == alId) return bl;
 
@@ -156,9 +158,7 @@ namespace Civil3D_commands.AssociativeBreaks
 
         public Corridor GetCorridor(Transaction tr, StationMarker m)
         {
-            var db = _doc.Database;
-            if (!db.TryGetObjectId(m.CorridorHandle, out ObjectId corrId) || corrId.IsNull) return null;
-            return tr.GetObject(corrId, OpenMode.ForWrite) as Corridor;
+            return RwHandles.Open<Corridor>(tr, _doc.Database, m.CorridorHandle, OpenMode.ForWrite);
         }
 
         private sealed class Guard : IDisposable

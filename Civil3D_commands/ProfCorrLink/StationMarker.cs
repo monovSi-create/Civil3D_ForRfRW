@@ -1,5 +1,6 @@
 using System;
 using Autodesk.AutoCAD.DatabaseServices;
+using Civil3D_commands.Shared;
 
 namespace Civil3D_commands.AssociativeBreaks
 {
@@ -86,12 +87,12 @@ namespace Civil3D_commands.AssociativeBreaks
                 new TypedValue((int)DxfCode.Real, StepHeight),
                 new TypedValue((int)DxfCode.Real, BaseElevation),
                 new TypedValue((int)DxfCode.Text, Layer ?? "0"),
-                new TypedValue((int)DxfCode.Text, ProfileHandle.ToString()),
-                new TypedValue((int)DxfCode.Text, ProfileViewHandle.ToString()),
-                new TypedValue((int)DxfCode.Text, AlignmentHandle.ToString()),
-                new TypedValue((int)DxfCode.Text, CorridorHandle.ToString()),
-                new TypedValue((int)DxfCode.Text, ProfileProxyHandle.ToString()),
-                new TypedValue((int)DxfCode.Text, PlanProxyHandle.ToString()),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(ProfileHandle)),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(ProfileViewHandle)),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(AlignmentHandle)),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(CorridorHandle)),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(ProfileProxyHandle)),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(PlanProxyHandle)),
                 new TypedValue((int)DxfCode.Text, LeftRegionId.ToString("N")),
                 new TypedValue((int)DxfCode.Text, RightRegionId.ToString("N")));
         }
@@ -143,12 +144,12 @@ namespace Civil3D_commands.AssociativeBreaks
             m.StepHeight = Convert.ToDouble(v[i++].Value);
             m.BaseElevation = Convert.ToDouble(v[i++].Value);
             m.Layer = v[i++].Value.ToString();
-            m.ProfileHandle = ParseHandle(v[i++].Value.ToString());
-            m.ProfileViewHandle = ParseHandle(v[i++].Value.ToString());
-            m.AlignmentHandle = ParseHandle(v[i++].Value.ToString());
-            m.CorridorHandle = ParseHandle(v[i++].Value.ToString());
-            m.ProfileProxyHandle = ParseHandle(v[i++].Value.ToString());
-            m.PlanProxyHandle = ParseHandle(v[i++].Value.ToString());
+            m.ProfileHandle = RwHandles.Parse(v[i++].Value.ToString());
+            m.ProfileViewHandle = RwHandles.Parse(v[i++].Value.ToString());
+            m.AlignmentHandle = RwHandles.Parse(v[i++].Value.ToString());
+            m.CorridorHandle = RwHandles.Parse(v[i++].Value.ToString());
+            m.ProfileProxyHandle = RwHandles.Parse(v[i++].Value.ToString());
+            m.PlanProxyHandle = RwHandles.Parse(v[i++].Value.ToString());
 
             if (v.Length > i + 1)
             {
@@ -157,12 +158,6 @@ namespace Civil3D_commands.AssociativeBreaks
             }
 
             return m;
-        }
-
-        private static Handle ParseHandle(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return new Handle(0);
-            return new Handle(Convert.ToInt64(s, 16));
         }
 
         private static Guid ParseGuid(string s) =>

@@ -2,6 +2,7 @@ using System;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 
 namespace Civil3D_commands.AssociativeBreaks
 {
@@ -156,8 +157,7 @@ namespace Civil3D_commands.AssociativeBreaks
 
         private static ObjectId Resolve(Handle h)
         {
-            var db = Doc.Database;
-            return (h.Value != 0 && db.TryGetObjectId(h, out ObjectId id)) ? id : ObjectId.Null;
+            return RwHandles.Resolve(Doc.Database, h);
         }
 
         private static void EraseIfValid(Transaction tr, Handle h)

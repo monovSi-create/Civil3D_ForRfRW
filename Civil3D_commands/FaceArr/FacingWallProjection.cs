@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.Colors;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 // Entity и ObjectId есть и в AutoCAD-, и в Civil-пространстве имён — снимаем неоднозначность.
 using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
 using ObjectId = Autodesk.AutoCAD.DatabaseServices.ObjectId;
@@ -85,11 +86,15 @@ namespace Civil3D_commands.FaceArr
 
                 if (stationEnd < stMin || block.Station > stMax) continue;
 
-                double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
-                pv.FindXYAtStationAndElevation(block.Station, elevBottom, ref x1, ref y1);
-                pv.FindXYAtStationAndElevation(stationEnd, elevTop, ref x2, ref y2);
+                // Диагональ габарита блока в координатах вида. null — пикет вне
+                // вида профиля: такой блок пропускаем, а не рисуем по NaN.
+                Point3d[] box = RwGeometry.ProfileSegment(
+                    pv, block.Station, elevBottom, stationEnd, elevTop);
+                if (box == null) continue;
 
-                var lowerLeft = new Point3d(x1, y1, 0.0);
+                Point3d lowerLeft = box[0];
+                double x2 = box[1].X, y2 = box[1].Y;
+                double x1 = lowerLeft.X, y1 = lowerLeft.Y;
 
                 ObjectId id;
                 if (def.ProjectionMode == FacingWallProjectionMode.Block2d)
@@ -309,12 +314,13 @@ namespace Civil3D_commands.FaceArr
             double elevation =
                 FacingWallBuilder.RowElevation(def, row) + def.BlockHeight / 2.0;
 
-            double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
-            pv.FindXYAtStationAndElevation(row.StartStation, elevation, ref x1, ref y1);
-            pv.FindXYAtStationAndElevation(row.EndStation, elevation, ref x2, ref y2);
+            // Горизонтальный отрезок на середине высоты ряда.
+            Point3d[] pts = RwGeometry.ProfileSegment(
+                pv, row.StartStation, elevation, row.EndStation, elevation);
+            if (pts == null) return;
 
-            var start = new Point3d(x1, y1, 0.0);
-            var end = new Point3d(x2, y2, 0.0);
+            Point3d start = pts[0];
+            Point3d end = pts[1];
 
             // Существующий — двигаем. Выходим в любом случае: создавать второй
             // отрезок на тот же ряд нельзя, даже если открыть этот не удалось.

@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 using AcApp = Autodesk.AutoCAD.ApplicationServices.Application;
 // Entity и ObjectId есть и в AutoCAD-, и в Civil-пространстве имён — снимаем неоднозначность.
 using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
@@ -748,25 +749,19 @@ namespace Civil3D_commands.FaceArr
 
         private static string HandleOf(ObjectId id)
         {
-            if (id.IsNull || !id.IsValid) return "0";
-            return id.Handle.ToString();
+            return RwHandles.ToText(id);
         }
 
+        /// <summary>
+        /// Ссылка из записи. Стёртый объект теперь даёт ObjectId.Null, а не
+        /// «живой» идентификатор стёртого: единое правило общего модуля.
+        /// Для списков это ничего не меняет — ReadIdList и раньше отсеивал
+        /// стёртых, — а одиночные ссылки (трасса, вид) корректнее проверять
+        /// на IsNull, чем ловить исключение при открытии.
+        /// </summary>
         private static ObjectId IdOf(Database db, string handleText)
         {
-            if (db == null || string.IsNullOrEmpty(handleText) || handleText == "0")
-                return ObjectId.Null;
-
-            try
-            {
-                var h = new Handle(Convert.ToInt64(handleText, 16));
-                ObjectId id;
-                return db.TryGetObjectId(h, out id) ? id : ObjectId.Null;
-            }
-            catch (System.Exception)
-            {
-                return ObjectId.Null;
-            }
+            return RwHandles.Resolve(db, handleText);
         }
 
         // =================================================================

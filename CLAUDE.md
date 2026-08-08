@@ -67,6 +67,7 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 
 | Путь | Что |
 |------|-----|
+| `Shared/` | Общее для обоих модулей: `RwGeometry` (пикет↔точка в плане и в виде профиля, перпендикуляр к оси, Clamp, середина отрезка) и `RwHandles` (Handle↔текст↔ObjectId, правило «стёртое = пусто»). Новый код по этим темам писать здесь, а не рядом. |
 | `FaceArr/` | Facing Wall — параметрическая облицовка стены. **Есть свой `README.md` — читать его первым при работе с модулем.** |
 | `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_DELETEBREAK`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
 | `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`, плюс служебная `UpdateRegions`). |
@@ -116,6 +117,10 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
   `ProfileView.FindStationAndElevationAtXY(...)`,
   `Alignment.StationOffset(...)` — параметры `ref`, не `out`.
   `StationOffset` за пределами оси возвращает NaN — оборачивать в try/catch.
+  **Напрямую эти методы больше не вызывать: есть `Shared/RwGeometry`,** где
+  и NaN, и исключение уже сведены к `false`/`null`. Перпендикуляр к оси там
+  получается из `PointLocation(station, offset)`, а не поворотом касательной:
+  численный способ врал на малых радиусах и в конце оси.
 - Ключевые слова `PromptKeywordOptions` задавать **латиницей** с русскими
   подписями: кириллицу не ввести при английской раскладке.
 - `PropertyDataServices.AddPropertySet` сработает, только если набор допускает

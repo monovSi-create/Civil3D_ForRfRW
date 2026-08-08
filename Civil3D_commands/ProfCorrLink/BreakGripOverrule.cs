@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.GraphicsInterface;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 
 namespace Civil3D_commands.AssociativeBreaks
 {
@@ -52,9 +53,7 @@ namespace Civil3D_commands.AssociativeBreaks
                 // Грипса видна только в режиме редактирования.
                 if (!session.IsEditMode(m.ProfileHandle)) return;
 
-                var ln = (Line)entity;
-                grips.Add(new BreakGrip(m.Id,
-                    (ln.StartPoint + ln.EndPoint.GetAsVector()) / 2.0));
+                grips.Add(new BreakGrip(m.Id, RwGeometry.Midpoint((Line)entity)));
             }
             catch { /* не роняем AutoCAD из-за ошибки в оверруле */ }
         }

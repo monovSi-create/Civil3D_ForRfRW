@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 
 namespace Civil3D_commands.AssociativeBreaks
 {
@@ -167,21 +168,19 @@ namespace Civil3D_commands.AssociativeBreaks
 
         private double? StationFromLine(Transaction tr, Database db, Handle h, bool isPlan, StationMarker m)
         {
-            if (h.Value == 0 || !db.TryGetObjectId(h, out ObjectId id) || id.IsNull || id.IsErased) return null;
-            var ln = tr.GetObject(id, OpenMode.ForRead) as Line;
+            var ln = RwHandles.Open<Line>(tr, db, h, OpenMode.ForRead);
             if (ln == null) return null;
-            Point3d mid = (ln.StartPoint + ln.EndPoint.GetAsVector()) / 2.0;
+
+            Point3d mid = RwGeometry.Midpoint(ln);
 
             if (isPlan)
             {
-                if (!db.TryGetObjectId(m.AlignmentHandle, out ObjectId aid) || aid.IsNull) return null;
-                var al = tr.GetObject(aid, OpenMode.ForRead) as Alignment;
+                var al = RwHandles.Open<Alignment>(tr, db, m.AlignmentHandle, OpenMode.ForRead);
                 return al == null ? (double?)null : BreakProxyFactory.PlanPointToStation(al, mid);
             }
             else
             {
-                if (!db.TryGetObjectId(m.ProfileViewHandle, out ObjectId pid) || pid.IsNull) return null;
-                var pv = tr.GetObject(pid, OpenMode.ForRead) as ProfileView;
+                var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
                 return pv == null ? (double?)null : BreakProxyFactory.ProfilePointToStation(pv, mid);
             }
         }

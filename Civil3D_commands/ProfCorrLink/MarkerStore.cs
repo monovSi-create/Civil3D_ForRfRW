@@ -5,6 +5,7 @@ using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 
 namespace Civil3D_commands.AssociativeBreaks
 {
@@ -190,8 +191,7 @@ namespace Civil3D_commands.AssociativeBreaks
 
         private static bool ProxyExists(Database db, Handle h)
         {
-            if (h.Value == 0) return false;
-            return db.TryGetObjectId(h, out ObjectId id) && id.IsValid && !id.IsErased;
+            return RwHandles.Exists(db, h);
         }
 
         private static ObjectId GetDictionaryId(Transaction tr, Database db, bool createIfMissing) =>
@@ -300,10 +300,7 @@ namespace Civil3D_commands.AssociativeBreaks
         private static bool Alive<T>(Transaction tr, Database db, Handle h)
             where T : Autodesk.AutoCAD.DatabaseServices.DBObject
         {
-            if (h.Value == 0) return false;
-            if (!db.TryGetObjectId(h, out ObjectId id) || id.IsNull || id.IsErased) return false;
-            try { return tr.GetObject(id, OpenMode.ForRead) is T; }
-            catch (System.Exception) { return false; }
+            return RwHandles.Open<T>(tr, db, h, OpenMode.ForRead) != null;
         }
     }
 }

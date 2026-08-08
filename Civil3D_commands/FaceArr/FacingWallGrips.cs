@@ -5,6 +5,7 @@ using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 using AcApp = Autodesk.AutoCAD.ApplicationServices.Application;
 // Entity и ObjectId есть и в AutoCAD-, и в Civil-пространстве имён — снимаем неоднозначность.
 using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
@@ -329,12 +330,16 @@ namespace Civil3D_commands.FaceArr
 
             double elev = FacingWallBuilder.RowElevation(def, row) + def.BlockHeight / 2.0;
 
-            double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
-            pv.FindXYAtStationAndElevation(row.StartStation, elev, ref x1, ref y1);
-            pv.FindXYAtStationAndElevation(row.EndStation, elev, ref x2, ref y2);
+            // Не удалось посчитать — отрезок останется на месте, данные всё равно
+            // сохраняются: картинку поправит FACINGWALLREBUILDALL.
+            Point3d[] pts = RwGeometry.ProfileSegment(
+                pv, row.StartStation, elev, row.EndStation, elev);
 
-            newStart = new Point3d(x1, y1, 0.0);
-            newEnd = new Point3d(x2, y2, 0.0);
+            if (pts != null)
+            {
+                newStart = pts[0];
+                newEnd = pts[1];
+            }
 
             LastAction = string.Format(
                 "ряд {0}: {1:F3}..{2:F3}", rowIndex, row.StartStation, row.EndStation);
@@ -469,46 +474,14 @@ namespace Civil3D_commands.FaceArr
         private static bool TryStationOnAlignment(
             Alignment alignment, Point3d p, out double station)
         {
-            station = 0.0;
-
-            try
-            {
-                double s = 0.0, o = 0.0;
-                alignment.StationOffset(p.X, p.Y, ref s, ref o);
-
-                if (double.IsNaN(s)) return false;
-
-                station = s;
-                return true;
-            }
-            catch (System.Exception)
-            {
-                return false;
-            }
+            return RwGeometry.TryStationOnAlignment(alignment, p, out station);
         }
 
         /// <summary>Точка вида профиля -> пикет. false, если точка вне вида.</summary>
         private static bool TryStationAt(
             ProfileView pv, Point3d p, out double station, out double elevation)
         {
-            station = 0.0;
-            elevation = 0.0;
-
-            try
-            {
-                double s = 0.0, e = 0.0;
-                pv.FindStationAndElevationAtXY(p.X, p.Y, ref s, ref e);
-
-                if (double.IsNaN(s)) return false;
-
-                station = s;
-                elevation = e;
-                return true;
-            }
-            catch (System.Exception)
-            {
-                return false;
-            }
+            return RwGeometry.TryStationInProfileView(pv, p, out station, out elevation);
         }
 
         /// <summary>
@@ -567,9 +540,7 @@ namespace Civil3D_commands.FaceArr
 
         private static double Clamp(double value, double min, double max)
         {
-            if (value < min) return min;
-            if (value > max) return max;
-            return value;
+            return RwGeometry.Clamp(value, min, max);
         }
 
         /// <summary>

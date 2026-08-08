@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.Colors;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 // Entity и ObjectId есть и в AutoCAD-, и в Civil-пространстве имён — снимаем неоднозначность.
 using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
 using ObjectId = Autodesk.AutoCAD.DatabaseServices.ObjectId;
@@ -101,15 +102,8 @@ namespace Civil3D_commands.FaceArr
 
                 if (string.IsNullOrEmpty(handleText) || !haveRow) return false;
 
-                Database db = ent.Database;
-                if (db == null) return false;
-
-                var h = new Handle(Convert.ToInt64(handleText, 16));
-                ObjectId id;
-                if (!db.TryGetObjectId(h, out id)) return false;
-
-                controllerId = id;
-                return !id.IsNull && id.IsValid && !id.IsErased;
+                controllerId = RwHandles.Resolve(ent.Database, handleText);
+                return !controllerId.IsNull;
             }
             catch (System.Exception)
             {
@@ -234,26 +228,11 @@ namespace Civil3D_commands.FaceArr
         public static Point3d[] PlanPoints(
             Alignment alignment, FacingWallDefinition def, double station)
         {
-            if (alignment == null) return null;
-
-            try
-            {
-                double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
-                alignment.PointLocation(station, 0.0, ref x1, ref y1);
-                alignment.PointLocation(station, PlanMarkerOffset(def), ref x2, ref y2);
-
-                if (double.IsNaN(x1) || double.IsNaN(x2)) return null;
-
-                return new[]
-                {
-                    new Point3d(x1, y1, 0.0),
-                    new Point3d(x2, y2, 0.0)
-                };
-            }
-            catch (System.Exception)
-            {
-                return null;
-            }
+            // Один пикет, два смещения — отрезок получается перпендикулярным оси.
+            return RwGeometry.PlanSegment(
+                alignment,
+                station, 0.0,
+                station, PlanMarkerOffset(def));
         }
 
         /// <summary>
@@ -271,24 +250,8 @@ namespace Civil3D_commands.FaceArr
             double bottom = def.BaseElevation - margin;
             double top = def.BaseElevation + def.RowCount * def.BlockHeight + margin;
 
-            try
-            {
-                double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
-                pv.FindXYAtStationAndElevation(station, bottom, ref x1, ref y1);
-                pv.FindXYAtStationAndElevation(station, top, ref x2, ref y2);
-
-                if (double.IsNaN(x1) || double.IsNaN(x2)) return null;
-
-                return new[]
-                {
-                    new Point3d(x1, y1, 0.0),
-                    new Point3d(x2, y2, 0.0)
-                };
-            }
-            catch (System.Exception)
-            {
-                return null;
-            }
+            // Один пикет, две отметки — отрезок вертикален в координатах вида.
+            return RwGeometry.ProfileSegment(pv, station, bottom, station, top);
         }
 
         /// <summary>
