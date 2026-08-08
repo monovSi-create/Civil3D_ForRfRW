@@ -69,7 +69,7 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 |------|-----|
 | `Shared/` | Общее для обоих модулей: `RwGeometry` (пикет↔точка в плане и в виде профиля, перпендикуляр к оси, Clamp, середина отрезка) и `RwHandles` (Handle↔текст↔ObjectId, правило «стёртое = пусто»). Новый код по этим темам писать здесь, а не рядом. |
 | `FaceArr/` | Facing Wall — параметрическая облицовка стены. **Есть свой `README.md` — читать его первым при работе с модулем.** |
-| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_DELETEBREAK`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
+| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_MOVEBREAK`, `RW_DELETEBREAK`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
 | `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`, плюс служебная `UpdateRegions`). |
 | `RetrieveReinfSoilMaterials.cs` | Ведомость материалов стены + таблица через `EntityJig` (`RW_MATERIALS`, `RW_WallPolylines`). |
 | `CorridorPolylineExtractor.cs` | Полилинии из коридора по группировке Z (`RW_ExtractCorridorPolylines`). |
@@ -92,6 +92,13 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 `CommandEnded`/`Idle` зовёт `AssociativeBreakManager` под `BreakSession.Suspend()`.
 Это защита от циклов перестроения (профиль → коридор → таргеты → профиль).
 Правки из реактора обязаны быть в `Document.LockDocument()`.
+
+**Своя геометрия в `MoveGripPointsAt` в обход `base` не работает.** Проверено
+в плане `ProfCorrLink`: линия при перетаскивании пропадала с экрана, а правка
+до модели не доходила — похоже, изменения оставались на временной копии
+сущности. Живое представление делать не так, а настоящим `DrawJig` из команды
+(`RW_MOVEBREAK`). Отбрасывать составляющую смещения перед `base` — можно,
+это работает (вертикаль в виде профиля).
 
 **Ручки (grips) вешаются на служебный `Line` с XData, а не на целевой объект.**
 Проверено в Civil 3D 2024: собственные `GripData` из переопределённого

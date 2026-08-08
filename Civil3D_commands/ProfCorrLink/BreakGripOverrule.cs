@@ -63,92 +63,14 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             // Ресинк профиля / областей / второго прокси выполнит реактор
             // в CommandEnded; здесь только сама картинка перетаскивания.
-            try
-            {
-                var session = BreakSession.Current;
-                var line = entity as Line;
-
-                StationMarker m = (session != null && line != null && !entity.ObjectId.IsNull)
-                    ? session.Store.GetByProxy(entity.ObjectId.Handle)
-                    : null;
-
-                // В плане линия не едет за курсором жёстко, а пересобирается
-                // на новом пикете — так она остаётся перпендикуляром к оси.
-                if (m != null && entity.ObjectId.Handle == m.PlanProxyHandle &&
-                    DragAlongAlignment(session, line, m, offset))
-                    return;
-
-                base.MoveGripPointsAt(entity, grips, Constrain(entity, offset), bitFlags);
-            }
+            // В плане перемещение отдаётся AutoCAD как есть. Попытка собирать
+            // линию заново прямо здесь (перпендикуляр на новом пикете) кончилась
+            // тем, что при перетаскивании линия пропадала с экрана и правка
+            // до модели не доходила: своя геометрия, поставленная в обход base,
+            // видимо, оставалась на временной копии. Не повторять — для точной
+            // постановки границы есть RW_MOVEBREAK с настоящим jig.
+            try { base.MoveGripPointsAt(entity, grips, Constrain(entity, offset), bitFlags); }
             catch { }
-        }
-
-        /// <summary>
-        /// Перетаскивание в плане: точку под курсором сносим на ось, получаем
-        /// пикет и строим перпендикуляр заново. Линия при этом всё время
-        /// стоит началом на оси и перпендикулярна ей — на кривых тоже, потому
-        /// что нормаль отмеряет сам Civil.
-        ///
-        /// Геометрия ставится прямо здесь, а не через base: именно её AutoCAD
-        /// и рисует как образ перетаскивания, поэтому пользователь видит
-        /// итоговое положение сразу, а не после отпускания кнопки.
-        ///
-        /// false — не смогли (нет оси, точка вне её): тогда работает обычное
-        /// перемещение, а модель поправит реактор.
-        /// </summary>
-        private bool DragAlongAlignment(BreakSession session, Line line, StationMarker m, Vector3d offset)
-        {
-            var doc = Autodesk.AutoCAD.ApplicationServices.Application
-                        .DocumentManager.MdiActiveDocument;
-            if (doc == null) return false;
-
-            try
-            {
-                using (var tr = doc.Database.TransactionManager.StartTransaction())
-                {
-                    var al = RwHandles.Open<Alignment>(
-                        tr, doc.Database, m.AlignmentHandle, OpenMode.ForRead);
-
-                    if (al == null) { tr.Commit(); return false; }
-
-                    // Тянут за середину линии, а держится она началом на оси:
-                    // сносим на ось именно ту точку, что оказалась под курсором.
-                    Point3d target = RwGeometry.Midpoint(line) + offset;
-
-                    double station;
-                    bool ok = RwGeometry.TryStationOnAlignment(al, target, out station);
-                    Point3d[] pts = null;
-
-                    if (ok)
-                    {
-                        double lo = al.StartingStation;
-                        double hi = al.EndingStation;
-
-                        Baseline bl = session.GetBaseline(tr, m);
-                        if (bl != null)
-                        {
-                            lo = Math.Max(lo, bl.StartStation);
-                            hi = Math.Min(hi, bl.EndStation);
-                        }
-
-                        pts = BreakProxyFactory.PlanPoints(
-                            al, RwGeometry.Clamp(station, lo, hi));
-                    }
-
-                    if (pts != null)
-                    {
-                        line.StartPoint = pts[0];
-                        line.EndPoint = pts[1];
-                    }
-
-                    tr.Commit();
-                    return pts != null;
-                }
-            }
-            catch (System.Exception)
-            {
-                return false;
-            }
         }
 
         /// <summary>

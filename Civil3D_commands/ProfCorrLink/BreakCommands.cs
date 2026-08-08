@@ -556,6 +556,146 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         // ------------------------------------------------------------------
+        //  ПЕРЕНЕСТИ ГРАНИЦУ УЧАСТКОВ (jig)
+        //
+        //  Ручка в плане двигает линию как умеет AutoCAD, а положение границы
+        //  видно только после отпускания. Здесь наоборот: пока не щёлкнули,
+        //  показывается будущая граница — отрезок от курсора до его проекции
+        //  на ось. Проекция идёт по нормали, поэтому отрезок перпендикулярен
+        //  оси сам собой, а его конец скользит по ней.
+        // ------------------------------------------------------------------
+        [CommandMethod("RW_MOVEBREAK")]
+        public void MoveBreak()
+        {
+            var doc = AcAp.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+            var session = BreakSession.Current;
+            if (session == null) return;
+
+            var opt = new PromptEntityOptions("\nВыберите прокси разрыва");
+            opt.SetRejectMessage("\nНужен прокси разрыва");
+            opt.AddAllowedClass(typeof(Line), false);
+            var res = ed.GetEntity(opt);
+            if (res.Status != PromptStatus.OK) return;
+
+            StationMarker m = session.Store.GetByProxy(res.ObjectId.Handle);
+            if (m == null)
+            {
+                ed.WriteMessage("\nЭта линия в модели не числится — не прокси разрыва или его копия.");
+                return;
+            }
+
+            double station;
+            bool accepted = false;
+
+            using (var tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                var al = RwHandles.Open<Alignment>(
+                    tr, doc.Database, m.AlignmentHandle, OpenMode.ForRead);
+
+                double lo, hi;
+                if (al == null || !TryBreakRange(tr, doc.Database, session, m, out lo, out hi))
+                {
+                    ed.WriteMessage("\nНе удалось определить ось или пределы участка.");
+                    tr.Commit();
+                    return;
+                }
+
+                // Соседние разрывы тоже держат границу — те же пределы, что
+                // и при перетаскивании ручки.
+                var bounds = session.Store.GetMoveBounds(m, BreakGripOverrule.Buffer, lo, hi);
+                lo = Math.Max(lo, bounds.min);
+                hi = Math.Min(hi, bounds.max);
+
+                var jig = new BreakBoundaryJig(al, lo, hi, m.Station);
+                PromptResult jigRes = ed.Drag(jig);
+
+                accepted = jigRes.Status == PromptStatus.OK && jig.HasStation;
+                station = jig.Station;
+
+                tr.Commit();
+            }
+
+            if (!accepted)
+            {
+                ed.WriteMessage("\nПеренос отменён.");
+                return;
+            }
+
+            session.Manager.ApplyStationChange(m.Id, station);
+            ed.WriteMessage($"\nГраница участков перенесена на пикет {station:F3}.");
+        }
+
+        /// <summary>
+        /// Временное представление будущей границы: отрезок «курсор → его
+        /// проекция на ось». Точка, за которую держится пользователь, идёт
+        /// за курсором; вторая скользит по оси, оставаясь основанием
+        /// перпендикуляра, — проекция на трассу и есть нормаль.
+        /// </summary>
+        private class BreakBoundaryJig : DrawJig
+        {
+            private readonly Alignment _alignment;
+            private readonly double _lo;
+            private readonly double _hi;
+
+            private Point3d _cursor;
+            private Point3d _onAxis;
+            private bool _valid;
+
+            public double Station { get; private set; }
+            public bool HasStation { get { return _valid; } }
+
+            public BreakBoundaryJig(Alignment alignment, double lo, double hi, double startStation)
+            {
+                _alignment = alignment;
+                _lo = lo;
+                _hi = hi;
+                Station = startStation;
+            }
+
+            protected override SamplerStatus Sampler(JigPrompts prompts)
+            {
+                var opt = new JigPromptPointOptions(
+                    "\nНовое положение границы участков (щелчок — подтвердить)");
+                opt.UserInputControls =
+                    UserInputControls.Accept3dCoordinates |
+                    UserInputControls.NoZeroResponseAccepted;
+
+                PromptPointResult res = prompts.AcquirePoint(opt);
+                if (res.Status != PromptStatus.OK) return SamplerStatus.Cancel;
+
+                // Без этого jig крутится вхолостую на каждом движении мыши.
+                if (res.Value.DistanceTo(_cursor) < 1e-8) return SamplerStatus.NoChange;
+
+                _cursor = res.Value;
+
+                double station;
+                _valid = RwGeometry.TryStationOnAlignment(_alignment, _cursor, out station);
+
+                if (_valid)
+                {
+                    Station = RwGeometry.Clamp(station, _lo, _hi);
+
+                    Point3d onAxis;
+                    _valid = RwGeometry.TryPointOnAlignment(_alignment, Station, 0.0, out onAxis);
+                    if (_valid) _onAxis = onAxis;
+                }
+
+                return SamplerStatus.OK;
+            }
+
+            protected override bool WorldDraw(Autodesk.AutoCAD.GraphicsInterface.WorldDraw draw)
+            {
+                // Курсор увели за пределы оси — показывать нечего, но jig
+                // продолжает работать: вернётся в зону, и картинка появится.
+                if (!_valid) return true;
+
+                draw.Geometry.WorldLine(_onAxis, _cursor);
+                return true;
+            }
+        }
+
+        // ------------------------------------------------------------------
         //  ИЗМЕНИТЬ СВОЙСТВА РАЗРЫВА
         //  До этого свойства задавались только при создании и потом не менялись.
         // ------------------------------------------------------------------
