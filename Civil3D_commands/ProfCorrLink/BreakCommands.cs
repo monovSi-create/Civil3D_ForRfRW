@@ -585,6 +585,12 @@ namespace Civil3D_commands.AssociativeBreaks
                 return;
             }
 
+            // Работаем в том виде, в котором выбран прокси: щёлкнули по линии
+            // на профиле — тянем в профиле. Иначе jig сносил бы курсор на ось,
+            // и от точки в виде профиля тянулась бы линия через весь чертёж
+            // к трассе.
+            bool inProfileView = res.ObjectId.Handle == m.ProfileProxyHandle;
+
             double station;
             bool accepted = false;
 
@@ -592,6 +598,8 @@ namespace Civil3D_commands.AssociativeBreaks
             {
                 var al = RwHandles.Open<Alignment>(
                     tr, doc.Database, m.AlignmentHandle, OpenMode.ForRead);
+                var pv = RwHandles.Open<ProfileView>(
+                    tr, doc.Database, m.ProfileViewHandle, OpenMode.ForRead);
 
                 double lo, hi;
                 if (al == null || !TryBreakRange(tr, doc.Database, session, m, out lo, out hi))
@@ -601,13 +609,22 @@ namespace Civil3D_commands.AssociativeBreaks
                     return;
                 }
 
+                if (inProfileView && pv == null)
+                {
+                    ed.WriteMessage("\nВид профиля не найден — переношу по плану.");
+                    inProfileView = false;
+                }
+
                 // Соседние разрывы тоже держат границу — те же пределы, что
                 // и при перетаскивании ручки.
                 var bounds = session.Store.GetMoveBounds(m, BreakGripOverrule.Buffer, lo, hi);
                 lo = Math.Max(lo, bounds.min);
                 hi = Math.Min(hi, bounds.max);
 
-                var jig = new BreakBoundaryJig(al, lo, hi, m.Station);
+                var jig = inProfileView
+                    ? new BreakBoundaryJig(pv, lo, hi, m.Station)
+                    : new BreakBoundaryJig(al, lo, hi, m.Station);
+
                 PromptResult jigRes = ed.Drag(jig);
 
                 accepted = jigRes.Status == PromptStatus.OK && jig.HasStation;
@@ -634,23 +651,59 @@ namespace Civil3D_commands.AssociativeBreaks
         /// </summary>
         private class BreakBoundaryJig : DrawJig
         {
+            // Задан ровно один из двух: в каком виде тянем, в том и работаем.
             private readonly Alignment _alignment;
+            private readonly ProfileView _view;
+
             private readonly double _lo;
             private readonly double _hi;
 
+            // Профильный режим: середина диапазона отметок (для перевода пикета
+            // в X) и габарит вида по Y — вертикаль рисуется во всю его высоту.
+            private readonly double _midElevation;
+            private readonly double _yLo;
+            private readonly double _yHi;
+
             private Point3d _cursor;
-            private Point3d _onAxis;
+            private Point3d _a;
+            private Point3d _b;
             private bool _valid;
 
             public double Station { get; private set; }
             public bool HasStation { get { return _valid; } }
 
+            /// <summary>План: отрезок «курсор → его проекция на ось».</summary>
             public BreakBoundaryJig(Alignment alignment, double lo, double hi, double startStation)
             {
                 _alignment = alignment;
                 _lo = lo;
                 _hi = hi;
                 Station = startStation;
+            }
+
+            /// <summary>Вид профиля: вертикаль на пикете под курсором.</summary>
+            public BreakBoundaryJig(ProfileView view, double lo, double hi, double startStation)
+            {
+                _view = view;
+                _lo = lo;
+                _hi = hi;
+                Station = startStation;
+
+                double eLo = view.ElevationMin;
+                double eHi = view.ElevationMax;
+                _midElevation = (eLo + eHi) / 2.0;
+
+                try
+                {
+                    Extents3d ext = view.GeometricExtents;
+                    _yLo = Math.Min(ext.MinPoint.Y, ext.MaxPoint.Y);
+                    _yHi = Math.Max(ext.MinPoint.Y, ext.MaxPoint.Y);
+                }
+                catch (System.Exception)
+                {
+                    _yLo = 0.0;
+                    _yHi = 0.0;
+                }
             }
 
             protected override SamplerStatus Sampler(JigPrompts prompts)
@@ -668,29 +721,74 @@ namespace Civil3D_commands.AssociativeBreaks
                 if (res.Value.DistanceTo(_cursor) < 1e-8) return SamplerStatus.NoChange;
 
                 _cursor = res.Value;
-
-                double station;
-                _valid = RwGeometry.TryStationOnAlignment(_alignment, _cursor, out station);
-
-                if (_valid)
-                {
-                    Station = RwGeometry.Clamp(station, _lo, _hi);
-
-                    Point3d onAxis;
-                    _valid = RwGeometry.TryPointOnAlignment(_alignment, Station, 0.0, out onAxis);
-                    if (_valid) _onAxis = onAxis;
-                }
+                _valid = _view != null ? SampleInProfileView() : SampleInPlan();
 
                 return SamplerStatus.OK;
             }
 
+            /// <summary>
+            /// В плане: пикет — проекция курсора на ось, картинка — отрезок
+            /// от курсора до этой проекции. Проекция идёт по нормали, поэтому
+            /// отрезок перпендикулярен оси сам собой.
+            /// </summary>
+            private bool SampleInPlan()
+            {
+                double station;
+                if (!RwGeometry.TryStationOnAlignment(_alignment, _cursor, out station)) return false;
+
+                Station = RwGeometry.Clamp(station, _lo, _hi);
+
+                Point3d onAxis;
+                if (!RwGeometry.TryPointOnAlignment(_alignment, Station, 0.0, out onAxis)) return false;
+
+                _a = onAxis;
+                _b = _cursor;
+                return true;
+            }
+
+            /// <summary>
+            /// В виде профиля: пикет — координата курсора по горизонтали,
+            /// картинка — вертикаль на этом пикете во всю высоту вида, то есть
+            /// ровно то, чем станет граница после подтверждения.
+            /// </summary>
+            private bool SampleInProfileView()
+            {
+                double station;
+                if (!RwGeometry.TryStationInProfileView(_view, _cursor, out station)) return false;
+
+                Station = RwGeometry.Clamp(station, _lo, _hi);
+
+                Point3d anchor;
+                if (!RwGeometry.TryPointInProfileView(_view, Station, _midElevation, out anchor))
+                    return false;
+
+                if (_yHi - _yLo > 1e-6)
+                {
+                    _a = new Point3d(anchor.X, _yLo, 0.0);
+                    _b = new Point3d(anchor.X, _yHi, 0.0);
+                }
+                else
+                {
+                    // Габаритов нет — показываем хотя бы отрезок по диапазону отметок.
+                    Point3d lo, hi;
+                    if (!RwGeometry.TryPointInProfileView(_view, Station, _view.ElevationMin, out lo) ||
+                        !RwGeometry.TryPointInProfileView(_view, Station, _view.ElevationMax, out hi))
+                        return false;
+
+                    _a = lo;
+                    _b = hi;
+                }
+
+                return true;
+            }
+
             protected override bool WorldDraw(Autodesk.AutoCAD.GraphicsInterface.WorldDraw draw)
             {
-                // Курсор увели за пределы оси — показывать нечего, но jig
+                // Курсор увели за пределы — показывать нечего, но jig
                 // продолжает работать: вернётся в зону, и картинка появится.
                 if (!_valid) return true;
 
-                draw.Geometry.WorldLine(_onAxis, _cursor);
+                draw.Geometry.WorldLine(_a, _b);
                 return true;
             }
         }
@@ -815,6 +913,12 @@ namespace Civil3D_commands.AssociativeBreaks
                     try
                     {
                         BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, al);
+
+                        BreakProxyFactory.BringToFront(
+                            tr, db, RwHandles.Resolve(db, m.ProfileProxyHandle));
+                        BreakProxyFactory.BringToFront(
+                            tr, db, RwHandles.Resolve(db, m.PlanProxyHandle));
+
                         done++;
                     }
                     catch (System.Exception)

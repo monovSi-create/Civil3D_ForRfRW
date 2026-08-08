@@ -76,6 +76,11 @@ namespace Civil3D_commands.AssociativeBreaks
             m.PlanProxyHandle = planLine.Handle;
 
             UpdateProxyGeometry(tr, m, profileView, alignment);
+
+            // Наверх порядка отрисовки: профильная линия лежит внутри вида
+            // профиля, и под ним её труднее и увидеть, и подцепить.
+            BringToFront(tr, db, profLine.ObjectId);
+            BringToFront(tr, db, planLine.ObjectId);
         }
 
         /// <summary>Пересчитать координаты обеих прокси-линий из пикета маркера.</summary>
@@ -211,6 +216,41 @@ namespace Civil3D_commands.AssociativeBreaks
             return RwGeometry.TryStationInProfileView(pv, viewPoint, out station)
                 ? station
                 : double.NaN;
+        }
+
+        /// <summary>
+        /// Поднять прокси на самый верх порядка отрисовки.
+        ///
+        /// Профильная линия лежит целиком внутри вида профиля, и если вид
+        /// нарисован поверх неё, щелчок попадает в вид, а не в линию: выбрать
+        /// прокси и взяться за его ручку становится невозможно. В плане такой
+        /// беды нет — там поверх линии ничего не лежит.
+        /// </summary>
+        public static void BringToFront(Transaction tr, Database db, ObjectId lineId)
+        {
+            if (lineId.IsNull) return;
+
+            try
+            {
+                var ent = tr.GetObject(lineId, OpenMode.ForRead) as Autodesk.AutoCAD.DatabaseServices.Entity;
+                if (ent == null) return;
+
+                var owner = tr.GetObject(ent.BlockId, OpenMode.ForRead) as BlockTableRecord;
+                if (owner == null) return;
+
+                var order = tr.GetObject(owner.DrawOrderTableId, OpenMode.ForWrite) as DrawOrderTable;
+                if (order == null) return;
+
+                using (var ids = new ObjectIdCollection())
+                {
+                    ids.Add(lineId);
+                    order.MoveToTop(ids);
+                }
+            }
+            catch (System.Exception)
+            {
+                // Порядок отрисовки — удобство выбора, а не механика разрывов.
+            }
         }
 
         /// <summary>
