@@ -269,17 +269,23 @@ namespace Civil3D_commands.AssociativeBreaks
             var ln = RwHandles.Open<Line>(tr, db, h, OpenMode.ForRead);
             if (ln == null) return null;
 
-            Point3d mid = RwGeometry.Midpoint(ln);
-
             if (isPlan)
             {
                 var al = RwHandles.Open<Alignment>(tr, db, m.AlignmentHandle, OpenMode.ForRead);
-                return al == null ? (double?)null : BreakProxyFactory.PlanPointToStation(al, mid);
+
+                // Плановая линия держится НАЧАЛОМ на оси — по нему пикет и
+                // считается. Середина дала бы почти то же, но на кривых
+                // проекция точки со смещением точна не так очевидно.
+                return al == null
+                    ? (double?)null
+                    : BreakProxyFactory.PlanPointToStation(al, ln.StartPoint);
             }
             else
             {
                 var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
-                return pv == null ? (double?)null : BreakProxyFactory.ProfilePointToStation(pv, mid);
+                return pv == null
+                    ? (double?)null
+                    : BreakProxyFactory.ProfilePointToStation(pv, RwGeometry.Midpoint(ln));
             }
         }
     }

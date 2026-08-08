@@ -102,17 +102,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 }
             }
 
-            // --- План: ортогональ к оси в пикете m.Station ---
-            // Перпендикулярность обеспечивает сам PointLocation: смещение у него
-            // отмеряется по нормали к оси. Прежний численный поворот касательной
-            // врал на малых радиусах и в конце оси.
+            // --- План: перпендикуляр к оси в пикете m.Station ---
             ObjectId planProxyId = ResolveId(m.PlanProxyHandle);
             if (!planProxyId.IsNull && alignment != null)
             {
-                Point3d[] pts = RwGeometry.PlanSegment(
-                    alignment,
-                    m.Station, -PlanProxyHalfWidth,
-                    m.Station, PlanProxyHalfWidth);
+                Point3d[] pts = PlanPoints(alignment, m.Station);
 
                 if (pts != null)
                 {
@@ -121,6 +115,21 @@ namespace Civil3D_commands.AssociativeBreaks
                     ln.EndPoint = pts[1];
                 }
             }
+        }
+
+        /// <summary>
+        /// Геометрия планового прокси: **начало на оси**, конец в стороне на
+        /// PlanProxyHalfWidth. Перпендикулярность обеспечивает сам PointLocation —
+        /// смещение у него отмеряется по нормали к оси, поэтому на кривых
+        /// ничего не перекашивает. Прежний численный поворот касательной врал
+        /// на малых радиусах и в конце оси.
+        ///
+        /// Начало именно на оси, а не посередине: за него линия и «держится»
+        /// при перетаскивании (см. BreakGripOverrule).
+        /// </summary>
+        public static Point3d[] PlanPoints(Alignment alignment, double station)
+        {
+            return RwGeometry.PlanSegment(alignment, station, 0.0, station, PlanProxyHalfWidth);
         }
 
         /// <summary>
