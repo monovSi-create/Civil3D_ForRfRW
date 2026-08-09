@@ -64,26 +64,29 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 Каждая итерация стоит пользователю перезапуска Civil 3D, поэтому в одну сборку
 имеет смысл класть и исправление, и диагностику, которая разделит оставшиеся
 гипотезы. Для этого есть диагностические команды: `FACINGWALLDIAG` в `FaceArr` (счётчики
-вызовов оверрула) и `RW_BREAKDIAG` в `ProfCorrLink` (связь, маркеры, фактические
-границы областей коридора). Не удалять.
+вызовов оверрула), `RW_BREAKDIAG` в `ProfCorrLink` (связь, маркеры, фактические
+границы областей коридора) и `PTPDIAG` (счётчики событий запроса точки, состояние
+режима, `CMDACTIVE` в момент включения). Не удалять.
 
 ## Структура
 
 | Путь | Что |
 |------|-----|
 | `Shared/` | Общее для обоих модулей: `RwGeometry` (пикет↔точка в плане и в виде профиля, перпендикуляр к оси, Clamp, середина отрезка) и `RwHandles` (Handle↔текст↔ObjectId, правило «стёртое = пусто»). Новый код по этим темам писать здесь, а не рядом. |
-| `FaceArr/` | Facing Wall — параметрическая облицовка стены. **Есть свой `README.md` — читать его первым при работе с модулем.** |
-| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_MOVEBREAK`, `RW_DELETEBREAK`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
-| `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`, плюс служебная `UpdateRegions`). |
+| `FaceArr/` | Facing Wall — параметрическая облицовка стены, команды `FACINGWALL*` (namespace `Civil3D_commands.FaceArr`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
+| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_MOVEBREAK`, `RW_DELETEBREAK`, `RW_REFRESHBREAKS`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Namespace не совпадает с папкой: `Civil3D_commands.AssociativeBreaks`** — искать классы модуля по имени папки бесполезно. **Есть свой `README.md` — читать его первым при работе с модулем.** |
+| `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`). Ещё два `CommandMethod` в файле закомментированы (`LinkCorridor`, `UpdateRegions`) — в сборке их нет. |
 | `RetrieveReinfSoilMaterials.cs` | Ведомость материалов стены + таблица через `EntityJig` (`RW_MATERIALS`, `RW_WallPolylines`). |
 | `CorridorPolylineExtractor.cs` | Полилинии из коридора по группировке Z (`RW_ExtractCorridorPolylines`). |
-| `ProfileToPlaneTransparent.cs` | Прозрачный режим `PTP`: `PointMonitor` перехватывает любой запрос точки и запускает jig «пикет → отметка → смещение». Свой namespace `ProfileToPlane`. |
+| `ProfileToPlaneTransparent.cs` | Прозрачная команда `PTP` (плюс `PTPOFF`, `PTPDIAG`): набирается изнутри чужой команды в ответ на запрос точки, даёт щёлкнуть пикет и отметку на виде профиля и смещение по нормали в плане, возвращает точку строкой координат. Свой namespace `ProfileToPlane`. Проверено в чертеже 10 августа 2026. |
 | `PropertySetHelper.cs`, `PropertySetArea.cs` | Наборы характеристик (Property Sets), геосвойства, площадь тела (`RW_AddGeoPropsToPropertySet`, `GETBODYAREA`). |
 | `LinkingCommands.cs` | Ранний эксперимент со связями объектов (`LINK`, `MYLINK`, `LOADLINKS`, `SAVELINKS`). |
 | `../RfRW_elements_kit_v0.4/` | **Второй проект репозитория, не часть плагина**: набор параметрических подсборок коридора на VB.NET (облицовка, геопанели, дренаж, грунты). Собирается отдельно, к `Civil3D_commands.csproj` отношения не имеет. |
 
 Оба README ссылаются на исходное ТЗ `claude_instructions.txt` — **в репозитории его
 больше нет**. Сверять требования не с чем, источник истины по поведению — README модуля.
+Корневой `README.md` — витрина для GitHub (что за проекты, сборка, лицензия);
+подробности состояния модулей в нём не дублируются и устаревают первыми.
 
 ## Архитектурные соглашения
 
@@ -146,3 +149,19 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
   Рабочий образец обоих правил — `FacingWallCommands`.
 - `PropertyDataServices.AddPropertySet` сработает, только если набор допускает
   класс объекта; см. отлаженный фильтр в `PropertySetHelper`.
+- **`SendStringToExecute` без `"\n"` на конце ничего не выполняет** — строка
+  только набирается в командной строке и висит там невведённой. Так молча
+  стояла прежняя версия `PTP`: и подача команды, и передача координаты
+  доходили до командной строки и замирали.
+- **`Document.CommandInProgress` не годится, чтобы понять, вложена ли прозрачная
+  команда в чужую.** При `'PTP` из-под `PLINE` он возвращает не «PLINE», а имя
+  самой прозрачной команды. Признак вложенности — системная переменная
+  `CMDACTIVE`: бит 1 «идёт обычная команда», **бит 2 «поверх неё идёт
+  прозрачная»**, то есть `(CMDACTIVE & 2) != 0`. Проверено в чертеже.
+- **Вернуть точку в ожидающий запрос из .NET нечем** — API для этого нет.
+  Рабочий способ один: послать координату строкой через `SendStringToExecute`,
+  она попадает в тот самый висящий запрос. Признак «запрос закрыт и можно
+  вклиниваться в следующий» — событие `Editor.PromptedForPoint`; связка
+  `PromptingForPoint` + `PromptedForPoint` (см. `PtpSession`) надёжнее счётчика
+  пропущенных запросов, который угадывает, поднимет ли AutoCAD
+  `PromptingForPoint` повторно для уже висящего запроса.
