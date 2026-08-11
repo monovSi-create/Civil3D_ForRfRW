@@ -260,6 +260,7 @@ namespace Civil3D_commands.FaceArr
             if (doc == null) return;
 
             Editor ed = doc.Editor;
+            FacingWallGrips.Enable();
 
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
@@ -278,10 +279,20 @@ namespace Civil3D_commands.FaceArr
         }
 
         // =================================================================
-        //  СМЕНА ОПРЕДЕЛЕНИЙ БЛОКОВ
+        //  РЕДАКТИРОВАНИЕ МАССИВА
+        //
+        //  Одно место для всего, что меняют уже после создания: определения
+        //  блоков (целый, половинчатый, заменители), их длины, количество
+        //  рядов и отметка низа. Прежняя FACINGWALLBLOCKS умела только первое
+        //  и потому удалена — здесь она вся целиком.
+        //
+        //  Правки копятся в памяти и применяются ОДНИМ перестроением на
+        //  выходе: BuildAll стирает проекции Civil и пересоздаёт все блоки,
+        //  делать это после каждого ответа незачем. Побочный полезный
+        //  эффект — выход по Esc не оставляет массив на полпути.
         // =================================================================
-        [CommandMethod("FACINGWALLBLOCKS")]
-        public static void ChangeBlocks()
+        [CommandMethod("FACINGWALLEDIT")]
+        public static void EditArray()
         {
             Document doc = AcApp.DocumentManager.MdiActiveDocument;
             if (doc == null) return;
@@ -289,54 +300,541 @@ namespace Civil3D_commands.FaceArr
             Database db = doc.Database;
             Editor ed = doc.Editor;
 
+            FacingWallGrips.Enable();
+
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
 
+            FacingWallDefinition def;
             List<string> mvNames;
-            string currentWhole, currentHalf;
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                FacingWallDefinition loaded = FacingWallController.Load(controllerId, tr);
-                if (loaded == null)
-                {
-                    ed.WriteMessage("\nНе удалось прочитать контроллер.");
-                    tr.Commit();
-                    return;
-                }
-
-                currentWhole = loaded.MvBlockDefName;
-                currentHalf = loaded.HalfMvBlockDefName;
+                def = FacingWallController.Load(controllerId, tr);
                 mvNames = FacingWallBuilder.GetMvBlockNames(db, tr);
                 tr.Commit();
             }
 
-            if (mvNames.Count == 0)
+            if (def == null)
             {
-                ed.WriteMessage("\nВ чертеже нет определений многовидовых блоков.");
+                ed.WriteMessage("\nНе удалось прочитать контроллер.");
                 return;
             }
 
-            ed.WriteMessage("\nСейчас: целый «{0}», половинчатый «{1}».",
-                currentWhole ?? "не задан", currentHalf ?? "не задан");
+            // Ряды, снятые сверху. Их блоки живут в чертеже до самого
+            // применения: вернуть количество обратно — обычное дело, и тогда
+            // ряд возвращается со своими объектами, а не строится заново.
+            var removed = new List<FacingWallRowDefinition>();
+            bool changed = false;
 
-            var opts = new PromptKeywordOptions("\nКакой блок заменить");
-            opts.Keywords.Add("Whole", "Целый", "Целый");
-            opts.Keywords.Add("Half", "Половинчатый", "Половинчатый");
-            opts.Keywords.Default = "Whole";
-            opts.AllowNone = true;
+            while (true)
+            {
+                PrintArrayState(ed, def);
 
-            PromptResult res = ed.GetKeywords(opts);
-            if (res.Status != PromptStatus.OK) return;
+                // Глобальные имена латиницей, подписи русские — иначе ключевое
+                // слово не вводится при английской раскладке. Default задаётся
+                // ГЛОБАЛЬНЫМ именем: русское бросает eInvalidInput до показа.
+                var opts = new PromptKeywordOptions("\nЧто изменить");
+                opts.Keywords.Add("Whole", "Целый", "Целый");
+                opts.Keywords.Add("Half", "Половинчатый", "Половинчатый");
+                opts.Keywords.Add("Custom", "Индивидуальный", "Индивидуальный");
+                opts.Keywords.Add("Rows", "Ряды", "Ряды");
+                opts.Keywords.Add("Elevation", "Отметка", "Отметка");
+                opts.Keywords.Add("Apply", "Применить", "Применить");
+                opts.Keywords.Default = "Apply";
+                opts.AllowNone = true;
 
-            bool whole = res.StringResult != "Half";
+                PromptResult res = ed.GetKeywords(opts);
+                if (res.Status != PromptStatus.OK)
+                {
+                    ed.WriteMessage("\nОтменено, массив не изменён.");
+                    return;
+                }
+
+                if (res.StringResult == "Apply") break;
+
+                switch (res.StringResult)
+                {
+                    case "Whole":
+                        if (ChangeMvBlock(ed, db, def, mvNames, true)) changed = true;
+                        break;
+
+                    case "Half":
+                        if (ChangeMvBlock(ed, db, def, mvNames, false)) changed = true;
+                        break;
+
+                    case "Custom":
+                        if (ChangeCustomBlock(ed, db, def, mvNames)) changed = true;
+                        break;
+
+                    case "Rows":
+                        if (ChangeRowCount(ed, def, removed)) changed = true;
+                        break;
+
+                    case "Elevation":
+                        if (ChangeBaseElevation(ed, db, def)) changed = true;
+                        break;
+                }
+            }
+
+            if (!changed)
+            {
+                ed.WriteMessage("\nНичего не изменено.");
+                return;
+            }
+
+            try
+            {
+                using (doc.LockDocument())
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    // Снятые ряды: их блоки, проекции и отрезок-ручку стирает
+                    // только эта команда — BuildAll о них уже не знает.
+                    foreach (FacingWallRowDefinition row in removed)
+                    {
+                        if (row == null) continue;
+
+                        FacingWallBuilder.EraseAll(tr, row.BlockIds);
+                        FacingWallBuilder.EraseAll(tr, row.ProjectionIds);
+                        FacingWallProjection.EraseGripLine(tr, row);
+                    }
+
+                    FacingWallController.BuildAll(tr, db, controllerId, def);
+                    FacingWallController.Save(controllerId, def, tr);
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage("\nОшибка перестроения: " + ex.Message);
+                return;
+            }
+
+            int total = 0;
+            foreach (FacingWallRowDefinition row in def.Rows)
+                if (row != null && row.BlockIds != null) total += row.BlockIds.Count;
+
+            ed.WriteMessage("\nМассив перестроен. Рядов: {0}, блоков: {1}.",
+                def.RowCount, total);
+
+            // Проекции Civil ассоциативны, а блоки только что созданы заново.
+            if (def.ProjectionMode == FacingWallProjectionMode.MvBlock)
+                ed.WriteMessage(
+                    "\nРежим «многовидовой»: проекции стёрты вместе со старыми " +
+                    "блоками, восстановите их командой FACINGWALLPROJECT.");
+
+            ed.Regen();
+        }
+
+        /// <summary>Что сейчас в массиве — печатается перед каждым вопросом.</summary>
+        private static void PrintArrayState(Editor ed, FacingWallDefinition def)
+        {
+            bool flat = def.ProjectionMode == FacingWallProjectionMode.Block2d;
+
+            ed.WriteMessage("\n\n--- Массив облицовки ---");
+            ed.WriteMessage("\nЦелый блок .................. {0}, длина {1:F3}{2}",
+                def.MvBlockDefName ?? "не задан", def.BlockWidth,
+                flat ? ", плоский «" + (def.ViewBlockName ?? "авто") + "»" : "");
+            ed.WriteMessage("\nПоловинчатый блок ........... {0}, длина {1:F3}{2}{3}",
+                def.HalfMvBlockDefName ?? "не задан", def.HalfWidth(),
+                def.HalfBlockWidth <= 0.0 ? " (половина ячейки)" : "",
+                flat ? ", плоский «" + (def.HalfViewBlockName ?? "авто") + "»" : "");
+
+            foreach (string custom in def.CustomMvBlockNames())
+                ed.WriteMessage("\nЗаменитель .................. {0}, длина {1:F3}{2}",
+                    custom, CustomWidth(def, custom),
+                    flat ? ", плоский «" + (def.GetCustomViewBlock(custom) ?? "авто") + "»" : "");
+
+            ed.WriteMessage("\nРядов ....................... {0}", def.RowCount);
+            ed.WriteMessage("\nОтметка низа / верха ........ {0:F3} / {1:F3}",
+                def.BaseElevation, def.BaseElevation + def.RowCount * def.BlockHeight);
+            ed.WriteMessage("\nОтображение на профиле ...... {0}",
+                ModeLabel(def.ProjectionMode));
+        }
+
+        /// <summary>
+        /// Длина, с которой стоят замены этого определения. Их может быть
+        /// несколько с разной длиной — тогда берём первую попавшуюся: в
+        /// редакторе она служит только значением по умолчанию.
+        /// </summary>
+        private static double CustomWidth(FacingWallDefinition def, string mvName)
+        {
+            foreach (FacingWallRowDefinition row in def.Rows)
+            {
+                if (row == null || row.Overrides == null) continue;
+
+                foreach (FacingWallBlockOverride ov in row.Overrides)
+                    if (ov != null && string.Equals(
+                            ov.MvBlockDefName, mvName, StringComparison.OrdinalIgnoreCase))
+                        return ov.Width;
+            }
+
+            return def.BlockWidth;
+        }
+
+        /// <summary>
+        /// Сменить определение целого или половинчатого блока. Возвращает,
+        /// изменилось ли что-нибудь на самом деле: перестраивать массив
+        /// из-за повторного выбора того же блока незачем.
+        /// </summary>
+        private static bool ChangeMvBlock(
+            Editor ed, Database db, FacingWallDefinition def,
+            List<string> mvNames, bool whole)
+        {
+            if (mvNames == null || mvNames.Count == 0)
+            {
+                ed.WriteMessage("\nВ чертеже нет определений многовидовых блоков.");
+                return false;
+            }
+
+            string currentMv = whole ? def.MvBlockDefName : def.HalfMvBlockDefName;
+            string currentView = whole ? def.ViewBlockName : def.HalfViewBlockName;
 
             string picked = SelectFromListUI(
-                whole ? "Целый блок" : "Половинчатый блок",
-                mvNames,
-                whole ? currentWhole : currentHalf);
+                whole ? "Целый блок" : "Половинчатый блок", mvNames, currentMv);
 
-            if (picked == null) { ed.WriteMessage("\nОтменено."); return; }
+            if (picked == null) { ed.WriteMessage("\nОтменено."); return false; }
+
+            bool sameMv = string.Equals(picked, currentMv, StringComparison.OrdinalIgnoreCase);
+
+            string viewBlock = null;
+            if (def.ProjectionMode == FacingWallProjectionMode.Block2d)
+                viewBlock = AskViewBlock(
+                    ed, db,
+                    whole ? "Плоский блок для вида профиля — целый"
+                          : "Плоский блок для вида профиля — половинчатый",
+                    picked, sameMv ? currentView : null);
+
+            // Определение не менялось и плоский блок не выбран — оставляем как было.
+            // Сменилось определение — прежний плоский блок принадлежал другому
+            // MVBlock и должен уйти, даже если нового не выбрали.
+            string newView = (sameMv && viewBlock == null) ? currentView : viewBlock;
+
+            // Длина: у нового определения она своя, у прежнего может остаться
+            // прежней. Предлагаем текущую — Enter оставляет как было.
+            double currentWidth = whole ? def.BlockWidth : def.HalfWidth();
+            double newWidth = AskDouble(ed,
+                whole ? "Длина целого блока" : "Длина половинчатого блока", currentWidth);
+
+            if (newWidth <= 0.0)
+            {
+                ed.WriteMessage("\nДлина должна быть положительной, оставлена прежняя.");
+                newWidth = currentWidth;
+            }
+
+            if (!whole && newWidth > def.HalfStep() + 1e-9)
+            {
+                // Ячейка сетки — BlockWidth/2, и половинка шире неё налезла бы
+                // на соседний целый блок. Саму сетку не трогаем: на ней держатся
+                // ручки, перевязка и привязка замен к пикетам.
+                ed.WriteMessage(
+                    "\nПоловинка не может быть длиннее половины ячейки ({0:F3}) — " +
+                    "укорочена до неё.", def.HalfStep());
+                newWidth = def.HalfStep();
+            }
+
+            bool result =
+                !sameMv ||
+                !string.Equals(newView, currentView, StringComparison.OrdinalIgnoreCase) ||
+                Math.Abs(newWidth - currentWidth) > 1e-9;
+
+            if (whole)
+            {
+                def.MvBlockDefName = picked;
+                def.ViewBlockName = newView;
+                def.BlockWidth = newWidth;
+            }
+            else
+            {
+                def.HalfMvBlockDefName = picked;
+                def.HalfViewBlockName = newView;
+
+                // Ровно половина ячейки хранится как «не задано»: так массив
+                // продолжает следовать за шириной целого блока, если её меняют.
+                def.HalfBlockWidth =
+                    Math.Abs(newWidth - def.HalfStep()) < 1e-9 ? 0.0 : newWidth;
+            }
+
+            if (result)
+                ed.WriteMessage("\n{0} блок: «{1}», длина {2:F3}{3}.",
+                    whole ? "Целый" : "Половинчатый", picked, newWidth,
+                    newView == null ? "" : ", плоский «" + newView + "»");
+            else
+                ed.WriteMessage("\nБлок не изменён.");
+
+            return result;
+        }
+
+        /// <summary>
+        /// Заменители (FACINGWALLREPLACE): определение, его длина и плоское
+        /// представление. Правка идёт ПО ОПРЕДЕЛЕНИЮ и разом по всем местам,
+        /// где оно стоит: замена привязана к месту на трассе, и перебирать
+        /// их поштучно в командной строке было бы мучением.
+        /// </summary>
+        private static bool ChangeCustomBlock(
+            Editor ed, Database db, FacingWallDefinition def, List<string> mvNames)
+        {
+            List<string> customNames = def.CustomMvBlockNames();
+
+            if (customNames.Count == 0)
+            {
+                ed.WriteMessage(
+                    "\nВ массиве нет заменённых блоков. Замены ставятся командой " +
+                    "FACINGWALLREPLACE.");
+                return false;
+            }
+
+            string target = customNames.Count == 1
+                ? customNames[0]
+                : SelectFromListUI("Какой заменитель править", customNames, null);
+
+            if (target == null) { ed.WriteMessage("\nОтменено."); return false; }
+
+            double currentWidth = CustomWidth(def, target);
+            string currentView = def.GetCustomViewBlock(target);
+
+            string picked = SelectFromListUI(
+                "Определение вместо «" + target + "»", mvNames, target);
+
+            if (picked == null) { ed.WriteMessage("\nОтменено."); return false; }
+
+            bool sameMv = string.Equals(picked, target, StringComparison.OrdinalIgnoreCase);
+
+            double newWidth = AskDouble(ed, "Длина блока-заменителя", currentWidth);
+            if (newWidth <= 0.0)
+            {
+                ed.WriteMessage("\nДлина должна быть положительной, оставлена прежняя.");
+                newWidth = currentWidth;
+            }
+
+            string viewBlock = null;
+            if (def.ProjectionMode == FacingWallProjectionMode.Block2d)
+                viewBlock = AskViewBlock(
+                    ed, db, "Плоский блок для вида профиля — заменитель «" + picked + "»",
+                    picked, sameMv ? currentView : null);
+
+            string newView = (sameMv && viewBlock == null) ? currentView : viewBlock;
+
+            bool result =
+                !sameMv ||
+                Math.Abs(newWidth - currentWidth) > 1e-9 ||
+                !string.Equals(newView, currentView, StringComparison.OrdinalIgnoreCase);
+
+            if (!result)
+            {
+                ed.WriteMessage("\nЗаменитель не изменён.");
+                return false;
+            }
+
+            int touched = 0;
+
+            foreach (FacingWallRowDefinition row in def.Rows)
+            {
+                if (row == null || row.Overrides == null) continue;
+
+                foreach (FacingWallBlockOverride ov in row.Overrides)
+                {
+                    if (ov == null) continue;
+                    if (!string.Equals(ov.MvBlockDefName, target,
+                                       StringComparison.OrdinalIgnoreCase)) continue;
+
+                    ov.MvBlockDefName = picked;
+                    ov.Width = newWidth;
+                    touched++;
+                }
+            }
+
+            // Прежнее определение больше нигде не стоит — его плоский блок
+            // в записи не нужен, иначе карта копила бы мусор.
+            if (!sameMv) def.SetCustomViewBlock(target, null);
+            def.SetCustomViewBlock(picked, newView);
+
+            ed.WriteMessage("\nЗаменитель: «{0}», длина {1:F3}{2}. Мест: {3}.",
+                picked, newWidth,
+                newView == null ? "" : ", плоский «" + newView + "»", touched);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Изменить количество рядов. Ряды снимаются и добавляются СВЕРХУ:
+        /// номер ряда задаёт его отметку (BaseElevation + RowIndex*BlockHeight)
+        /// и фазу перевязки, поэтому нумерация обязана оставаться сплошной
+        /// от нуля.
+        /// </summary>
+        private static bool ChangeRowCount(
+            Editor ed, FacingWallDefinition def, List<FacingWallRowDefinition> removed)
+        {
+            int current = def.RowCount;
+            int wanted = AskInt(ed, "Количество рядов", current);
+
+            if (wanted <= 0)
+            {
+                ed.WriteMessage("\nРядов должно быть не меньше одного.");
+                return false;
+            }
+
+            if (wanted == current) return false;
+
+            while (def.RowCount > wanted)
+            {
+                FacingWallRowDefinition top = TopRow(def);
+                if (top == null) break;
+
+                def.Rows.Remove(top);
+                removed.Add(top);
+            }
+
+            while (def.RowCount < wanted)
+            {
+                FacingWallRowDefinition top = TopRow(def);
+                int index = top == null ? 0 : top.RowIndex + 1;
+
+                // Ряд этого номера могли снять в этом же сеансе — возвращаем его
+                // вместе со связями, иначе его блоки остались бы в чертеже ничьими.
+                FacingWallRowDefinition back =
+                    removed.Find(r => r != null && r.RowIndex == index);
+
+                if (back != null)
+                {
+                    removed.Remove(back);
+                }
+                else
+                {
+                    // Новый ряд занимает всю область раскладки; подрезать его
+                    // отдельно — дело профильных ручек.
+                    back = new FacingWallRowDefinition
+                    {
+                        RowIndex = index,
+                        StartStation = def.LayoutStartStation,
+                        EndStation = def.LayoutEndStation
+                    };
+                }
+
+                def.Rows.Add(back);
+            }
+
+            ed.WriteMessage("\nРядов: {0} -> {1}, верх стены {2:F3}.",
+                current, def.RowCount,
+                def.BaseElevation + def.RowCount * def.BlockHeight);
+
+            return true;
+        }
+
+        /// <summary>Самый верхний ряд — у него наибольший номер.</summary>
+        private static FacingWallRowDefinition TopRow(FacingWallDefinition def)
+        {
+            FacingWallRowDefinition top = null;
+
+            foreach (FacingWallRowDefinition row in def.Rows)
+            {
+                if (row == null) continue;
+                if (top == null || row.RowIndex > top.RowIndex) top = row;
+            }
+
+            return top;
+        }
+
+        /// <summary>
+        /// Сменить отметку низа. Спрашивается тем же диалогом, что и при
+        /// создании: числом или снятием минимума с профиля в границах раскладки.
+        /// </summary>
+        private static bool ChangeBaseElevation(
+            Editor ed, Database db, FacingWallDefinition def)
+        {
+            double current = def.BaseElevation;
+            double elevation;
+
+            if (!AskBaseElevation(
+                    ed, db, def.LayoutLowStation(), def.LayoutHighStation(), out elevation))
+            {
+                ed.WriteMessage("\nОтметка не изменена.");
+                return false;
+            }
+
+            if (Math.Abs(elevation - current) < 1e-9)
+            {
+                ed.WriteMessage("\nОтметка не изменена.");
+                return false;
+            }
+
+            def.BaseElevation = elevation;
+
+            ed.WriteMessage("\nОтметка низа: {0:F3} -> {1:F3}.", current, elevation);
+            return true;
+        }
+
+        /// <summary>
+        /// Каким 2D-блоком показывать это определение на виде профиля.
+        /// null — «подобрать самому»: вид спереди, а если такого назначения
+        /// в определении нет, первый блок состава.
+        /// </summary>
+        private static string AskViewBlock(
+            Editor ed, Database db, string title, string mvName, string current)
+        {
+            List<string> names;
+            string preferred;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                names = FacingWallBuilder.GetViewBlockNames(db, tr, mvName);
+                preferred = FacingWallBuilder.GetProfileViewBlockName(db, tr, mvName);
+                tr.Commit();
+            }
+
+            if (names.Count == 0)
+            {
+                ed.WriteMessage(
+                    "\nВ определении «{0}» нет обычных блоков — " +
+                    "на виде профиля показать его нечем.", mvName);
+                return null;
+            }
+
+            return SelectFromListUI(title, names, current ?? preferred);
+        }
+
+        // =================================================================
+        //  ПОДРЕЗКА РЯДОВ ПОД ПРОФИЛЬ
+        //
+        //  Стена выстраивается ступенями между своей отметкой низа и выбранным
+        //  профилем: ряд обрывается на последнем блоке, который целиком помещается
+        //  ПОД профилем, не коснувшись его контуром.
+        //
+        //  Ряды считаются от границ раскладки, а не от нынешней своей длины.
+        //  Иначе команда умела бы только укорачивать: второй запуск давал бы
+        //  не тот же результат, что первый, а ряд, обнулённый низким профилем,
+        //  было бы нечем вернуть. Плата за это — профильные уточнения рядов,
+        //  сделанные ручками, командой сбрасываются.
+        //
+        //  Связь с профилем НЕ сохраняется: профиль изменили — команду надо
+        //  выполнить заново. Ассоциативность здесь означала бы реактор,
+        //  как в ProfCorrLink, и это отдельная задача.
+        // =================================================================
+        [CommandMethod("FACINGBYPROFILE")]
+        public static void FitRowsToProfile()
+        {
+            Document doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            FacingWallGrips.Enable();
+
+            ObjectId controllerId = SelectController(doc);
+            if (controllerId.IsNull) return;
+
+            var pOpts = new PromptEntityOptions(
+                "\nВыберите профиль, ниже которого должна остаться стена: ");
+            pOpts.SetRejectMessage("\nНужен профиль (Profile).");
+            pOpts.AddAllowedClass(typeof(Profile), true);
+
+            PromptEntityResult pRes = ed.GetEntity(pOpts);
+            if (pRes.Status != PromptStatus.OK) return;
+
+            int shortened = 0;
+            int emptied = 0;
+            int total = 0;
 
             try
             {
@@ -346,31 +844,122 @@ namespace Civil3D_commands.FaceArr
                     FacingWallDefinition def = FacingWallController.Load(controllerId, tr);
                     if (def == null) { tr.Commit(); return; }
 
-                    if (whole)
+                    var profile = tr.GetObject(pRes.ObjectId, OpenMode.ForRead) as Profile;
+                    if (profile == null)
                     {
-                        def.MvBlockDefName = picked;
-                        def.ViewBlockName = null;      // прежний плоский блок был от другого MVBlock
+                        ed.WriteMessage("\nНе удалось открыть профиль.");
+                        tr.Commit();
+                        return;
                     }
-                    else
+
+                    def.ResetRowsToLayout();
+
+                    foreach (FacingWallRowDefinition row in def.Rows)
                     {
-                        def.HalfMvBlockDefName = picked;
-                        def.HalfViewBlockName = null;
+                        if (row == null) continue;
+
+                        double full = row.EndStation;
+                        row.EndStation = FitRowUnderProfile(def, row, profile);
+
+                        if (Math.Abs(row.EndStation - row.StartStation) < 1e-9) emptied++;
+                        else if (Math.Abs(row.EndStation - full) > 1e-9) shortened++;
+
+                        total++;
                     }
 
                     FacingWallController.BuildAll(tr, db, controllerId, def);
                     FacingWallController.Save(controllerId, def, tr);
                     tr.Commit();
                 }
-
-                ed.WriteMessage("\n{0} блок: «{1}». Массив перестроен.",
-                    whole ? "Целый" : "Половинчатый", picked);
             }
             catch (System.Exception ex)
             {
-                ed.WriteMessage("\nОшибка смены блока: " + ex.Message);
+                ed.WriteMessage("\nОшибка подрезки: " + ex.Message);
+                return;
             }
 
+            ed.WriteMessage(
+                "\nРядов: {0}, подрезано: {1}, пустых: {2}.",
+                total, shortened, emptied);
+
+            if (emptied == total && total > 0)
+                ed.WriteMessage(
+                    "\nПод профилем не поместился ни один блок — профиль ниже " +
+                    "отметки низа стены или слишком близко к ней.");
+            else if (emptied > 0)
+                ed.WriteMessage(
+                    "\nПустые ряды не удалены: команда считает от границ раскладки, " +
+                    "и с другим профилем они вернутся. Убрать совсем — FACINGWALLEDIT.");
+
+            ed.WriteMessage(
+                "\nСвязь с профилем не сохранена: изменили профиль — выполните команду заново.");
+
             ed.Regen();
+        }
+
+        /// <summary>
+        /// Докуда ряд помещается под профилем.
+        ///
+        /// Блоки перебираются в порядке укладки, от якоря наружу, и ряд
+        /// обрывается на ПЕРВОМ, который профиля касается: ряд сплошной, и
+        /// оставить блоки за провалом профиля всё равно нельзя. Возвращается
+        /// шов сетки за последним поместившимся блоком (NextStation), а не его
+        /// край: у половинки со своей шириной это разные точки, и обрезка по
+        /// краю выбросила бы сам этот блок из укоротившегося ряда.
+        /// </summary>
+        private static double FitRowUnderProfile(
+            FacingWallDefinition def, FacingWallRowDefinition row, Profile profile)
+        {
+            double top = FacingWallBuilder.RowElevation(def, row) + def.BlockHeight;
+            double edge = row.StartStation;   // ничего не поместилось — ряд пуст
+
+            foreach (FacingWallBlockPlacement block in FacingWallBuilder.EnumerateBlocks(def, row))
+            {
+                if (!IsUnderProfile(profile, block, top)) break;
+                edge = block.NextStation;
+            }
+
+            return edge;
+        }
+
+        /// <summary>
+        /// Весь контур блока строго ниже профиля?
+        ///
+        /// Профиль между двумя пикетами может провисать (вертикальная кривая),
+        /// поэтому проверяются не только края блока. Шаг опроса держим около
+        /// 0.1 м: у облицовочного блока это те же 4-5 точек, что и раньше, а
+        /// у длинного блока-заменителя провал профиля больше не проскочит
+        /// между краями. Пикет, до которого профиль не достаёт, считается
+        /// непроходимым: гарантировать, что блок под ним, там нечем.
+        /// </summary>
+        private static bool IsUnderProfile(
+            Profile profile, FacingWallBlockPlacement block, double top)
+        {
+            const double eps = 1e-6;
+
+            int samples = (int)Math.Ceiling(block.Width / 0.1);
+            if (samples < 4) samples = 4;
+            if (samples > 200) samples = 200;
+
+            for (int k = 0; k <= samples; k++)
+            {
+                double station = block.Station + block.Width * k / samples;
+
+                double elevation;
+                try
+                {
+                    elevation = profile.ElevationAt(station);
+                }
+                catch (System.Exception)
+                {
+                    return false;   // профиль сюда не дотягивается
+                }
+
+                if (double.IsNaN(elevation)) return false;
+                if (elevation <= top + eps) return false;
+            }
+
+            return true;
         }
 
         // =================================================================
@@ -388,6 +977,7 @@ namespace Civil3D_commands.FaceArr
 
             Database db = doc.Database;
             Editor ed = doc.Editor;
+            FacingWallGrips.Enable();
 
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
@@ -584,6 +1174,7 @@ namespace Civil3D_commands.FaceArr
 
             Database db = doc.Database;
             Editor ed = doc.Editor;
+            FacingWallGrips.Enable();
 
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
@@ -597,10 +1188,19 @@ namespace Civil3D_commands.FaceArr
             if (sel.Status != PromptStatus.OK) return;
 
             List<string> mvNames;
+            FacingWallDefinition loaded;
+
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
+                loaded = FacingWallController.Load(controllerId, tr);
                 mvNames = FacingWallBuilder.GetMvBlockNames(db, tr);
                 tr.Commit();
+            }
+
+            if (loaded == null)
+            {
+                ed.WriteMessage("\nНе удалось прочитать контроллер.");
+                return;
             }
 
             if (mvNames.Count == 0)
@@ -612,12 +1212,22 @@ namespace Civil3D_commands.FaceArr
             string picked = SelectFromListUI("Блок-заменитель", mvNames, null);
             if (picked == null) { ed.WriteMessage("\nОтменено."); return; }
 
-            double width = AskDouble(ed, "Длина блока-заменителя", 0.405);
+            double width = AskDouble(ed, "Длина блока-заменителя", loaded.BlockWidth);
             if (width <= 0.0)
             {
                 ed.WriteMessage("\nДлина должна быть положительной.");
                 return;
             }
+
+            // Плоское представление спрашивается ПО ОПРЕДЕЛЕНИЮ: заменителей
+            // в массиве может быть сколько угодно разных, и вид спереди назначен
+            // далеко не у каждого — без этого их места на профиле оставались
+            // пустыми ровно так же, как раньше половинки.
+            string customView = null;
+            if (loaded.ProjectionMode == FacingWallProjectionMode.Block2d)
+                customView = AskViewBlock(
+                    ed, db, "Плоский блок для вида профиля — заменитель «" + picked + "»",
+                    picked, loaded.GetCustomViewBlock(picked));
 
             int added = 0;
 
@@ -651,6 +1261,8 @@ namespace Civil3D_commands.FaceArr
 
                     if (added > 0)
                     {
+                        def.SetCustomViewBlock(picked, customView);
+
                         FacingWallController.BuildAll(tr, db, controllerId, def);
                         FacingWallController.Save(controllerId, def, tr);
                     }
@@ -784,15 +1396,20 @@ namespace Civil3D_commands.FaceArr
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
 
-            // 1. Текущее состояние и состав многовидового блока.
+            // 1. Текущее состояние и состав многовидовых блоков — целого и
+            //    половинчатого. Состав у них РАЗНЫЙ, поэтому и списки разные:
+            //    один вопрос на оба блока показывал бы для половинки чужие имена.
             FacingWallProjectionMode current;
-            string mvName;
-            List<string> viewBlocks;
-            string frontBlock;
+            string mvName, halfMvName;
+            string currentView, currentHalfView;
+            List<string> viewBlocks, halfViewBlocks;
+            string frontBlock, halfFrontBlock;
+            List<string> customMvNames;
+            FacingWallDefinition loaded;
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                FacingWallDefinition loaded = FacingWallController.Load(controllerId, tr);
+                loaded = FacingWallController.Load(controllerId, tr);
                 if (loaded == null)
                 {
                     ed.WriteMessage("\nНе удалось прочитать контроллер.");
@@ -802,12 +1419,21 @@ namespace Civil3D_commands.FaceArr
 
                 current = loaded.ProjectionMode;
                 mvName = loaded.MvBlockDefName;
+                halfMvName = loaded.HalfMvBlockDefName;
+                currentView = loaded.ViewBlockName;
+                currentHalfView = loaded.HalfViewBlockName;
+                customMvNames = loaded.CustomMvBlockNames();
+
                 viewBlocks = FacingWallBuilder.GetViewBlockNames(db, tr, mvName);
                 frontBlock = FacingWallBuilder.GetFrontViewBlockName(db, tr, mvName);
 
+                halfViewBlocks = FacingWallBuilder.GetViewBlockNames(db, tr, halfMvName);
+                halfFrontBlock = FacingWallBuilder.GetFrontViewBlockName(db, tr, halfMvName);
+
                 ed.WriteMessage("\nТекущий режим: {0}", ModeLabel(current));
                 if (current == FacingWallProjectionMode.Block2d)
-                    ed.WriteMessage("  (блок {0})", loaded.ViewBlockName ?? "не задан");
+                    ed.WriteMessage("  (целый «{0}», половинчатый «{1}»)",
+                        currentView ?? "авто", currentHalfView ?? "авто");
 
                 tr.Commit();
             }
@@ -831,8 +1457,15 @@ namespace Civil3D_commands.FaceArr
                 default: mode = FacingWallProjectionMode.Outline; break;
             }
 
-            // 3. Для плоского режима — какой именно 2D-блок.
+            // 3. Для плоского режима — какими именно 2D-блоками показывать целый
+            //    блок и половинку. Половинку спрашиваем отдельно: раньше её не
+            //    спрашивали вовсе, брали вид спереди её MVBlock, а если такого
+            //    назначения не было — половинки на профиле не появлялись совсем.
             string viewBlockName = null;
+            string halfViewBlockName = null;
+            bool askedHalf = false;
+            var customViews = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
             if (mode == FacingWallProjectionMode.Block2d)
             {
                 if (viewBlocks.Count == 0)
@@ -844,12 +1477,48 @@ namespace Civil3D_commands.FaceArr
                 }
 
                 viewBlockName = SelectFromListUI(
-                    "Плоский блок для вида профиля", viewBlocks, frontBlock);
+                    "Плоский блок для вида профиля — целый",
+                    viewBlocks, currentView ?? frontBlock);
 
                 if (viewBlockName == null) { ed.WriteMessage("\nОтменено."); return; }
 
                 if (frontBlock != null && viewBlockName == frontBlock)
                     ed.WriteMessage("\nВыбран блок вида спереди — то, что нужно для фасада.");
+
+                if (string.IsNullOrEmpty(halfMvName))
+                {
+                    ed.WriteMessage(
+                        "\nПоловинчатый блок массиву не задан — половинки не ставятся " +
+                        "(задаётся командой FACINGWALLEDIT).");
+                }
+                else if (halfViewBlocks.Count == 0)
+                {
+                    ed.WriteMessage(
+                        "\nВ определении половинки '{0}' не нашлось обычных блоков — " +
+                        "на виде профиля показать её нечем.", halfMvName);
+                }
+                else
+                {
+                    halfViewBlockName = SelectFromListUI(
+                        "Плоский блок для вида профиля — половинчатый",
+                        halfViewBlocks, currentHalfView ?? halfFrontBlock);
+
+                    if (halfViewBlockName == null) { ed.WriteMessage("\nОтменено."); return; }
+
+                    askedHalf = true;
+                }
+
+                // Заменители: у каждого определения своё плоское представление,
+                // поэтому вопрос задаётся ПО КАЖДОМУ, а не один на всех.
+                foreach (string customMv in customMvNames)
+                {
+                    string answer = AskViewBlock(
+                        ed, db,
+                        "Плоский блок для вида профиля — заменитель «" + customMv + "»",
+                        customMv, loaded.GetCustomViewBlock(customMv));
+
+                    if (answer != null) customViews[customMv] = answer;
+                }
             }
 
             // 4. Записать и пересобрать только проекции.
@@ -865,7 +1534,17 @@ namespace Civil3D_commands.FaceArr
 
                     def.ProjectionMode = mode;
                     if (mode == FacingWallProjectionMode.Block2d)
+                    {
                         def.ViewBlockName = viewBlockName;
+
+                        // Если половинку спросить было негде (не задана или в её
+                        // определении нет обычных блоков), прежний выбор не
+                        // затираем: массив мог быть настроен раньше.
+                        if (askedHalf) def.HalfViewBlockName = halfViewBlockName;
+
+                        foreach (KeyValuePair<string, string> pair in customViews)
+                            def.SetCustomViewBlock(pair.Key, pair.Value);
+                    }
 
                     // Проекции Civil принадлежат только режиму MvBlock: уходя из
                     // него — стираем, входя — стираем прежние, чтобы не копились.
@@ -907,6 +1586,7 @@ namespace Civil3D_commands.FaceArr
             if (doc == null) return;
 
             Editor ed = doc.Editor;
+            FacingWallGrips.Enable();
 
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
@@ -940,21 +1620,6 @@ namespace Civil3D_commands.FaceArr
                 case FacingWallProjectionMode.Block2d: return "плоский блок";
                 default: return "контур";
             }
-        }
-
-        // =================================================================
-        //  СЛУЖЕБНАЯ: включить грипсы в текущем сеансе.
-        //  Нужна, если чертёж с массивами открыт, но ни одна команда
-        //  массива ещё не вызывалась (оверрул регистрируется по требованию).
-        // =================================================================
-        [CommandMethod("FACINGWALLGRIPS")]
-        public static void ToggleGrips()
-        {
-            Document doc = AcApp.DocumentManager.MdiActiveDocument;
-            if (doc == null) return;
-
-            FacingWallGrips.Enable();
-            doc.Editor.WriteMessage("\nГрипсы массива облицовки включены.");
         }
 
         // =================================================================

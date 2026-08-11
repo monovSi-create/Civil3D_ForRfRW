@@ -193,8 +193,14 @@ namespace Civil3D_commands.FaceArr
         /// </summary>
         /// <summary>
         /// Плоский блок для конкретного места ряда: целый, половинка или
-        /// заменённый. Явно заданное имя важнее, иначе берём блок вида спереди
-        /// из состава соответствующего многовидового.
+        /// заменённый. Явно заданное имя важнее (для целого — ViewBlockName,
+        /// для половинки — HalfViewBlockName), иначе блок подбирается из состава
+        /// соответствующего многовидового: вид спереди, а при его отсутствии
+        /// первый блок состава.
+        ///
+        /// Именно здесь пропадали половинки: раньше запасным вариантом был
+        /// только вид спереди, и половинчатый MVBlock без такого назначения
+        /// давал ObjectId.Null, а место молча пропускалось.
         /// </summary>
         private static ObjectId ResolveBlock2dFor(
             Database db, Transaction tr, Dictionary<string, ObjectId> cache,
@@ -204,6 +210,8 @@ namespace Civil3D_commands.FaceArr
 
             if (block.Kind == FacingWallBlockKind.Whole) explicitName = def.ViewBlockName;
             else if (block.Kind == FacingWallBlockKind.Half) explicitName = def.HalfViewBlockName;
+            else if (block.Kind == FacingWallBlockKind.Custom)
+                explicitName = def.GetCustomViewBlock(block.MvBlockDefName);
 
             string key = explicitName ?? ("mv:" + (block.MvBlockDefName ?? string.Empty));
 
@@ -215,7 +223,7 @@ namespace Civil3D_commands.FaceArr
                 string name = explicitName;
 
                 if (string.IsNullOrEmpty(name))
-                    name = FacingWallBuilder.GetFrontViewBlockName(db, tr, block.MvBlockDefName);
+                    name = FacingWallBuilder.GetProfileViewBlockName(db, tr, block.MvBlockDefName);
 
                 id = string.IsNullOrEmpty(name)
                     ? ObjectId.Null
@@ -230,12 +238,26 @@ namespace Civil3D_commands.FaceArr
             return id;
         }
 
+        /// <summary>
+        /// Вставка плоского блока в габарит места.
+        ///
+        /// По горизонтали блок ЦЕНТРИРУЕТСЯ: базовая точка облицовочного блока
+        /// лежит в его середине — ровно так же, как у многовидового в плане
+        /// (см. TryPlaceOnAlignment). Раньше вставка шла в левый нижний угол,
+        /// и на профиле блоки стояли на полблока левее своих мест.
+        ///
+        /// По вертикали базой остаётся НИЗ ряда: там базовая точка и есть,
+        /// это подтверждено тем, что ряды по отметкам всегда стояли верно.
+        /// </summary>
         private static ObjectId CreateBlock2dAt(
             Transaction tr, BlockTableRecord btr, ObjectId blockDefId, double blockWidth,
-            FacingWallDefinition def, Point3d insertion, double dx, double dy)
+            FacingWallDefinition def, Point3d lowerLeft, double dx, double dy)
         {
             double sx, sy;
             ViewScales(def, blockWidth, dx, dy, out sx, out sy);
+
+            var insertion = new Point3d(
+                lowerLeft.X + dx / 2.0, lowerLeft.Y, lowerLeft.Z);
 
             var br = new BlockReference(insertion, blockDefId);
             br.SetDatabaseDefaults();

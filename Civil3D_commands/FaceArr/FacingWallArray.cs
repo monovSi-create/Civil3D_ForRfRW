@@ -59,6 +59,18 @@ namespace Civil3D_commands.FaceArr
 
         /// <summary>Имя определения MVBlock для этого места.</summary>
         public string MvBlockDefName;
+
+        /// <summary>
+        /// Пикет, с которого раскладка продолжается дальше, — то есть шов сетки
+        /// за этим блоком, в направлении раскладки.
+        ///
+        /// Это НЕ «Station + Width»: блок может быть уже своей ячейки
+        /// (половинка со своей шириной), и тогда раскладка шагает по сетке,
+        /// а не по краю блока. Нужен тем, кто обрывает ряд на выбранном
+        /// блоке (FACINGBYPROFILE): обрежь по краю блока — и при следующем
+        /// перечислении этот блок в укоротившийся ряд уже не поместится.
+        /// </summary>
+        public double NextStation;
     }
 
     /// <summary>
@@ -164,12 +176,94 @@ namespace Civil3D_commands.FaceArr
         public string HalfViewBlockName { get; set; }
 
         /// <summary>
+        /// Собственная ширина половинчатого блока. Ноль — «как раньше»,
+        /// то есть ровно половина ячейки сетки (BlockWidth/2).
+        ///
+        /// Отдельное число нужно потому, что «половинчатый» блок в жизни редко
+        /// равен ровно половине: у него своя номенклатурная длина. Сетку это
+        /// НЕ меняет — она как была с шагом BlockWidth/2, иначе поехали бы
+        /// ручки, перевязка и привязка замен к пикетам. Меняется только
+        /// ширина самого блока внутри его ячейки, а прижимается он к соседнему
+        /// целому блоку (см. EnumerateBlocks).
+        /// </summary>
+        public double HalfBlockWidth { get; set; }
+
+        /// <summary>
         /// Шаг ручек и сетка раскладки: половина ширины блока. Именно поэтому
         /// по краям ряда может появиться половинка.
         /// </summary>
         public double HalfStep()
         {
             return BlockWidth / 2.0;
+        }
+
+        /// <summary>
+        /// Фактическая ширина половинчатого блока. Не задана — половина ячейки.
+        /// Шире ячейки быть не может: он налез бы на соседний целый блок.
+        /// </summary>
+        public double HalfWidth()
+        {
+            double cell = HalfStep();
+            if (HalfBlockWidth <= 0.0) return cell;
+
+            return HalfBlockWidth > cell ? cell : HalfBlockWidth;
+        }
+
+        /// <summary>
+        /// Плоский блок для режима Block2d по КАЖДОМУ определению-заменителю:
+        /// имя MVBlock -> имя обычного блока. У целого и половинки для этого
+        /// есть свои поля, а заменителей может быть сколько угодно разных,
+        /// и вид спереди назначен далеко не у каждого.
+        /// </summary>
+        public Dictionary<string, string> CustomViewBlocks { get; set; }
+            = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Плоский блок этого заменителя или null, если не задан.</summary>
+        public string GetCustomViewBlock(string mvName)
+        {
+            if (string.IsNullOrEmpty(mvName) || CustomViewBlocks == null) return null;
+
+            string view;
+            return CustomViewBlocks.TryGetValue(mvName, out view) ? view : null;
+        }
+
+        /// <summary>Задать (или снять, если view пуст) плоский блок заменителя.</summary>
+        public void SetCustomViewBlock(string mvName, string view)
+        {
+            if (string.IsNullOrEmpty(mvName)) return;
+
+            if (CustomViewBlocks == null)
+                CustomViewBlocks = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrEmpty(view)) CustomViewBlocks.Remove(mvName);
+            else CustomViewBlocks[mvName] = view;
+        }
+
+        /// <summary>
+        /// Разные определения, которыми заменялись блоки во всех рядах.
+        /// Ими спрашивают плоское представление и меняют длину заменителя.
+        /// </summary>
+        public List<string> CustomMvBlockNames()
+        {
+            var names = new List<string>();
+            if (Rows == null) return names;
+
+            foreach (FacingWallRowDefinition row in Rows)
+            {
+                if (row == null || row.Overrides == null) continue;
+
+                foreach (FacingWallBlockOverride ov in row.Overrides)
+                {
+                    if (ov == null || string.IsNullOrEmpty(ov.MvBlockDefName)) continue;
+
+                    if (!names.Exists(n => string.Equals(
+                            n, ov.MvBlockDefName, StringComparison.OrdinalIgnoreCase)))
+                        names.Add(ov.MvBlockDefName);
+                }
+            }
+
+            names.Sort();
+            return names;
         }
 
         /// <summary>
@@ -441,8 +535,14 @@ namespace Civil3D_commands.FaceArr
             if (span <= Eps) yield break;
 
             bool forward = def.LayoutEndStation >= def.LayoutStartStation;
-            double half = whole / 2.0;
-            bool hasHalf = !string.IsNullOrEmpty(def.HalfMvBlockDefName);
+
+            // ЯЧЕЙКА сетки (whole/2) и ШИРИНА половинчатого блока — разные вещи.
+            // Сетка задаёт, где проходят швы, и по ней же ходят ручки; блок
+            // может быть уже своей ячейки, тогда он прижимается к соседнему
+            // целому, а остаток ячейки остаётся пустым.
+            double cell = whole / 2.0;
+            double halfWidth = def.HalfWidth();
+            bool hasHalf = !string.IsNullOrEmpty(def.HalfMvBlockDefName) && halfWidth > Eps;
 
             List<FacingWallBlockOverride> overrides = SortedOverrides(row, forward);
             int used = 0;
@@ -453,7 +553,7 @@ namespace Civil3D_commands.FaceArr
             // Перевязка отсчитывается ОТ ЯКОРЯ, а не от начала ряда. Иначе
             // подрезанный ряд уезжает швами относительно соседей: у него своя
             // точка отсчёта. Нечётные ряды сдвинуты на полблока.
-            double phase = (row.RowIndex % 2 != 0) ? half : 0.0;
+            double phase = (row.RowIndex % 2 != 0) ? cell : 0.0;
 
             double fromAnchor = forward
                 ? row.StartStation - def.LayoutStartStation
@@ -465,9 +565,13 @@ namespace Civil3D_commands.FaceArr
 
             if (lead > Eps)
             {
-                if (hasHalf && Math.Abs(lead - half) < Eps && span >= half - Eps)
-                    yield return Place(row, forward, t, half, FacingWallBlockKind.Half,
-                        def.HalfMvBlockDefName);
+                // Половинка прижимается к СЛЕДУЮЩЕМУ целому блоку, то есть
+                // заканчивается ровно на шве сетки. При штатной ширине (ровно
+                // ячейка) это ровно то же, что было; при уменьшенной пустым
+                // остаётся край ряда, а не шов посреди раскладки.
+                if (hasHalf && Math.Abs(lead - cell) < Eps && span >= lead - Eps)
+                    yield return Place(row, forward, t + lead - halfWidth, halfWidth,
+                        t + lead, FacingWallBlockKind.Half, def.HalfMvBlockDefName);
 
                 // Даже если половинку поставить нечем, шаг делаем: попасть
                 // в сетку важнее, чем закрыть остаток.
@@ -479,7 +583,11 @@ namespace Civil3D_commands.FaceArr
                 double remaining = span - t;
                 double edge = forward ? row.StartStation + t : row.StartStation - t;
 
+                // Ширина блока и шаг раскладки — РАЗНЫЕ величины: половинка
+                // уже своей ячейки занимает её целиком, иначе в оставшийся
+                // хвост влезла бы вторая такая же.
                 double width;
+                double step;
                 FacingWallBlockKind kind;
                 string name;
 
@@ -488,30 +596,33 @@ namespace Civil3D_commands.FaceArr
                 if (ov != null)
                 {
                     width = ov.Width;
+                    step = ov.Width;   // заменитель сдвигает всё, что стоит за ним
                     kind = FacingWallBlockKind.Custom;
                     name = ov.MvBlockDefName;
                 }
                 else if (remaining >= whole - Eps)
                 {
                     width = whole;
+                    step = whole;
                     kind = FacingWallBlockKind.Whole;
                     name = def.MvBlockDefName;
                 }
-                else if (hasHalf && remaining >= half - Eps)
+                else if (hasHalf && remaining >= cell - Eps)
                 {
-                    width = half;
+                    width = halfWidth;
+                    step = cell;
                     kind = FacingWallBlockKind.Half;
                     name = def.HalfMvBlockDefName;
                 }
                 else
                 {
-                    break;   // остаток меньше половинки — не заполняем
+                    break;   // остаток меньше половины ячейки — не заполняем
                 }
 
                 if (width <= Eps || width > remaining + Eps) break;
 
-                yield return Place(row, forward, t, width, kind, name);
-                t += width;
+                yield return Place(row, forward, t, width, t + step, kind, name);
+                t += step;
             }
         }
 
@@ -570,9 +681,15 @@ namespace Civil3D_commands.FaceArr
             return null;
         }
 
+        /// <summary>
+        /// Разместить блок: t — его ближний к якорю край, nextT — куда сдвинется
+        /// раскладка после него. Второе задаётся отдельно, а не считается как
+        /// t + width: у блока уже своей ячейки это разные точки.
+        /// </summary>
         private static FacingWallBlockPlacement Place(
             FacingWallRowDefinition row, bool forward,
-            double t, double width, FacingWallBlockKind kind, string name)
+            double t, double width, double nextT,
+            FacingWallBlockKind kind, string name)
         {
             double lead = forward ? row.StartStation + t : row.StartStation - t;
 
@@ -581,7 +698,10 @@ namespace Civil3D_commands.FaceArr
                 Station = forward ? lead : lead - width,
                 Width = width,
                 Kind = kind,
-                MvBlockDefName = name
+                MvBlockDefName = name,
+                NextStation = forward
+                    ? row.StartStation + nextT
+                    : row.StartStation - nextT
             };
         }
 
@@ -639,12 +759,19 @@ namespace Civil3D_commands.FaceArr
         /// <summary>
         /// Положение и поворот блока на трассе.
         ///
-        /// Блок ЦЕНТРИРУЕТСЯ на хорде своего пролёта. Раньше он вставлялся в
-        /// начало хорды, а поворачивался по её направлению — то есть по
-        /// касательной в СЕРЕДИНЕ пролёта. Из-за этого каждый блок был развёрнут
-        /// относительно оси в точке своего начала на половину собственного угла
-        /// поворота, BlockWidth/(2R): при R=50 м это 0.23°, systematically в одну
-        /// сторону. Центрирование делит эту ошибку пополам и симметрично.
+        /// БАЗОВАЯ ТОЧКА БЛОКА — В ЕГО СЕРЕДИНЕ. Это свойство самих определений
+        /// облицовочных блоков, а не наш выбор, и до 12 августа 2026 код считал
+        /// иначе: вставлял блок в начало пролёта, отчего вся раскладка стояла
+        /// на полблока левее области, а крайний блок торчал за её границу.
+        /// Теперь точка вставки — СЕРЕДИНА пролёта: у целого это полблока от
+        /// границы, у половинки — четверть (половина её собственной ячейки),
+        /// и крайний блок ровно касается границы боковой гранью.
+        ///
+        /// ПОВОРОТ берётся от хорды, режущей ОСЬ раскладки: ось делится на
+        /// отрезки по длине блока, направление лицевой грани — нормаль к такой
+        /// хорде. Раньше хорда бралась по СМЕЩЁННОЙ кривой (на FaceOffset),
+        /// и на переходных кривых её направление отличалось от направления
+        /// хорды оси — то самое небольшое отклонение поворота.
         ///
         /// Остаётся не исправленным другое: пикеты отмеряются по оси, а блоки
         /// стоят на смещённой кривой, которая длиннее в отношении (R+o)/R.
@@ -663,11 +790,20 @@ namespace Civil3D_commands.FaceArr
             angle = 0.0;
 
             double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
+            double cx = 0.0, cy = 0.0;
 
             try
             {
-                alignment.PointLocation(block.Station, def.FaceOffset, ref x1, ref y1);
-                alignment.PointLocation(block.Station + block.Width, def.FaceOffset, ref x2, ref y2);
+                // Хорда по САМОЙ ОСИ — она задаёт направление лицевой грани.
+                alignment.PointLocation(block.Station, 0.0, ref x1, ref y1);
+                alignment.PointLocation(block.Station + block.Width, 0.0, ref x2, ref y2);
+
+                // Точка вставки — середина пролёта, снесённая на грань стены.
+                // Смещение берём у самого Alignment: у него offset отмеряется
+                // по нормали к оси, и знак FaceOffset остаётся прежним —
+                // считать нормаль руками значило бы гадать про её сторону.
+                alignment.PointLocation(
+                    block.Station + block.Width / 2.0, def.FaceOffset, ref cx, ref cy);
             }
             catch (System.Exception)
             {
@@ -680,20 +816,7 @@ namespace Civil3D_commands.FaceArr
             if (len < 1e-9) return false;
 
             angle = Math.Atan2(dy, dx) + def.BlockRotationOffset;
-
-            // Отступаем от середины хорды вдоль СОБСТВЕННОЙ оси блока — с учётом
-            // поправки. Иначе при развороте на 180° блок уехал бы на свою длину
-            // вместо того, чтобы перевернуться на месте.
-            double ux = Math.Cos(angle);
-            double uy = Math.Sin(angle);
-
-            double cx = (x1 + x2) / 2.0;
-            double cy = (y1 + y2) / 2.0;
-
-            insertion = new Point3d(
-                cx - ux * block.Width / 2.0,
-                cy - uy * block.Width / 2.0,
-                elevation);
+            insertion = new Point3d(cx, cy, elevation);
 
             return true;
         }
@@ -902,6 +1025,27 @@ namespace Civil3D_commands.FaceArr
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// 2D-блок, которым показывать это определение на виде профиля, когда
+        /// пользователь не выбрал его явно: вид спереди, а если такого назначения
+        /// в определении нет — первый блок состава.
+        ///
+        /// Запасной вариант нужен принципиально. Раньше отсутствие вида спереди
+        /// означало, что место в ряду не рисовалось ВООБЩЕ, и чаще всего так
+        /// пропадали половинки: у половинчатого блока направления вида назначают
+        /// реже, чем у целого. Показать не тот вид — заметно и лечится выбором
+        /// вручную; не показать ничего — выглядит как дыра в раскладке.
+        /// </summary>
+        public static string GetProfileViewBlockName(
+            Database db, Transaction tr, string mvDefName)
+        {
+            string front = GetFrontViewBlockName(db, tr, mvDefName);
+            if (!string.IsNullOrEmpty(front)) return front;
+
+            List<string> names = GetViewBlockNames(db, tr, mvDefName);
+            return names.Count > 0 ? names[0] : null;
         }
 
         /// <summary>Определение MVBlock по имени или null (в отличие от ResolveMvBlockDef).</summary>

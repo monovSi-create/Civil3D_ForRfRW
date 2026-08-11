@@ -39,7 +39,7 @@ namespace Civil3D_commands.AssociativeBreaks
             }
             catch (System.Exception)
             {
-                // не смертельно: ручки облицовки включаются командой FACINGWALLGRIPS
+                // не смертельно: любая команда FACINGWALL* включает их сама
             }
 
             AcAp.DocumentManager.DocumentActivated    += (s, e) => AttachTo(e.Document);

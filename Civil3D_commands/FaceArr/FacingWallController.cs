@@ -79,9 +79,10 @@ namespace Civil3D_commands.FaceArr
         // 8 — половинчатый блок и замены блоков по местам на трассе.
         // 9 — поправка к повороту блока.
         // 10 — собственный хэндл контроллера: по нему опознаётся копия.
+        // 11 — своя ширина половинчатого блока и плоские блоки заменителей.
         // Старые записи читаются: недостающее берётся по умолчанию, а
         // недостающие отрезки-ручки создаст FACINGWALLREBUILDALL.
-        private const int DataVersion = 10;
+        private const int DataVersion = 11;
 
         // =================================================================
         //  ЖИЗНЕННЫЙ ЦИКЛ
@@ -507,6 +508,19 @@ namespace Civil3D_commands.FaceArr
             // версия 10
             rb.Add(new TypedValue((int)DxfCode.Text, def.SelfHandle ?? "0"));
 
+            // версия 11
+            rb.Add(new TypedValue((int)DxfCode.Real, def.HalfBlockWidth));
+
+            var customViews = def.CustomViewBlocks
+                ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            rb.Add(new TypedValue((int)DxfCode.Int32, customViews.Count));
+
+            foreach (KeyValuePair<string, string> pair in customViews)
+            {
+                rb.Add(new TypedValue((int)DxfCode.Text, pair.Key ?? string.Empty));
+                rb.Add(new TypedValue((int)DxfCode.Text, pair.Value ?? string.Empty));
+            }
+
             var rows = def.Rows ?? new List<FacingWallRowDefinition>();
             rb.Add(new TypedValue((int)DxfCode.Int32, rows.Count));
 
@@ -612,6 +626,20 @@ namespace Civil3D_commands.FaceArr
 
             if (version >= 10)
                 def.SelfHandle = NullIfEmpty(v[i++].Value.ToString());
+
+            if (version >= 11)
+            {
+                def.HalfBlockWidth = Convert.ToDouble(v[i++].Value);
+
+                int customCount = Convert.ToInt32(v[i++].Value);
+
+                for (int k = 0; k < customCount; k++)
+                {
+                    string mvName = v[i++].Value.ToString();
+                    string viewName = v[i++].Value.ToString();
+                    def.SetCustomViewBlock(mvName, NullIfEmpty(viewName));
+                }
+            }
 
             int rowCount = Convert.ToInt32(v[i++].Value);
 
