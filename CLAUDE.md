@@ -9,6 +9,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ассоциативные разрывы коридора по профилю, извлечение материалов, поверхности
 коридора. Комментарии, README и сообщения пользователю — по-русски.
 
+Исходники в UTF-8 (у большинства файлов без BOM). **`Get-Content` в Windows
+PowerShell 5.1 читает такой файл в ANSI и превращает русский текст в «Р РµР·»** —
+читать файлы инструментами Read/Grep, а из PowerShell только с `-Encoding UTF8`.
+Новый файл сохранять в UTF-8; CP1251 компилятор не поймёт.
+
 Загрузка в Civil 3D командой `NETLOAD`. Точка входа `IExtensionApplication` —
 `ProfCorrLink/BreakCommands.cs` (в сборке она **единственная**, второй быть не может),
 поэтому она же включает оверрул ручек модуля `FaceArr` — там инициализация обоих
@@ -81,12 +86,43 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 | `ProfileToPlaneTransparent.cs` | Прозрачная команда `PTP` (плюс `PTPOFF`, `PTPDIAG`): набирается изнутри чужой команды в ответ на запрос точки, даёт щёлкнуть пикет и отметку на виде профиля и смещение по нормали в плане, возвращает точку строкой координат. Свой namespace `ProfileToPlane`. Проверено в чертеже 10 августа 2026. |
 | `PropertySetHelper.cs`, `PropertySetArea.cs` | Наборы характеристик (Property Sets), геосвойства, площадь тела (`RW_AddGeoPropsToPropertySet`, `GETBODYAREA`). |
 | `LinkingCommands.cs` | Ранний эксперимент со связями объектов (`LINK`, `MYLINK`, `LOADLINKS`, `SAVELINKS`). |
-| `../RfRW_elements_kit_v0.4/` | **Второй проект репозитория, не часть плагина**: набор параметрических подсборок коридора на VB.NET (облицовка, геопанели, дренаж, грунты). Собирается отдельно, к `Civil3D_commands.csproj` отношения не имеет. |
+| `../RfRW_elements_kit_v0.4/` | **Второй проект репозитория, не часть плагина**: набор параметрических подсборок коридора на VB.NET (облицовка, геопанели, дренаж, грунты). Собирается отдельно, к `Civil3D_commands.csproj` отношения не имеет. **Сейчас не собирается** — см. ниже. |
 
 Оба README ссылаются на исходное ТЗ `claude_instructions.txt` — **в репозитории его
 больше нет**. Сверять требования не с чем, источник истины по поведению — README модуля.
 Корневой `README.md` — витрина для GitHub (что за проекты, сборка, лицензия);
 подробности состояния модулей в нём не дублируются и устаревают первыми.
+
+### Подсборки на VB.NET: состояние
+
+Проект лежит по вложенному пути с повторяющимся именем папки —
+`RfRW_elements_kit_v0.4/RfRW_elements_kit_v0.1/RfRW_elements_kit_v0.1/RfRW_elements_kit_v0.1.vbproj`.
+Проверено 11 августа 2026: **сборка падает** — в `.vbproj` остались те самые
+относительные `HintPath` (`..\..\..\..\..\Apps\AutoCAD\AutoCAD 2024\`), от которых
+ушёл `.csproj`. С нынешней глубины вложенности они указывают на несуществующий
+`D:\проекты\Apps\AutoCAD\AutoCAD 2024\`, ссылки Autodesk не разрешаются, и
+компилятор сыплет `BC30002` на `ObjectId`, `Alignment`, `CorridorState` и прочие
+типы API. Лечится тем же приёмом, что в `.csproj` (свойство `AcadDir` + `CheckAcadDir`).
+Ещё: `GeoPanel_UpToDown.vb` и `ReinfSlope_TMAT.vb` лежат на диске и под git,
+но в `<Compile Include=...>` не внесены — грабли «старый формат проекта»
+здесь те же. Собранные `.pkt`/`.atc` живут в `bin/` и потому вне репозитория.
+
+## Имена, которые живут в чертеже
+
+Постоянные ключи разбросаны по файлам; менять их — значит потерять данные
+в уже размеченных чертежах.
+
+| Модуль | Словарь NOD | XData (RegApp) | Слои / блоки |
+|--------|-------------|----------------|--------------|
+| `FaceArr` | `FACINGWALL_DATA` (Xrecord у контроллера) | `RW_FACINGWALL`, метка `"FACINGWALL"` | блок `FACINGWALL_CONTROLLER`; слои `RW_FACINGWALL_PROFILE`, `RW_FACINGWALL_GRIP`, `RW_FACINGWALL_GRIP_PLAN`, `RW_FACINGWALL_GRIP_LAYOUT` |
+| `ProfCorrLink` | `RW_AssocBreaks` → подсловари `Markers`, `EditMode/Profiles`, `Link/Active` | `RW_BREAK` (Guid маркера) | служебные прокси-`Line` |
+| `LinkingCommands` | `AsdkLinks` → `AsdkLinkedObjects` | — | — |
+
+Отсюда же следует, **как два оверруля уживаются на одном `Line`**: оба висят на
+`RXObject.GetClass(typeof(Line))`, и каждый узнаёт свои отрезки только по XData —
+`FacingWallProjection.TryReadGripTag` против `BreakProxyFactory.GetMarkerGuid`.
+Ни один не смотрит на слой. Новый оверрул на `Line` обязан опознаваться так же
+и всё чужое отдавать в `base`.
 
 ## Архитектурные соглашения
 
