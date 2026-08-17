@@ -103,6 +103,9 @@
     <Compile Include="FaceArr\FacingWallProjection.cs" />
     <Compile Include="ProfCorrLink\AssociativeBreakManager.cs" />
     <Compile Include="ProfCorrLink\BreakCommands.cs" />
+    <Compile Include="ProfCorrLink\BreakController.cs" />
+    <Compile Include="ProfCorrLink\BreakLink.cs" />
+    <Compile Include="ProfCorrLink\BreakOverlay.cs" />
     <Compile Include="ProfCorrLink\BreakGripOverrule.cs" />
     <Compile Include="ProfCorrLink\BreakProxyFactory.cs" />
     <Compile Include="ProfCorrLink\BreakReactor.cs" />

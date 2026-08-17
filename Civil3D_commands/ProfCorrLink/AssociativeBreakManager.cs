@@ -26,6 +26,11 @@ namespace Civil3D_commands.AssociativeBreaks
             using (_session.Suspend())
             using (var tr = Doc.Database.TransactionManager.StartTransaction())
             {
+                // Слой границ заблокирован вне режима редактирования, а прокси
+                // лежат на нём: без этого создание и правка линий бросают
+                // eOnLockedLayer. Состояние слоёв возвращает RefreshOverlay.
+                BreakOverlay.Unlock(tr, Doc.Database);
+
                 var profile = (Profile)tr.GetObject(Resolve(template.ProfileHandle), OpenMode.ForWrite);
                 var pv = (ProfileView)tr.GetObject(Resolve(template.ProfileViewHandle), OpenMode.ForRead);
                 var alignment = (Alignment)tr.GetObject(Resolve(template.AlignmentHandle), OpenMode.ForRead);
@@ -48,11 +53,112 @@ namespace Civil3D_commands.AssociativeBreaks
                 if (bl != null) ProfileGeometryOps.ApplyBreak(bl, template, template.Station);
                 WriteProps(tr, template);
                 RebuildCorridor(tr, template);
+                RefreshOverlay(tr, template);
 
                 tr.Commit();
             }
             _session.Store.SaveToDatabase(Doc.Database);
+            _session.SaveLinks();
             return template.Id;
+        }
+
+        /// <summary>
+        /// Завести концевые границы связи, если их ещё нет.
+        ///
+        /// Начало и конец коридора двигаются так же, как разрывы: те же прокси,
+        /// те же ручки, тот же реактор. Разница только в том, что они не пара
+        /// областей, а единственный край крайней, и ступенью быть не могут.
+        ///
+        /// Поэтому они — обычные <see cref="StationMarker"/> с ролью, а не особый
+        /// вид объектов: заведи их отдельным классом, и пришлось бы дублировать
+        /// и оверрул ручек, и реактор, и кламп по соседям.
+        ///
+        /// Идемпотентна: зовётся из мастера, из RW_EDITLINKS и из RW_REFRESHBREAKS,
+        /// потому что чертежи прежних версий концевых границ не содержат.
+        /// </summary>
+        public int EnsureTerminals(BreakLink link)
+        {
+            if (link == null) return 0;
+
+            int created = 0;
+
+            using (Doc.LockDocument())
+            using (_session.Suspend())
+            using (var tr = Doc.Database.TransactionManager.StartTransaction())
+            {
+                var db = Doc.Database;
+                BreakOverlay.Unlock(tr, db);
+
+                Baseline bl = _session.GetBaseline(tr, link);
+                if (bl == null) { tr.Commit(); return 0; }
+
+                var pv = RwHandles.Open<ProfileView>(tr, db, link.ProfileViewHandle, OpenMode.ForRead);
+                var alignment = RwHandles.Open<Alignment>(tr, db, link.AlignmentHandle, OpenMode.ForRead);
+                var profile = RwHandles.Open<Profile>(tr, db, link.ProfileHandle, OpenMode.ForRead);
+
+                double start, end;
+                RegionSpan(bl, out start, out end);
+
+                if (EnsureTerminal(tr, db, link, StationMarker.MarkerRole.Start, start,
+                                   pv, alignment, profile)) created++;
+                if (EnsureTerminal(tr, db, link, StationMarker.MarkerRole.End, end,
+                                   pv, alignment, profile)) created++;
+
+                BreakOverlay.ApplyState(tr, db, _session.AnyEditMode);
+                tr.Commit();
+            }
+
+            if (created > 0) _session.Store.SaveToDatabase(Doc.Database);
+            return created;
+        }
+
+        private bool EnsureTerminal(Transaction tr, Database db, BreakLink link,
+                                    StationMarker.MarkerRole role, double station,
+                                    ProfileView pv, Alignment alignment, Profile profile)
+        {
+            foreach (StationMarker existing in _session.Store.ForProfile(link.ProfileHandle))
+                if (existing.Role == role) return false;
+
+            StationMarker m = link.NewMarker();
+            m.Role = role;
+            m.Station = station;
+            m.IsStep = false;
+            m.StepHeight = 0.0;
+
+            // Полузазора у конца нет — отметка берётся ровно на его пикете.
+            if (profile != null)
+                m.BaseElevation = ProfileGeometryOps.BaseElevationAt(profile, station, 0.0);
+
+            BreakProxyFactory.CreateProxies(tr, db, m, pv, alignment);
+            _session.Store.Add(m);
+            WriteProps(tr, m);
+            return true;
+        }
+
+        /// <summary>
+        /// Пикеты, которые занимают области коридора. Не то же, что пределы
+        /// базовой линии: области могут не покрывать её целиком, а концевая
+        /// граница управляет именно краем области.
+        /// </summary>
+        private static void RegionSpan(Baseline bl, out double start, out double end)
+        {
+            start = bl.StartStation;
+            end = bl.EndStation;
+
+            bool first = true;
+            foreach (BaselineRegion r in bl.BaselineRegions)
+            {
+                if (first)
+                {
+                    start = r.StartStation;
+                    end = r.EndStation;
+                    first = false;
+                    continue;
+                }
+
+                if (r.StartStation < start) start = r.StartStation;
+                if (r.EndStation > end) end = r.EndStation;
+            }
         }
 
         /// <summary>Удалить разрыв.</summary>
@@ -65,6 +171,8 @@ namespace Civil3D_commands.AssociativeBreaks
             using (_session.Suspend())
             using (var tr = Doc.Database.TransactionManager.StartTransaction())
             {
+                BreakOverlay.Unlock(tr, Doc.Database);
+
                 var profile = (Profile)tr.GetObject(Resolve(m.ProfileHandle), OpenMode.ForWrite);
 
                 if (m.IsStep)
@@ -75,17 +183,24 @@ namespace Civil3D_commands.AssociativeBreaks
 
                 // Правая область поглощается левой; соседний справа маркер ссылался
                 // на исчезнувшую — переводим его на выжившую.
+                //
+                // У концевой границы поглощать нечего: она не разделяет пару
+                // областей, а держит внешний край крайней. Стирается только сам
+                // маркер с прокси — край коридора остаётся там, где стоял,
+                // а RW_EDITLINKS заведёт границу заново.
                 Baseline bl = _session.GetBaseline(tr, m);
-                if (bl != null &&
+                if (!m.IsTerminal && bl != null &&
                     ProfileGeometryOps.RemoveBreak(bl, m, out Guid removed, out Guid surviving))
                     RebindNeighbours(removed, surviving);
 
                 _session.Store.Remove(id);
 
                 RebuildCorridor(tr, m);
+                RefreshOverlay(tr, m);
                 tr.Commit();
             }
             _session.Store.SaveToDatabase(Doc.Database);
+            _session.SaveLinks();
         }
 
         /// <summary>
@@ -101,6 +216,8 @@ namespace Civil3D_commands.AssociativeBreaks
             using (_session.Suspend())
             using (var tr = Doc.Database.TransactionManager.StartTransaction())
             {
+                BreakOverlay.Unlock(tr, Doc.Database);
+
                 var profile = (Profile)tr.GetObject(Resolve(m.ProfileHandle), OpenMode.ForWrite);
                 var pv = (ProfileView)tr.GetObject(Resolve(m.ProfileViewHandle), OpenMode.ForRead);
                 var alignment = (Alignment)tr.GetObject(Resolve(m.AlignmentHandle), OpenMode.ForRead);
@@ -129,9 +246,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 // и без этого она осталась бы стоять мимо модели.
                 BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, alignment);
                 WriteProps(tr, m);
+                RefreshOverlay(tr, m);
                 tr.Commit();
             }
             _session.Store.SaveToDatabase(Doc.Database);
+            _session.SaveLinks();
         }
 
         /// <summary>
@@ -163,6 +282,8 @@ namespace Civil3D_commands.AssociativeBreaks
             using (var tr = Doc.Database.TransactionManager.StartTransaction())
             {
                 var db = Doc.Database;
+                BreakOverlay.Unlock(tr, db);
+
                 var profile = RwHandles.Open<Profile>(tr, db, m.ProfileHandle, OpenMode.ForWrite);
                 var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
                 var alignment = RwHandles.Open<Alignment>(tr, db, m.AlignmentHandle, OpenMode.ForRead);
@@ -170,8 +291,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 if (m.IsStep && profile != null)
                     ProfileGeometryOps.RemoveStep(profile, m.Station, m.StepHeight, m.HalfGap);
 
-                m.IsStep = isStep;
-                m.StepHeight = isStep ? stepHeight : 0.0;
+                // Ступень у концевой границы невозможна: поднимать «весь профиль
+                // правее» за пределами коридора не над чем. Гасим здесь, а не
+                // только в командах: сюда же приходит и правка из палитры свойств.
+                m.IsStep = isStep && !m.IsTerminal;
+                m.StepHeight = m.IsStep ? stepHeight : 0.0;
                 m.Gap = ProfileGeometryOps.SanitizeGap(gap);
 
                 if (profile != null)
@@ -194,13 +318,37 @@ namespace Civil3D_commands.AssociativeBreaks
                 BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, alignment);
                 WriteProps(tr, m);
                 RebuildCorridor(tr, m);
+                RefreshOverlay(tr, m);
 
                 tr.Commit();
             }
             _session.Store.SaveToDatabase(Doc.Database);
+            _session.SaveLinks();
         }
 
         // ----------------------------------------------------------------------
+
+        /// <summary>
+        /// Перестроить оформление связи, к которой относится разрыв, и вернуть
+        /// слоям состояние, положенное текущему режиму.
+        ///
+        /// Заливки участков строятся по фактическим областям коридора, а области
+        /// только что переставлены — значит, картинка устарела ровно сейчас.
+        /// Ошибки гасятся: оформление не механика, и падать из-за него нельзя.
+        /// </summary>
+        private void RefreshOverlay(Transaction tr, IBreakTarget target)
+        {
+            try
+            {
+                BreakLink link = _session.LinkFor(target);
+
+                if (link != null)
+                    BreakOverlay.Rebuild(tr, Doc.Database, _session, link);
+                else
+                    BreakOverlay.ApplyState(tr, Doc.Database, _session.AnyEditMode);
+            }
+            catch (System.Exception) { }
+        }
 
         /// <summary>
         /// Обновить набор характеристик на обоих прокси. Вызывается после КАЖДОЙ

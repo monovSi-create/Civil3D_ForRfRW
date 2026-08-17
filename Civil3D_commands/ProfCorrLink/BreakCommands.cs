@@ -63,11 +63,17 @@ namespace Civil3D_commands.AssociativeBreaks
             if (doc == null) return;
             // НЕ детачим существующую сессию — иначе теряем IsEditMode и ActiveLink
             // при каждом переключении окна. Attach сам проверяет наличие сессии.
-            BreakSession.Attach(doc);
+            BreakSession session = BreakSession.Attach(doc);
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
                 PropertySetSupport.EnsureEditPsd(doc.Database);
                 PropertySetSupport.EnsureMarkerPsd(doc.Database);
+
+                // Слои оформления приводятся к режиму сразу при открытии: иначе
+                // чертёж, сохранённый с включённым режимом, открывался бы
+                // с незаблокированными границами.
+                BreakOverlay.ApplyState(tr, doc.Database, session != null && session.AnyEditMode);
+
                 tr.Commit();
             }
             BreakProxyFactory.EnsureRegApp(doc.Database);
@@ -341,23 +347,43 @@ namespace Civil3D_commands.AssociativeBreaks
                     }
                 }
 
-                // --- Запоминаем активную связь ---
-                session.ActiveLink = new StationMarker
+                // --- Запоминаем связь ---
+                // Связей в чертеже может быть несколько, в том числе на одном
+                // виде профиля, поэтому новая ДОБАВЛЯЕТСЯ к существующим,
+                // а не заменяет их.
+                var link = new BreakLink
                 {
                     ProfileHandle     = profHandle,
                     ProfileViewHandle = pvHandle,
                     AlignmentHandle   = alHandle,
                     CorridorHandle    = corrId.Handle
                 };
+                link.ColorIndex = BreakOverlay.RandomColor(link.Id);
+                link.RefreshNames(tr, db);
+
+                // Контроллер — объект, которым связь потом выбирают мышью.
+                // Место под него считается по числу связей на этом же виде:
+                // иначе второй лёг бы поверх первого.
+                int slot = session.Links.Count(l => l.ProfileViewHandle == pvHandle);
+                BreakController.Ensure(tr, db, link, slot);
+
+                session.AddLink(link);
+                session.ActiveLink = link;
 
                 tr.Commit();
             }
 
-            // Связь — в чертёж: после перезапуска Civil 3D она восстановится сама,
-            // и разрывы можно будет добавлять к ней, а не создавать всё заново.
-            LinkStore.Save(db, session.ActiveLink);
+            // Связи — в чертёж: после перезапуска Civil 3D они восстановятся сами,
+            // и разрывы можно будет добавлять к ним, а не создавать всё заново.
+            session.SaveLinks();
 
-            ed.WriteMessage("\nГотово. Включите режим редактирования: RW_EDITMODE");
+            // Концы коридора — такие же перемещаемые границы, как разрывы.
+            session.Manager.EnsureTerminals(session.ActiveLink);
+            session.RefreshOverlay();
+
+            ed.WriteMessage(
+                $"\nГотово, связь «{session.ActiveLink.Label}» создана." +
+                "\nВыбрать связь и включить редактирование: RW_EDITLINKS");
         }
 
         // ------------------------------------------------------------------
@@ -369,14 +395,192 @@ namespace Civil3D_commands.AssociativeBreaks
             var doc = AcAp.DocumentManager.MdiActiveDocument;
             var session = BreakSession.Current;
             var link = session?.ActiveLink;
-            if (link == null) { doc.Editor.WriteMessage("\nСначала RW_LINKPROFILECORRIDOR"); return; }
+            if (link == null)
+            {
+                doc.Editor.WriteMessage(session != null && session.Links.Count > 1
+                    ? "\nСвязей в чертеже несколько — выберите нужную: RW_EDITLINKS"
+                    : "\nСначала RW_LINKPROFILECORRIDOR");
+                return;
+            }
 
             bool now = !session.IsEditMode(link.ProfileHandle);
             session.SetEditMode(link.ProfileHandle, now);
             doc.Editor.WriteMessage(
-                $"\nРежим редактирования: {(now ? "ВКЛ" : "ВЫКЛ")}" +
+                $"\nСвязь «{link.Label}», режим редактирования: {(now ? "ВКЛ" : "ВЫКЛ")}" +
                 " (сохранён в чертеже, переживёт перезапуск)");
             doc.Editor.Regen();
+        }
+
+        // ------------------------------------------------------------------
+        //  РЕДАКТИРОВАНИЕ СВЯЗЕЙ: ВЫБОР КОНТРОЛЛЕРА
+        //
+        //  Связей в чертеже может быть много, и командной строкой их не
+        //  различить — «профиль такой-то» пользователю ничего не говорит.
+        //  Поэтому у каждой связи есть контроллер: вставка рядом с видом
+        //  профиля с подписью «коридор-профиль» и своим цветом. Выбрали
+        //  контроллер — эта связь стала активной и открылась для правки:
+        //  границы участков разблокировались, появились заливки и надписи.
+        // ------------------------------------------------------------------
+        [CommandMethod("RW_EDITLINKS")]
+        public void EditLinks()
+        {
+            var doc = AcAp.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+            var db = doc.Database;
+            var session = BreakSession.Current;
+
+            if (session == null) { ed.WriteMessage("\nСессии нет."); return; }
+            if (session.Links.Count == 0)
+            {
+                ed.WriteMessage("\nСвязей в чертеже нет — начните с RW_LINKPROFILECORRIDOR.");
+                return;
+            }
+
+            // Контроллеров может не быть: связь могла прийти из чертежа прежней
+            // версии или быть восстановленной по самим разрывам. Выбирать
+            // нечего — значит, сначала создаём. Заодно заводим концевые границы:
+            // в чертежах прежних версий их тоже нет.
+            EnsureControllers(doc, session);
+
+            int terminals = 0;
+            foreach (BreakLink l in session.Links.ToList())
+                terminals += session.Manager.EnsureTerminals(l);
+
+            if (terminals > 0)
+                ed.WriteMessage($"\nДобавлено концевых границ коридора: {terminals}.");
+
+            ed.WriteMessage("\nСвязи чертежа:");
+            foreach (BreakLink l in session.Links)
+                ed.WriteMessage(
+                    $"\n  {l.Label}{(session.IsEditMode(l.ProfileHandle) ? "  [правится]" : string.Empty)}");
+
+            var opt = new PromptEntityOptions(
+                "\nВыберите контроллер связи (вставка с подписью «коридор-профиль»)");
+            opt.SetRejectMessage("\nНужен контроллер связи");
+            opt.AddAllowedClass(typeof(BlockReference), false);
+            // Латиницей только глобальное имя: второй и третий параметры обязаны
+            // быть тем самым русским словом, которое показано пользователю.
+            opt.Keywords.Add("Off", "Выключить", "Выключить");
+            opt.AppendKeywordsToMessage = true;
+
+            var res = ed.GetEntity(opt);
+
+            if (res.Status == PromptStatus.Keyword && res.StringResult == "Off")
+            {
+                TurnOffAll(session);
+                ed.WriteMessage(
+                    "\nРедактирование выключено у всех связей." +
+                    "\nВидны границы участков и имена конструкций; границы заблокированы.");
+                ed.Regen();
+                return;
+            }
+
+            if (res.Status != PromptStatus.OK) return;
+
+            BreakLink link = FindLinkByController(session, db, res.ObjectId);
+            if (link == null)
+            {
+                ed.WriteMessage(
+                    "\nЭта вставка в модели не числится контроллером связи." +
+                    "\nЕсли это копия контроллера — удалите её: копия ничем не управляет.");
+                return;
+            }
+
+            // Правится всегда одна связь: слои общие на чертёж, и держать
+            // разблокированными границы сразу нескольких коридоров значит
+            // потерять саму защиту от случайного смещения.
+            foreach (BreakLink other in session.Links.ToList())
+                if (other != link && session.IsEditMode(other.ProfileHandle))
+                    session.SetEditMode(other.ProfileHandle, false);
+
+            session.ActiveLink = link;
+            session.SetEditMode(link.ProfileHandle, true);
+
+            ed.WriteMessage(
+                $"\nСвязь «{link.Label}» открыта для правки: границы разблокированы," +
+                " показаны участки и подписи." +
+                "\nВыключить: RW_EDITMODE или RW_EDITLINKS → Выключить.");
+            ed.Regen();
+        }
+
+        /// <summary>
+        /// Создать контроллеры связям, у которых их ещё нет, и обновить подписи
+        /// у остальных: имена коридора и профиля пользователь мог поменять.
+        /// </summary>
+        private static void EnsureControllers(Document doc, BreakSession session)
+        {
+            try
+            {
+                using (doc.LockDocument())
+                using (session.Suspend())
+                using (var tr = doc.Database.TransactionManager.StartTransaction())
+                {
+                    var db = doc.Database;
+                    BreakOverlay.Unlock(tr, db);
+
+                    var slots = new System.Collections.Generic.Dictionary<long, int>();
+
+                    foreach (BreakLink link in session.Links)
+                    {
+                        long key = link.ProfileViewHandle.Value;
+                        int slot;
+                        slots.TryGetValue(key, out slot);
+                        slots[key] = slot + 1;
+
+                        link.RefreshNames(tr, db);
+                        if (link.ColorIndex <= 0) link.ColorIndex = BreakOverlay.RandomColor(link.Id);
+
+                        BreakController.Ensure(tr, db, link, slot);
+                    }
+
+                    BreakOverlay.ApplyState(tr, db, session.AnyEditMode);
+                    tr.Commit();
+                }
+
+                session.SaveLinks();
+            }
+            catch (System.Exception)
+            {
+                // Без контроллера связь всё равно работает — выбрать её нельзя,
+                // но команды с активной связью действуют по-прежнему.
+            }
+        }
+
+        private static void TurnOffAll(BreakSession session)
+        {
+            foreach (BreakLink link in session.Links.ToList())
+                if (session.IsEditMode(link.ProfileHandle))
+                    session.SetEditMode(link.ProfileHandle, false);
+
+            // Ни одна связь не правится — оформление всё равно перестраиваем:
+            // надписи конструкций остаются видны и обязаны быть свежими.
+            session.RefreshOverlay();
+        }
+
+        /// <summary>
+        /// Связь по выбранной вставке.
+        ///
+        /// Guid из XData — только предварительный фильтр: у КОПИИ контроллера
+        /// он ровно тот же, и по нему копия управляла бы настоящей связью.
+        /// Владение проверяется по хэндлу, записанному в самой связи, — тем же
+        /// правилом, что и у прокси-линий.
+        /// </summary>
+        private static BreakLink FindLinkByController(BreakSession session, Database db, ObjectId id)
+        {
+            if (id.IsNull) return null;
+
+            Guid? tagged = null;
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Autodesk.AutoCAD.DatabaseServices.Entity;
+                if (ent != null) tagged = BreakController.GetLinkId(ent);
+                tr.Commit();
+            }
+
+            if (tagged == null) return null;
+
+            BreakLink link = session.FindLink(tagged.Value);
+            return link != null && link.ControllerHandle == id.Handle ? link : null;
         }
 
         // ------------------------------------------------------------------
@@ -389,7 +593,16 @@ namespace Civil3D_commands.AssociativeBreaks
             var ed = doc.Editor;
             var session = BreakSession.Current;
             var link = session?.ActiveLink;
-            if (link == null) { ed.WriteMessage("\nСначала RW_LINKPROFILECORRIDOR"); return; }
+            if (link == null)
+            {
+                // Активной связи нет по двум разным причинам, и советы у них разные.
+                ed.WriteMessage(session != null && session.Links.Count > 1
+                    ? "\nСвязей в чертеже несколько — выберите нужную: RW_EDITLINKS"
+                    : "\nСначала RW_LINKPROFILECORRIDOR");
+                return;
+            }
+
+            ed.WriteMessage($"\nСвязь: «{link.Label}».");
 
             // Точка в виде профиля ИЛИ в плане -> пикет.
             var ptRes = ed.GetPoint("\nУкажите положение разрыва (в виде профиля или в плане)");
@@ -474,7 +687,8 @@ namespace Civil3D_commands.AssociativeBreaks
             double lo, hi;
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
-                bool ok = TryBreakRange(tr, doc.Database, session, marker, out lo, out hi);
+                bool ok = TryBreakRange(tr, doc.Database, session, marker,
+                                        marker.HalfGap + BreakGripOverrule.Buffer, out lo, out hi);
                 tr.Commit();
 
                 if (!ok)
@@ -518,9 +732,15 @@ namespace Civil3D_commands.AssociativeBreaks
         public void DeleteBreak()
         {
             var doc = AcAp.DocumentManager.MdiActiveDocument;
-            var ed = doc.Editor;
             var session = BreakSession.Current;
             if (session == null) return;
+
+            using (new BoundaryUnlock(doc, session)) DeleteBreakCore(doc, session);
+        }
+
+        private static void DeleteBreakCore(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
 
             var opt = new PromptEntityOptions("\nВыберите прокси разрыва для удаления");
             opt.SetRejectMessage("\nНужен прокси разрыва");
@@ -551,6 +771,18 @@ namespace Civil3D_commands.AssociativeBreaks
                 return;
             }
 
+            // Конец коридора удалять нечего: он не разделяет пару участков,
+            // а держит внешний край крайнего. Убрать его значит остаться
+            // без ручки, которой этот край двигают.
+            StationMarker target = session.Store.Get(id.Value);
+            if (target != null && target.IsTerminal)
+            {
+                ed.WriteMessage(
+                    "\nЭто концевая граница коридора, а не разрыв — удалить нельзя." +
+                    "\nЕё можно только перетащить: она задаёт край крайнего участка.");
+                return;
+            }
+
             session.Manager.DeleteBreak(id.Value);
             ed.WriteMessage("\nРазрыв удалён.");
         }
@@ -568,9 +800,15 @@ namespace Civil3D_commands.AssociativeBreaks
         public void MoveBreak()
         {
             var doc = AcAp.DocumentManager.MdiActiveDocument;
-            var ed = doc.Editor;
             var session = BreakSession.Current;
             if (session == null) return;
+
+            using (new BoundaryUnlock(doc, session)) MoveBreakCore(doc, session);
+        }
+
+        private static void MoveBreakCore(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
 
             var opt = new PromptEntityOptions("\nВыберите прокси разрыва");
             opt.SetRejectMessage("\nНужен прокси разрыва");
@@ -596,7 +834,10 @@ namespace Civil3D_commands.AssociativeBreaks
                     tr, doc.Database, m.ProfileViewHandle, OpenMode.ForRead);
 
                 double lo, hi;
-                if (al == null || !TryBreakRange(tr, doc.Database, session, m, out lo, out hi))
+                // Конец коридора доходит до самого края — отступа у него нет.
+                double margin = m.IsTerminal ? 0.0 : m.HalfGap + BreakGripOverrule.Buffer;
+
+                if (al == null || !TryBreakRange(tr, doc.Database, session, m, margin, out lo, out hi))
                 {
                     ed.WriteMessage("\nНе удалось определить ось или пределы участка.");
                     tr.Commit();
@@ -804,9 +1045,15 @@ namespace Civil3D_commands.AssociativeBreaks
         public void EditBreak()
         {
             var doc = AcAp.DocumentManager.MdiActiveDocument;
-            var ed = doc.Editor;
             var session = BreakSession.Current;
             if (session == null) return;
+
+            using (new BoundaryUnlock(doc, session)) EditBreakCore(doc, session);
+        }
+
+        private static void EditBreakCore(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
 
             var opt = new PromptEntityOptions("\nВыберите прокси разрыва");
             opt.SetRejectMessage("\nНужен прокси разрыва");
@@ -820,6 +1067,10 @@ namespace Civil3D_commands.AssociativeBreaks
                 ed.WriteMessage("\nЭта линия в модели не числится — не прокси разрыва или его копия.");
                 return;
             }
+
+            // У конца коридора нет ни ступени, ни микроразрыва — спрашивать
+            // о них нечего, а участок рядом только один.
+            if (m.IsTerminal) { EditTerminalCore(doc, session, m); return; }
 
             ed.WriteMessage(
                 $"\nРазрыв на пикете {m.Station:F3}: ступень={(m.IsStep ? m.StepHeight.ToString("F3") : "нет")}, " +
@@ -883,6 +1134,43 @@ namespace Civil3D_commands.AssociativeBreaks
             ed.WriteMessage("\nСвойства разрыва изменены, коридор перестроен.");
         }
 
+        /// <summary>
+        /// Правка концевой границы коридора. Менять здесь можно ровно одно —
+        /// конструкцию того единственного участка, который к ней примыкает.
+        /// Пикет правится ручкой или RW_MOVEBREAK, как и у разрыва.
+        /// </summary>
+        private static void EditTerminalCore(Document doc, BreakSession session, StationMarker m)
+        {
+            var ed = doc.Editor;
+            bool isStart = m.Role == StationMarker.MarkerRole.Start;
+
+            string regionName;
+            using (var tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                Baseline bl = session.GetBaseline(tr, m);
+                string left, right;
+                ProfileGeometryOps.DescribeRegions(bl, m, out left, out right);
+                regionName = isStart ? right : left;
+                tr.Commit();
+            }
+
+            ed.WriteMessage(
+                $"\n{(isStart ? "Начало" : "Конец")} коридора на пикете {m.Station:F3}" +
+                $" ({BreakOverlay.FormatStation(m.Station)}), участок «{regionName}»." +
+                "\nСтупени и микроразрыва у конца коридора нет; пикет правится ручкой или RW_MOVEBREAK.");
+
+            ObjectId assembly = AskAssembly(ed, $"участка «{regionName}»");
+            if (assembly.IsNull) { ed.WriteMessage("\nНичего не изменено."); return; }
+
+            // Конструкция назначается той стороне, с которой участок и лежит.
+            session.Manager.ApplyProperties(
+                m.Id, false, 0.0, m.Gap,
+                isStart ? ObjectId.Null : assembly,
+                isStart ? assembly : ObjectId.Null);
+
+            ed.WriteMessage("\nКонструкция участка изменена, коридор перестроен.");
+        }
+
         // ------------------------------------------------------------------
         //  ПЕРЕСТРОИТЬ ПРОКСИ ВСЕХ РАЗРЫВОВ
         //
@@ -898,6 +1186,11 @@ namespace Civil3D_commands.AssociativeBreaks
             var session = BreakSession.Current;
             if (session == null) { ed.WriteMessage("\nСессии нет."); return; }
 
+            // Чертежи прежних версий концевых границ не содержат — заводим.
+            int terminals = 0;
+            foreach (BreakLink l in session.Links.ToList())
+                terminals += session.Manager.EnsureTerminals(l);
+
             int done = 0, failed = 0;
 
             using (doc.LockDocument())
@@ -905,6 +1198,7 @@ namespace Civil3D_commands.AssociativeBreaks
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
                 var db = doc.Database;
+                BreakOverlay.Unlock(tr, db);
 
                 foreach (var m in session.Store.All)
                 {
@@ -916,6 +1210,11 @@ namespace Civil3D_commands.AssociativeBreaks
                     try
                     {
                         BreakProxyFactory.UpdateProxyGeometry(tr, m, pv, al);
+
+                        // Прокси из чертежей прежней версии лежат на слое «0»
+                        // со штрихпунктиром — переводим их на слой границ.
+                        BreakOverlay.AdoptProxy(tr, db, m.ProfileProxyHandle);
+                        BreakOverlay.AdoptProxy(tr, db, m.PlanProxyHandle);
 
                         BreakProxyFactory.BringToFront(
                             tr, db, RwHandles.Resolve(db, m.ProfileProxyHandle));
@@ -930,10 +1229,17 @@ namespace Civil3D_commands.AssociativeBreaks
                     }
                 }
 
+                // Оформление тоже производное — перестраиваем заодно.
+                BreakOverlay.RebuildAll(tr, db, session);
+
                 tr.Commit();
             }
 
-            ed.WriteMessage($"\nПрокси перестроены: {done}, не удалось: {failed}.");
+            session.SaveLinks();
+
+            ed.WriteMessage(
+                $"\nПрокси перестроены: {done}, не удалось: {failed}" +
+                $"{(terminals > 0 ? $", концевых границ добавлено: {terminals}" : string.Empty)}.");
             ed.Regen();
         }
 
@@ -956,13 +1262,27 @@ namespace Civil3D_commands.AssociativeBreaks
 
             var link = session.ActiveLink;
             ed.WriteMessage("\n--- RW_Break ---");
-            if (link == null)
-                ed.WriteMessage("\nСвязь: НЕТ — нужен RW_LINKPROFILECORRIDOR");
-            else
+
+            if (session.Links.Count == 0)
+                ed.WriteMessage("\nСвязей нет — нужен RW_LINKPROFILECORRIDOR");
+
+            foreach (BreakLink l in session.Links)
+            {
+                bool active = ReferenceEquals(l, link);
+                ObjectId ctrl = RwHandles.Resolve(doc.Database, l.ControllerHandle);
+
                 ed.WriteMessage(
-                    $"\nСвязь: профиль {link.ProfileHandle}, вид {link.ProfileViewHandle}, " +
-                    $"ось {link.AlignmentHandle}, коридор {link.CorridorHandle}" +
-                    $"\nРежим редактирования: {(session.IsEditMode(link.ProfileHandle) ? "ВКЛ" : "ВЫКЛ")}");
+                    $"\nсвязь «{l.Label}»{(active ? "  [активная]" : string.Empty)}" +
+                    $"\n    профиль {l.ProfileHandle}, вид {l.ProfileViewHandle}, " +
+                    $"ось {l.AlignmentHandle}, коридор {l.CorridorHandle}" +
+                    $"\n    контроллер: {(ctrl.IsNull ? "НЕТ (RW_EDITLINKS создаст)" : ctrl.Handle.ToString())}" +
+                    $", цвет {BreakController.ColorOf(l)}, оформление: {l.OverlayHandles.Count} об." +
+                    $"\n    режим редактирования: {(session.IsEditMode(l.ProfileHandle) ? "ВКЛ" : "ВЫКЛ")}");
+            }
+
+            ed.WriteMessage(
+                $"\nслои: границы {(session.AnyEditMode ? "разблокированы" : "заблокированы")}, " +
+                $"заливки и подписи пикетов {(session.AnyEditMode ? "видны" : "выключены")}");
 
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
@@ -1012,6 +1332,13 @@ namespace Civil3D_commands.AssociativeBreaks
                     $"опознано {BreakReactor.PropMatched}, применено {BreakReactor.PropApplied}" +
                     $"\nпалитра (режим): опознано {BreakReactor.PropEditMatched}, " +
                     $"применено {BreakReactor.PropEditApplied}");
+
+                // Прямоугольники заливок числами: если полосы выглядят не полосами,
+                // отсюда видно, врёт построение штриховки или пересчёт пикета
+                // в координаты вида.
+                if (link != null)
+                    foreach (string line in BreakOverlay.DescribeFills(tr, doc.Database, session, link))
+                        ed.WriteMessage("\nзаливка: " + line);
 
                 if (link != null)
                 {
@@ -1101,30 +1428,80 @@ namespace Civil3D_commands.AssociativeBreaks
         private static ObjectId Resolve(Database db, Handle h) => RwHandles.Resolve(db, h);
 
         /// <summary>
-        /// Пикеты, в которых разрыв вообще возможен: пересечение профиля
-        /// и участка коридора, ужатое на полузазор с каждой стороны — пара PVI
-        /// ступени должна поместиться внутрь профиля.
+        /// Снять защиту с границ на время команды и вернуть её в конце.
+        ///
+        /// Вне режима редактирования слой границ заблокирован — в этом и смысл
+        /// защиты. Но заблокированный объект нельзя и ВЫБРАТЬ, а команды правки
+        /// разрыва начинаются именно с выбора прокси: без этого стража они
+        /// молча отказывались бы работать всюду, кроме режима редактирования.
+        ///
+        /// Случайного смещения это не открывает: команду надо ввести осознанно,
+        /// а защита возвращается даже при отмене по Esc — за это отвечает
+        /// <c>using</c> у вызывающего.
+        /// </summary>
+        private sealed class BoundaryUnlock : IDisposable
+        {
+            private readonly Document _doc;
+            private readonly BreakSession _session;
+
+            public BoundaryUnlock(Document doc, BreakSession session)
+            {
+                _doc = doc;
+                _session = session;
+                Apply(true);
+            }
+
+            public void Dispose() => Apply(false);
+
+            private void Apply(bool unlock)
+            {
+                try
+                {
+                    using (_doc.LockDocument())
+                    using (_session.Suspend())
+                    using (var tr = _doc.Database.TransactionManager.StartTransaction())
+                    {
+                        if (unlock) BreakOverlay.Unlock(tr, _doc.Database);
+                        else BreakOverlay.ApplyState(tr, _doc.Database, _session.AnyEditMode);
+
+                        tr.Commit();
+                    }
+                }
+                catch (System.Exception)
+                {
+                    // Не вышло — команда всё равно должна попробовать отработать.
+                }
+            }
+        }
+
+        /// <summary>
+        /// Пикеты, в которых граница вообще возможна: пересечение профиля
+        /// и участка коридора, ужатое на <paramref name="margin"/> с каждой стороны.
+        ///
+        /// У разрыва отступ есть — пара PVI ступени должна поместиться внутрь
+        /// профиля, — а у концевой границы он нулевой: ей положено доходить
+        /// ровно до края коридора, там ступени нет и упираться не во что.
         /// </summary>
         private static bool TryBreakRange(Transaction tr, Database db, BreakSession session,
-                                          StationMarker m, out double lo, out double hi)
+                                          IBreakTarget target, double margin,
+                                          out double lo, out double hi)
         {
             lo = 0.0;
             hi = 0.0;
 
-            var profile = RwHandles.Open<Profile>(tr, db, m.ProfileHandle, OpenMode.ForRead);
+            var profile = RwHandles.Open<Profile>(tr, db, target.ProfileHandle, OpenMode.ForRead);
             if (profile == null) return false;
 
             lo = profile.StartingStation;
             hi = profile.EndingStation;
 
-            Baseline bl = session.GetBaseline(tr, m);
+            Baseline bl = session.GetBaseline(tr, target);
             if (bl != null)
             {
                 lo = Math.Max(lo, bl.StartStation);
                 hi = Math.Min(hi, bl.EndStation);
             }
 
-            double margin = m.HalfGap + BreakGripOverrule.Buffer;
             lo += margin;
             hi -= margin;
 

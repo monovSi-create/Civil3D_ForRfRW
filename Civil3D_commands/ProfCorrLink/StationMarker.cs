@@ -13,10 +13,24 @@ namespace Civil3D_commands.AssociativeBreaks
     ///   - "ступенью" (IsStep = true)  -> двигает и границу области, и пару PVI профиля;
     ///   - простой рубкой (IsStep = false) на ровном участке -> двигает только границу области.
     /// </summary>
-    public class StationMarker
+    public class StationMarker : IBreakTarget
     {
         /// <summary>Что лежит в записи: сам маркер или активная связь.</summary>
         public enum RecordKind { Marker = 0, Link = 1 }
+
+        /// <summary>
+        /// Чем маркер служит коридору.
+        ///
+        /// <see cref="MarkerRole.Break"/> — разрыв между двумя участками: двигает
+        /// общую границу пары и (если это ступень) пару PVI профиля.
+        ///
+        /// <see cref="MarkerRole.Start"/> и <see cref="MarkerRole.End"/> — концы
+        /// коридора: двигают начало первой области и конец последней. Механика
+        /// та же, что у разрыва, но соседа с другой стороны нет — значит, нет
+        /// ни микроразрыва, ни ступени: поднимать «весь профиль правее» за
+        /// пределами коридора не над чем.
+        /// </summary>
+        public enum MarkerRole { Break = 0, Start = 1, End = 2 }
 
         // Тег и версия формата записи. До их появления запись начиналась сразу
         // с Guid, и отличить свою запись от чужой было нельзя вообще: чтение
@@ -24,7 +38,8 @@ namespace Civil3D_commands.AssociativeBreaks
         // маркер молча исчезал. Прежние записи читаются позиционным путём.
         private const string Tag = "RWBREAK";
         // 2 — собственный микроразрыв у каждого разрыва.
-        private const int FormatVersion = 2;
+        // 3 — роль маркера: разрыв или конец коридора.
+        private const int FormatVersion = 3;
 
         /// <summary>
         /// Вид записи. LinkStore хранит связь этим же классом (заполнены только
@@ -38,6 +53,15 @@ namespace Civil3D_commands.AssociativeBreaks
 
         /// <summary>Пикет (станция вдоль оси/профиля), на котором стоит разрыв.</summary>
         public double Station { get; set; }
+
+        /// <summary>
+        /// Разрыв это или конец коридора. Концы двигают крайнюю область
+        /// и ступенью быть не могут — см. <see cref="MarkerRole"/>.
+        /// </summary>
+        public MarkerRole Role { get; set; } = MarkerRole.Break;
+
+        /// <summary>Концевая граница коридора — её нельзя ни удалить, ни сделать ступенью.</summary>
+        public bool IsTerminal => Role != MarkerRole.Break;
 
         /// <summary>true — это ступень профиля; false — рубка на ровном участке.</summary>
         public bool IsStep { get; set; }
@@ -118,7 +142,9 @@ namespace Civil3D_commands.AssociativeBreaks
                 new TypedValue((int)DxfCode.Text, LeftRegionId.ToString("N")),
                 new TypedValue((int)DxfCode.Text, RightRegionId.ToString("N")),
                 // формат 2
-                new TypedValue((int)DxfCode.Real, Gap));
+                new TypedValue((int)DxfCode.Real, Gap),
+                // формат 3
+                new TypedValue((int)DxfCode.Int16, (short)Role));
         }
 
         /// <summary>
@@ -186,7 +212,24 @@ namespace Civil3D_commands.AssociativeBreaks
             if (v.Length > i)
                 m.Gap = ProfileGeometryOps.SanitizeGap(Convert.ToDouble(v[i++].Value));
 
+            // Формат 3. В записях формата 1–2 ролей не было вовсе: всё, что
+            // там лежит, — разрывы, и концевые границы к ним потом добавятся.
+            if (v.Length > i)
+                m.Role = ParseRole(Convert.ToInt16(v[i++].Value));
+
+            // Концевая граница ступенью быть не может. Проверка здесь, а не
+            // только при вводе: запись в чертеже могли поправить руками.
+            if (m.IsTerminal) { m.IsStep = false; m.StepHeight = 0.0; }
+
             return m;
+        }
+
+        /// <summary>Неизвестная роль — это разрыв: так вела себя любая запись до формата 3.</summary>
+        private static MarkerRole ParseRole(short value)
+        {
+            if (value == (short)MarkerRole.Start) return MarkerRole.Start;
+            if (value == (short)MarkerRole.End) return MarkerRole.End;
+            return MarkerRole.Break;
         }
 
         private static Guid ParseGuid(string s) =>

@@ -194,6 +194,10 @@ namespace Civil3D_commands.AssociativeBreaks
             if (baseline == null || double.IsNaN(m.Station) || double.IsInfinity(m.Station))
                 return false;
 
+            // У концов коридора соседа с одной стороны нет: там не пара
+            // областей, а единственный край крайней. Отдельная ветка.
+            if (m.IsTerminal) return ApplyTerminal(baseline, m);
+
             var regions = baseline.BaselineRegions;
 
             BaselineRegion left = FindByGuid(regions, m.LeftRegionId);
@@ -220,6 +224,57 @@ namespace Civil3D_commands.AssociativeBreaks
 
             m.LeftRegionId = host.RegionGUID;
             m.RightRegionId = created.RegionGUID;
+            return true;
+        }
+
+        /// <summary>
+        /// Перенести конец коридора: начало ПЕРВОЙ области либо конец ПОСЛЕДНЕЙ.
+        ///
+        /// Микроразрыва здесь нет и быть не может: он разводит соседей, а с внешней
+        /// стороны соседа нет. Поэтому граница встаёт ровно на пикет маркера,
+        /// без полузазора, — в отличие от <see cref="MoveBoundary"/>.
+        ///
+        /// Крайняя область ищется по геометрии, а не по <c>RegionGUID</c> маркера:
+        /// первой она быть перестаёт, стоит пользователю удалить соседний разрыв,
+        /// и запомненный GUID указывал бы на исчезнувшую.
+        ///
+        /// Схлопнуть область нельзя: пикет, перешедший её противоположный край,
+        /// отвергается. Иначе Civil получил бы область нулевой или отрицательной
+        /// длины, а это отказ уже на присваивании.
+        /// </summary>
+        public static bool ApplyTerminal(Baseline baseline, StationMarker m)
+        {
+            var regions = baseline.BaselineRegions;
+            if (regions.Count == 0) return false;
+
+            BaselineRegion target = null;
+
+            if (m.Role == StationMarker.MarkerRole.Start)
+            {
+                foreach (BaselineRegion r in regions)
+                    if (target == null || r.StartStation < target.StartStation) target = r;
+
+                if (target == null || m.Station >= target.EndStation) return false;
+
+                target.StartStation = m.Station;
+
+                // Справа от конца-начала лежит та самая первая область.
+                m.LeftRegionId = Guid.Empty;
+                m.RightRegionId = target.RegionGUID;
+            }
+            else
+            {
+                foreach (BaselineRegion r in regions)
+                    if (target == null || r.EndStation > target.EndStation) target = r;
+
+                if (target == null || m.Station <= target.StartStation) return false;
+
+                target.EndStation = m.Station;
+
+                m.LeftRegionId = target.RegionGUID;
+                m.RightRegionId = Guid.Empty;
+            }
+
             return true;
         }
 

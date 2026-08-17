@@ -60,7 +60,12 @@ namespace Civil3D_commands.AssociativeBreaks
         /// <summary>
         /// Соседние пикеты для маркера (для клампа). Возвращает границы допустимого
         /// перемещения с учётом буфера: (минимально допустимый, максимально допустимый).
-        /// regionStart/regionEnd — пределы базовой линии коридора.
+        /// baselineStart/baselineEnd — пределы базовой линии коридора.
+        ///
+        /// Буфер отделяет маркер от СОСЕДА, чтобы область не схлопнулась. С внешней
+        /// стороны у концевых границ соседа нет, и буфер там не нужен: иначе
+        /// начало коридора невозможно было бы поставить на самое начало базовой
+        /// линии — оно упиралось бы в невидимый отступ шириной в буфер.
         /// </summary>
         public (double min, double max) GetMoveBounds(StationMarker m, double buffer,
                                                       double baselineStart, double baselineEnd)
@@ -74,7 +79,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 if (s < m.Station && s > prev) prev = s;
                 if (s > m.Station && s < next) next = s;
             }
-            return (prev + buffer, next - buffer);
+
+            double lower = m.Role == StationMarker.MarkerRole.Start ? 0.0 : buffer;
+            double upper = m.Role == StationMarker.MarkerRole.End ? 0.0 : buffer;
+
+            return (prev + lower, next - upper);
         }
 
         // ----------------------------------------------------------------------

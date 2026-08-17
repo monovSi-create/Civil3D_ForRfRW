@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.Civil.ApplicationServices;
@@ -40,6 +41,8 @@ namespace Civil3D_commands.AssociativeBreaks
         // (EditModeStore), в сеансе только зеркалится.
         private HashSet<long> _editProfiles = new HashSet<long>();
 
+        private readonly List<BreakLink> _links = new List<BreakLink>();
+
         private BreakSession(Document doc)
         {
             _doc = doc;
@@ -58,8 +61,7 @@ namespace Civil3D_commands.AssociativeBreaks
             _sessions[doc] = session;
             session.Reactor.Subscribe(doc);
             session.Store.LoadFromDatabase(doc.Database);
-            session.ActiveLink = LinkStore.Load(doc.Database)
-                                 ?? RestoreLinkFromMarkers(doc.Database, session.Store);
+            session.LoadLinks(doc.Database);
 
             // Режим редактирования переживает перезапуск: иначе после открытия
             // чертежа ручек нет, и догадаться про RW_EDITMODE невозможно.
@@ -68,33 +70,133 @@ namespace Civil3D_commands.AssociativeBreaks
             return session;
         }
 
+        // ------------------------------------------------------------------
+        //  СВЯЗИ
+        // ------------------------------------------------------------------
+
         /// <summary>
-        /// Запасной путь, если явной записи связи в чертеже нет: любой маркер несёт
-        /// те же четыре хэндла. Нужен для чертежей, сделанных до появления LinkStore,
-        /// и на случай, если запись связи потерялась, а разрывы остались.
-        /// В чертёж ничего не пишем: восстановление не должно помечать его изменённым.
+        /// Все связи чертежа. Их может быть несколько, в том числе несколько
+        /// на одном виде профиля: в таком виде лежат несколько профилей, и
+        /// каждый служит базовой линией своему коридору.
         /// </summary>
-        private static StationMarker RestoreLinkFromMarkers(Database db, MarkerStore store)
+        public IReadOnlyList<BreakLink> Links => _links;
+
+        /// <summary>
+        /// Связь, к которой относятся команды без явного выбора контроллера.
+        /// Задаётся мастером и командой RW_EDITLINKS; при единственной связи
+        /// в чертеже подставляется сама, чтобы прежние сценарии работали как были.
+        /// </summary>
+        public BreakLink ActiveLink
         {
+            get
+            {
+                if (_active != null && _links.Contains(_active)) return _active;
+                return _links.Count == 1 ? _links[0] : _active;
+            }
+            set { _active = value; }
+        }
+        private BreakLink _active;
+
+        public BreakLink FindLink(Guid id) => _links.FirstOrDefault(l => l.Id == id);
+
+        /// <summary>Связь, которой принадлежит разрыв. Ищется по профилю и коридору.</summary>
+        public BreakLink LinkFor(IBreakTarget target)
+        {
+            if (target == null) return null;
+            return _links.FirstOrDefault(l => l.Covers(target));
+        }
+
+        public void AddLink(BreakLink link)
+        {
+            if (link == null) return;
+            if (_links.Any(l => l.Id == link.Id)) return;
+            _links.Add(link);
+        }
+
+        public void RemoveLink(BreakLink link)
+        {
+            if (link == null) return;
+            _links.Remove(link);
+            if (_active == link) _active = null;
+        }
+
+        public void SaveLinks() => BreakLinkStore.SaveAll(_doc.Database, _links);
+
+        /// <summary>
+        /// Прочитать связи чертежа. Записи прежнего формата (одна связь
+        /// в подсловаре Link) подхватываются, чтобы существующие чертежи
+        /// не пришлось размечать заново; если и её нет, связи восстанавливаются
+        /// по самим разрывам — каждый несёт ту же четвёрку хэндлов.
+        ///
+        /// В чертёж при этом ничего не пишется: открытие не должно помечать
+        /// его изменённым.
+        /// </summary>
+        private void LoadLinks(Database db)
+        {
+            _links.Clear();
+            _links.AddRange(BreakLinkStore.LoadAll(db));
+
+            if (_links.Count == 0)
+            {
+                BreakLink legacy = FromLegacyRecord(db);
+                if (legacy != null) _links.Add(legacy);
+            }
+
+            foreach (BreakLink restored in RestoreLinksFromMarkers(db))
+                if (!_links.Any(l => l.Covers(restored)))
+                    _links.Add(restored);
+        }
+
+        /// <summary>Единственная связь прежнего формата, если она ещё жива.</summary>
+        private static BreakLink FromLegacyRecord(Database db)
+        {
+            StationMarker legacy = LinkStore.Load(db);
+            if (legacy == null) return null;
+
+            return new BreakLink
+            {
+                ProfileHandle     = legacy.ProfileHandle,
+                ProfileViewHandle = legacy.ProfileViewHandle,
+                AlignmentHandle   = legacy.AlignmentHandle,
+                CorridorHandle    = legacy.CorridorHandle
+            };
+        }
+
+        /// <summary>
+        /// Связи, выведенные из самих разрывов: по одной на каждую пару
+        /// «профиль + коридор». Нужно для чертежей, сделанных до появления
+        /// записи связи, и на случай, если запись потерялась, а разрывы остались.
+        /// </summary>
+        private List<BreakLink> RestoreLinksFromMarkers(Database db)
+        {
+            var result = new List<BreakLink>();
+
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                StationMarker link = null;
-                foreach (var m in store.All)
+                foreach (var m in Store.All)
                 {
-                    if (!LinkStore.IsAlive(tr, db, m)) continue;
-                    link = new StationMarker
+                    var candidate = new BreakLink
                     {
                         ProfileHandle     = m.ProfileHandle,
                         ProfileViewHandle = m.ProfileViewHandle,
                         AlignmentHandle   = m.AlignmentHandle,
                         CorridorHandle    = m.CorridorHandle
                     };
-                    break;
+
+                    if (!candidate.IsAlive(tr, db)) continue;
+                    if (result.Any(l => l.Covers(candidate))) continue;
+
+                    candidate.RefreshNames(tr, db);
+                    result.Add(candidate);
                 }
+
                 tr.Commit();
-                return link;
             }
+
+            return result;
         }
+
+        // ------------------------------------------------------------------
 
         public void Detach()
         {
@@ -106,7 +208,7 @@ namespace Civil3D_commands.AssociativeBreaks
         /// <summary>Очистить сессию закрытого документа по имени файла.</summary>
         public static void DetachByFileName(string fileName)
         {
-            foreach (var kv in new System.Collections.Generic.List<Document>(_sessions.Keys))
+            foreach (var kv in new List<Document>(_sessions.Keys))
             {
                 try
                 {
@@ -126,12 +228,12 @@ namespace Civil3D_commands.AssociativeBreaks
         public bool IsEditMode(Handle profileHandle) => _editProfiles.Contains(profileHandle.Value);
 
         /// <summary>
-        /// Текущая связь "профиль-вид-ось-коридор", заданная мастером RW_LINKPROFILECORRIDOR.
-        /// Хранится в чертеже (<see cref="LinkStore"/>) и восстанавливается при открытии,
-        /// поэтому переживает перезапуск Civil 3D. Связь в чертеже одна: если их несколько,
-        /// восстановится последняя созданная.
+        /// Режим включён хотя бы у одной связи.
+        ///
+        /// Слои оформления общие на чертёж, а «заблокировать наполовину» нельзя —
+        /// поэтому защита границ снимается, пока правится хоть что-нибудь.
         /// </summary>
-        public StationMarker ActiveLink { get; set; }
+        public bool AnyEditMode => _editProfiles.Count > 0;
 
         /// <summary>
         /// Переключить режим и запомнить это в чертеже.
@@ -139,6 +241,10 @@ namespace Civil3D_commands.AssociativeBreaks
         /// Флаг пишется и в набор характеристик профиля, чтобы галочка
         /// в палитре свойств показывала правду: править режим можно с обеих
         /// сторон, и расходиться им нельзя.
+        ///
+        /// Следом перестраивается оформление: включение режима должно САМО
+        /// показать заливки участков и подписи, а выключение — убрать лишнее
+        /// и заблокировать границы.
         /// </summary>
         public void SetEditMode(Handle profileHandle, bool on)
         {
@@ -153,6 +259,8 @@ namespace Civil3D_commands.AssociativeBreaks
                 using (Suspend())
                 {
                     EditModeStore.Save(_doc.Database, _editProfiles);
+
+                    RefreshOverlay();
 
                     ObjectId profId = RwHandles.Resolve(_doc.Database, profileHandle);
                     if (profId.IsNull) return;
@@ -172,22 +280,47 @@ namespace Civil3D_commands.AssociativeBreaks
             }
         }
 
-        /// <summary>Базовая линия коридора, построенная на профиле маркера.</summary>
-        public Baseline GetBaseline(Transaction tr, StationMarker m)
+        /// <summary>
+        /// Перестроить оформление всех связей и привести слои к текущему режиму.
+        /// Отдельной транзакцией: вызывается и снаружи любой другой правки.
+        /// </summary>
+        public void RefreshOverlay()
         {
+            try
+            {
+                using (_doc.LockDocument())
+                using (Suspend())
+                using (var tr = _doc.Database.TransactionManager.StartTransaction())
+                {
+                    BreakOverlay.RebuildAll(tr, _doc.Database, this);
+                    tr.Commit();
+                }
+
+                SaveLinks();
+            }
+            catch (System.Exception)
+            {
+                // Оформление — удобство, а не механика разрывов.
+            }
+        }
+
+        /// <summary>Базовая линия коридора, построенная на профиле цели.</summary>
+        public Baseline GetBaseline(Transaction tr, IBreakTarget target)
+        {
+            if (target == null) return null;
             var db = _doc.Database;
 
-            var corridor = RwHandles.Open<Corridor>(tr, db, m.CorridorHandle, OpenMode.ForWrite);
+            var corridor = RwHandles.Open<Corridor>(tr, db, target.CorridorHandle, OpenMode.ForWrite);
             if (corridor == null) return null;
 
             // Сначала ищем по профилю (точное совпадение).
-            ObjectId profId = RwHandles.Resolve(db, m.ProfileHandle);
+            ObjectId profId = RwHandles.Resolve(db, target.ProfileHandle);
             if (!profId.IsNull)
                 foreach (Baseline bl in corridor.Baselines)
                     if (bl.ProfileId == profId) return bl;
 
             // Фоллбэк: ищем по оси — надёжнее если профиль ещё не сохранён в BL.
-            ObjectId alId = RwHandles.Resolve(db, m.AlignmentHandle);
+            ObjectId alId = RwHandles.Resolve(db, target.AlignmentHandle);
             if (!alId.IsNull)
                 foreach (Baseline bl in corridor.Baselines)
                     if (bl.AlignmentId == alId) return bl;
@@ -195,9 +328,10 @@ namespace Civil3D_commands.AssociativeBreaks
             return null;
         }
 
-        public Corridor GetCorridor(Transaction tr, StationMarker m)
+        public Corridor GetCorridor(Transaction tr, IBreakTarget target)
         {
-            return RwHandles.Open<Corridor>(tr, _doc.Database, m.CorridorHandle, OpenMode.ForWrite);
+            if (target == null) return null;
+            return RwHandles.Open<Corridor>(tr, _doc.Database, target.CorridorHandle, OpenMode.ForWrite);
         }
 
         private sealed class Guard : IDisposable
