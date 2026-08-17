@@ -80,9 +80,10 @@ namespace Civil3D_commands.FaceArr
         // 9 — поправка к повороту блока.
         // 10 — собственный хэндл контроллера: по нему опознаётся копия.
         // 11 — своя ширина половинчатого блока и плоские блоки заменителей.
+        // 12 — отскок ряда, таблички слева от вида профиля, разрывы в рядах.
         // Старые записи читаются: недостающее берётся по умолчанию, а
         // недостающие отрезки-ручки создаст FACINGWALLREBUILDALL.
-        private const int DataVersion = 11;
+        private const int DataVersion = 12;
 
         // =================================================================
         //  ЖИЗНЕННЫЙ ЦИКЛ
@@ -168,6 +169,7 @@ namespace Civil3D_commands.FaceArr
                 {
                     FacingWallLayoutGrip.EraseMarkers(tr, def);
                     FacingWallCivilProjection.Erase(tr, def);
+                    FacingWallTables.Erase(tr, def);
                 }
 
                 if (!controllerId.IsNull && !controllerId.IsErased)
@@ -221,6 +223,13 @@ namespace Civil3D_commands.FaceArr
 
             // Ручка массива в плане одна на все ряды — после них.
             FacingWallLayoutGrip.EnsureMarkers(tr, db, controllerId, def);
+
+            // Таблички производные, как и всё остальное нарисованное: раскладка
+            // только что изменилась, значит числа в них устарели ровно сейчас.
+            // Сами по себе не заводятся — только обновляются, если пользователь
+            // их уже построил командой FACINGWALLTABLE.
+            if (!def.RowTableId.IsNull || !def.TotalsTableId.IsNull)
+                FacingWallTables.Rebuild(tr, db, def);
         }
 
         /// <summary>
@@ -521,6 +530,11 @@ namespace Civil3D_commands.FaceArr
                 rb.Add(new TypedValue((int)DxfCode.Text, pair.Value ?? string.Empty));
             }
 
+            // версия 12
+            rb.Add(new TypedValue((int)DxfCode.Real, def.RowSetback));
+            rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(def.RowTableId)));
+            rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(def.TotalsTableId)));
+
             var rows = def.Rows ?? new List<FacingWallRowDefinition>();
             rb.Add(new TypedValue((int)DxfCode.Int32, rows.Count));
 
@@ -543,6 +557,16 @@ namespace Civil3D_commands.FaceArr
                     rb.Add(new TypedValue((int)DxfCode.Real, ov.Station));
                     rb.Add(new TypedValue((int)DxfCode.Real, ov.Width));
                     rb.Add(new TypedValue((int)DxfCode.Text, ov.MvBlockDefName ?? string.Empty));
+                }
+
+                // версия 12: разрывы этого ряда
+                var gaps = row.Gaps ?? new List<FacingWallRowGap>();
+                rb.Add(new TypedValue((int)DxfCode.Int32, gaps.Count));
+
+                foreach (FacingWallRowGap gap in gaps)
+                {
+                    rb.Add(new TypedValue((int)DxfCode.Real, gap.Start));
+                    rb.Add(new TypedValue((int)DxfCode.Real, gap.End));
                 }
             }
 
@@ -641,6 +665,13 @@ namespace Civil3D_commands.FaceArr
                 }
             }
 
+            if (version >= 12)
+            {
+                def.RowSetback = Convert.ToDouble(v[i++].Value);
+                def.RowTableId = IdOf(db, v[i++].Value.ToString());
+                def.TotalsTableId = IdOf(db, v[i++].Value.ToString());
+            }
+
             int rowCount = Convert.ToInt32(v[i++].Value);
 
             for (int r = 0; r < rowCount; r++)
@@ -669,6 +700,20 @@ namespace Civil3D_commands.FaceArr
                             Station = Convert.ToDouble(v[i++].Value),
                             Width = Convert.ToDouble(v[i++].Value),
                             MvBlockDefName = NullIfEmpty(v[i++].Value.ToString())
+                        });
+                    }
+                }
+
+                if (version >= 12)
+                {
+                    int gapCount = Convert.ToInt32(v[i++].Value);
+
+                    for (int k = 0; k < gapCount; k++)
+                    {
+                        row.Gaps.Add(new FacingWallRowGap
+                        {
+                            Start = Convert.ToDouble(v[i++].Value),
+                            End = Convert.ToDouble(v[i++].Value)
                         });
                     }
                 }

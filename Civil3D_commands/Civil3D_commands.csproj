@@ -101,6 +101,7 @@
     <Compile Include="FaceArr\FacingWallCivilProjection.cs" />
     <Compile Include="FaceArr\FacingWallLayoutGrip.cs" />
     <Compile Include="FaceArr\FacingWallProjection.cs" />
+    <Compile Include="FaceArr\FacingWallTables.cs" />
     <Compile Include="ProfCorrLink\AssociativeBreakManager.cs" />
     <Compile Include="ProfCorrLink\BreakCommands.cs" />
     <Compile Include="ProfCorrLink\BreakController.cs" />

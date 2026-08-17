@@ -94,6 +94,26 @@ namespace Civil3D_commands.FaceArr
     }
 
     /// <summary>
+    /// Разрыв в ряду: участок трассы, на котором блоков нет.
+    ///
+    /// Разрыв не режет ряд на два самостоятельных: сетка перевязки идёт СКВОЗЬ
+    /// него, и блоки за разрывом стоят на тех же швах, что стояли бы без него.
+    /// Иначе каждый кусок отсчитывал бы перевязку от своего края, и швы
+    /// соседних рядов разъехались бы — ровно та ошибка, от которой перевязку
+    /// когда-то привязали к якорю, а не к началу ряда.
+    /// </summary>
+    public class FacingWallRowGap
+    {
+        public double Start;
+        public double End;
+
+        public double Low { get { return Math.Min(Start, End); } }
+        public double High { get { return Math.Max(Start, End); } }
+
+        public double Length { get { return High - Low; } }
+    }
+
+    /// <summary>
     /// Параметрическое определение стены.
     /// Источник истины для геометрии массива.
     /// </summary>
@@ -120,6 +140,21 @@ namespace Civil3D_commands.FaceArr
         /// Смещение массива относительно Alignment.
         /// </summary>
         public double FaceOffset { get; set; }
+
+        /// <summary>
+        /// Отскок — горизонтальный уступ КАЖДОГО ряда относительно нижнего.
+        /// Смещение ряда = <see cref="FaceOffset"/> + НомерРяда × Отскок,
+        /// то есть нижний ряд стоит на нуле, а стена получает наклон.
+        ///
+        /// Знак тот же, что у <see cref="FaceOffset"/>: смещение отмеряет сам
+        /// Alignment по нормали к оси, и куда у него положительная сторона —
+        /// вопрос геометрии трассы, а не наш. Отрицательный отскок наклоняет
+        /// стену в другую сторону.
+        ///
+        /// На вид профиля не влияет: уступ горизонтален и перпендикулярен оси,
+        /// а профиль показывает пикет и отметку.
+        /// </summary>
+        public double RowSetback { get; set; }
 
         /// <summary>
         /// Абсолютная отметка низа стены.
@@ -309,6 +344,16 @@ namespace Civil3D_commands.FaceArr
         public ObjectId ProfileEndGripId { get; set; }
 
         /// <summary>
+        /// Табличка «блоков в каждом ряду» слева от вида профиля.
+        /// Производная от раскладки: перестраивается целиком, как и всё
+        /// остальное нарисованное.
+        /// </summary>
+        public ObjectId RowTableId { get; set; }
+
+        /// <summary>Табличка «всего блоков по наименованиям» слева от вида профиля.</summary>
+        public ObjectId TotalsTableId { get; set; }
+
+        /// <summary>
         /// Проекции, созданные штатным инструментом Civil 3D (режим MvBlock).
         /// Хранятся отдельно от ProjectionIds рядов: те мы рисуем сами и знаем
         /// поштучно, а эти создаёт Civil, и опознаются они только по разнице
@@ -342,6 +387,8 @@ namespace Civil3D_commands.FaceArr
             PlanEndGripId = ObjectId.Null;
             ProfileStartGripId = ObjectId.Null;
             ProfileEndGripId = ObjectId.Null;
+            RowTableId = ObjectId.Null;
+            TotalsTableId = ObjectId.Null;
             CivilProjectionIds = new List<ObjectId>();
 
             if (Rows == null) return;
@@ -460,6 +507,14 @@ namespace Civil3D_commands.FaceArr
             = new List<FacingWallBlockOverride>();
 
         /// <summary>
+        /// Разрывы этого ряда — участки, на которых блоков нет. Нужны, когда
+        /// стена идёт «горбами»: верхние ряды существуют только над возвышениями.
+        /// См. <see cref="FacingWallRowGap"/> — сетка перевязки идёт сквозь разрыв.
+        /// </summary>
+        public List<FacingWallRowGap> Gaps { get; set; }
+            = new List<FacingWallRowGap>();
+
+        /// <summary>
         /// Служебный отрезок-ручка ряда в виде профиля.
         /// Именно за него тянут мышью: ручки на его концах рисует сам AutoCAD.
         /// Хранится отдельно от ProjectionIds, потому что при перестроении ряда
@@ -570,8 +625,12 @@ namespace Civil3D_commands.FaceArr
                 // ячейка) это ровно то же, что было; при уменьшенной пустым
                 // остаётся край ряда, а не шов посреди раскладки.
                 if (hasHalf && Math.Abs(lead - cell) < Eps && span >= lead - Eps)
-                    yield return Place(row, forward, t + lead - halfWidth, halfWidth,
-                        t + lead, FacingWallBlockKind.Half, def.HalfMvBlockDefName);
+                {
+                    FacingWallBlockPlacement head = Place(row, forward, t + lead - halfWidth,
+                        halfWidth, t + lead, FacingWallBlockKind.Half, def.HalfMvBlockDefName);
+
+                    if (!IsInGap(row, head)) yield return head;
+                }
 
                 // Даже если половинку поставить нечем, шаг делаем: попасть
                 // в сетку важнее, чем закрыть остаток.
@@ -621,9 +680,37 @@ namespace Civil3D_commands.FaceArr
 
                 if (width <= Eps || width > remaining + Eps) break;
 
-                yield return Place(row, forward, t, width, t + step, kind, name);
+                FacingWallBlockPlacement placement =
+                    Place(row, forward, t, width, t + step, kind, name);
+
+                // Место в разрыве пропускается, но ШАГ ДЕЛАЕТСЯ ВСЁ РАВНО:
+                // сетка перевязки идёт сквозь разрыв, и блоки за ним обязаны
+                // встать на те же швы, на которых стояли бы без него.
+                if (!IsInGap(row, placement)) yield return placement;
+
                 t += step;
             }
+        }
+
+        /// <summary>Место целиком или частично попадает в разрыв ряда?</summary>
+        private static bool IsInGap(FacingWallRowDefinition row, FacingWallBlockPlacement block)
+        {
+            if (row.Gaps == null || row.Gaps.Count == 0) return false;
+
+            double from = block.Station;
+            double to = block.Station + block.Width;
+
+            foreach (FacingWallRowGap gap in row.Gaps)
+            {
+                if (gap == null || gap.Length <= Eps) continue;
+
+                // Достаточно ЧАСТИЧНОГО перекрытия: блок, наполовину заехавший
+                // в разрыв, — это блок в разрыве. Оставить его значило бы
+                // получить край стены не там, где его провёл пользователь.
+                if (from < gap.High - Eps && to > gap.Low + Eps) return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -714,6 +801,23 @@ namespace Civil3D_commands.FaceArr
         }
 
         /// <summary>
+        /// Смещение ряда от оси с учётом отскока: нижний ряд стоит на
+        /// <see cref="FacingWallDefinition.FaceOffset"/>, каждый следующий
+        /// отступает ещё на <see cref="FacingWallDefinition.RowSetback"/>.
+        ///
+        /// Считается от НОМЕРА ряда, а не накоплением по ходу построения:
+        /// ряды перестраиваются поодиночке (FACINGWALLREBUILD), и накопленное
+        /// значение у одного ряда взяться было бы неоткуда.
+        /// </summary>
+        public static double RowFaceOffset(
+            FacingWallDefinition def,
+            FacingWallRowDefinition row)
+        {
+            if (def == null || row == null) return 0.0;
+            return def.FaceOffset + row.RowIndex * def.RowSetback;
+        }
+
+        /// <summary>
         /// Построить ОДИН ряд. Возвращает созданные MVBlock-вставки.
         /// </summary>
         public static List<ObjectId> GenerateRow(
@@ -729,6 +833,7 @@ namespace Civil3D_commands.FaceArr
             if (def == null || row == null || alignment == null) return created;
 
             double elevation = RowElevation(def, row);
+            double faceOffset = RowFaceOffset(def, row);
             double alignStart = alignment.StartingStation;
             double alignEnd = alignment.EndingStation;
 
@@ -743,7 +848,8 @@ namespace Civil3D_commands.FaceArr
 
                 Point3d insertion;
                 double angle;
-                if (!TryPlaceOnAlignment(alignment, def, block, elevation, out insertion, out angle))
+                if (!TryPlaceOnAlignment(alignment, def, block, elevation, faceOffset,
+                                         out insertion, out angle))
                     continue;
 
                 ObjectId id = ResolveCached(db, tr, defCache, block.MvBlockDefName);
@@ -783,6 +889,7 @@ namespace Civil3D_commands.FaceArr
             FacingWallDefinition def,
             FacingWallBlockPlacement block,
             double elevation,
+            double faceOffset,
             out Point3d insertion,
             out double angle)
         {
@@ -802,8 +909,10 @@ namespace Civil3D_commands.FaceArr
                 // Смещение берём у самого Alignment: у него offset отмеряется
                 // по нормали к оси, и знак FaceOffset остаётся прежним —
                 // считать нормаль руками значило бы гадать про её сторону.
+                // Смещение ряда, а не массива: у ряда к нему прибавлен отскок,
+                // и именно поэтому стена может идти с наклоном.
                 alignment.PointLocation(
-                    block.Station + block.Width / 2.0, def.FaceOffset, ref cx, ref cy);
+                    block.Station + block.Width / 2.0, faceOffset, ref cx, ref cy);
             }
             catch (System.Exception)
             {

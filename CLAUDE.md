@@ -33,6 +33,10 @@ PowerShell 5.1 читает такой файл в ANSI и превращает 
   Относительные `HintPath` не использовать: они ломались при переносе на другой диск.
 - `.csproj` — старого формата (не SDK-style): **новый `.cs` файл надо руками
   добавить в `<ItemGroup>` с `<Compile Include=...>`**, иначе он молча не компилируется.
+- Корневой `Civil3D_commands.sln` содержит **только** проект плагина. У набора
+  подсборок своё решение —
+  `RfRW_elements_kit_v0.4/RfRW_elements_kit_v0.1/RfRW_elements_kit_v0.1.sln`;
+  открытие корневого решения его не подтянет.
 - Результат — `Civil3D_commands\bin\Debug\Civil3D_commands.dll`, его и грузят
   `NETLOAD`. Конфигурация только Debug; платформа `AnyCPU` (в
   `ProfCorrLink/README.md` написано «x64» — там неверно, менять не нужно:
@@ -66,6 +70,19 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 имеет смысл коммит, а крупные изменения делать точечным редактированием,
 а не переписыванием файла целиком.
 
+**Формат коммита сложился и его стоит держать** (`git log` — образец): заголовок
+по-русски, коротко и по сути; тело — связный текст абзацами о том, **почему**
+так сделано и какая ошибка этим лечится, а не перечень тронутых файлов.
+Последней содержательной строкой — что подтверждено в чертеже, а что нет
+(«Подтверждено в чертеже: план и профиль. Не проверено: FACINGBYPROFILE»):
+автотестов нет, и эта строка — единственная запись о том, насколько правке
+можно верить. Трейлер `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
+стоит во всех коммитах, где участвовал агент.
+
+Поведение, которое поменялось, дописывать в README модуля **тем же коммитом**:
+раздел «Состояние» с датой там заменяет тесты, и разошедшийся README дороже,
+чем несделанная правка.
+
 Каждая итерация стоит пользователю перезапуска Civil 3D, поэтому в одну сборку
 имеет смысл класть и исправление, и диагностику, которая разделит оставшиеся
 гипотезы. Для этого есть диагностические команды: `FACINGWALLDIAG` в `FaceArr` (счётчики
@@ -78,8 +95,8 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 | Путь | Что |
 |------|-----|
 | `Shared/` | Общее для обоих модулей: `RwGeometry` (пикет↔точка в плане и в виде профиля, перпендикуляр к оси, Clamp, середина отрезка) и `RwHandles` (Handle↔текст↔ObjectId, правило «стёртое = пусто»). Новый код по этим темам писать здесь, а не рядом. |
-| `FaceArr/` | Facing Wall — параметрическая облицовка стены, команды `FACINGWALL*` (namespace `Civil3D_commands.FaceArr`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
-| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_MOVEBREAK`, `RW_DELETEBREAK`, `RW_REFRESHBREAKS`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Namespace не совпадает с папкой: `Civil3D_commands.AssociativeBreaks`** — искать классы модуля по имени папки бесполезно. **Есть свой `README.md` — читать его первым при работе с модулем.** |
+| `FaceArr/` | Facing Wall — параметрическая облицовка стены, команды `FACINGWALL*` (включая `FACINGWALLGAP` — разрывы в ряду, `FACINGWALLTABLE` — таблички слева от вида профиля) **плюс `FACINGBYPROFILE`** (имя без `WALL` — так попросил пользователь; по маске модуль не найти) (namespace `Civil3D_commands.FaceArr`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
+| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITLINKS`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_MOVEBREAK`, `RW_DELETEBREAK`, `RW_REFRESHBREAKS`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Namespace не совпадает с папкой: `Civil3D_commands.AssociativeBreaks`** — искать классы модуля по имени папки бесполезно. **Есть свой `README.md` — читать его первым при работе с модулем.** |
 | `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`). Ещё два `CommandMethod` в файле закомментированы (`LinkCorridor`, `UpdateRegions`) — в сборке их нет. |
 | `RetrieveReinfSoilMaterials.cs` | Ведомость материалов стены + таблица через `EntityJig` (`RW_MATERIALS`, `RW_WallPolylines`). |
 | `CorridorPolylineExtractor.cs` | Полилинии из коридора по группировке Z (`RW_ExtractCorridorPolylines`). |
@@ -90,6 +107,10 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 
 Оба README ссылаются на исходное ТЗ `claude_instructions.txt` — **в репозитории его
 больше нет**. Сверять требования не с чем, источник истины по поведению — README модуля.
+Внутри README свежее то, что выше: датированные разделы «Состояние» идут
+сверху вниз от новых к старым, и верить надо верхнему. Списки в конце файла
+(«Не сделано», «Известные ограничения») отстают первыми — правя поведение,
+править и их.
 Корневой `README.md` — витрина для GitHub (что за проекты, сборка, лицензия);
 подробности состояния модулей в нём не дублируются и устаревают первыми.
 
@@ -115,7 +136,7 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 | Модуль | Словарь NOD | XData (RegApp) | Слои / блоки |
 |--------|-------------|----------------|--------------|
 | `FaceArr` | `FACINGWALL_DATA` (Xrecord у контроллера) | `RW_FACINGWALL`, метка `"FACINGWALL"` | блок `FACINGWALL_CONTROLLER`; слои `RW_FACINGWALL_PROFILE`, `RW_FACINGWALL_GRIP`, `RW_FACINGWALL_GRIP_PLAN`, `RW_FACINGWALL_GRIP_LAYOUT` |
-| `ProfCorrLink` | `RW_AssocBreaks` → подсловари `Markers`, `EditMode/Profiles`, `Link/Active` | `RW_BREAK` (Guid маркера) | служебные прокси-`Line` |
+| `ProfCorrLink` | `RW_AssocBreaks` → подсловари `Markers`, `EditMode/Profiles`, `Link/Active` (прежний формат, только чтение), `Links` (`LK_<guid>`) | `RW_BREAK` (Guid маркера), `RW_BREAKLINK` (Guid связи, на контроллере), `RW_BREAKOVL` (Guid связи, на оформлении) | блок `RW_BREAK_CONTROLLER`; слои `RW_BREAK_BOUNDARY`, `RW_BREAK_FILL`, `RW_BREAK_INFO`, `RW_BREAK_ASSEMBLY`, `RW_BREAK_CONTROLLER`; служебные прокси-`Line` |
 | `LinkingCommands` | `AsdkLinks` → `AsdkLinkedObjects` | — | — |
 
 Отсюда же следует, **как два оверруля уживаются на одном `Line`**: оба висят на
@@ -152,6 +173,14 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 не переопределяется вообще (ручки концов и середины рисует AutoCAD), перехватывается
 только `MoveGripPointsAt`. Так сделано и в `FaceArr`, и в `ProfCorrLink`.
 
+**Оверрул включается идемпотентно из каждой команды.** Новая команда `FACINGWALL*`
+обязана начинаться с `FacingWallGrips.Enable()` — так модуль остаётся живым, даже
+если инициализация в `BreakCommands.Initialize()` упала (она обёрнута в try/catch,
+чтобы не утащить за собой реактор разрывов). **Исключение — диагностические
+команды:** `FACINGWALLANGLE` и `FACINGWALLDIAG` не зовут `Enable()` намеренно,
+иначе `FACINGWALLDIAG` всегда показывал бы оверрул включённым и перестал бы
+отвечать на вопрос, ради которого написан.
+
 ## Подводные камни API (уже наступили)
 
 - `Overrule.AddOverrule(class, overrule, bAddAtLast)` — третий параметр это
@@ -164,6 +193,11 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 - `Entity` и `DBObject` есть и в `Autodesk.AutoCAD.DatabaseServices`, и в
   `Autodesk.Civil.DatabaseServices` — во всех файлах ставится алиас. `DBObject`
   всплывает реже и потому неожиданнее: например в ограничении обобщённого метода.
+  Так же конфликтуют `Surface` (две одноимённые в тех же пространствах),
+  `Application` (`ApplicationServices` против `Windows.Forms` — отсюда `AcAp`/`AcApp`)
+  и `Exception` (`Autodesk.AutoCAD.Runtime` против `System`): ловить надо
+  автокадовское, иначе `ErrorStatus` не прочитать. Образцы алиасов — в шапках
+  `RetrieveReinfSoilMaterials.cs` и `PropertySetHelper.cs`.
 - `Alignment.PointLocation(station, offset, ref x, ref y)`,
   `ProfileView.FindStationAndElevationAtXY(...)`,
   `Alignment.StationOffset(...)` — параметры `ref`, не `out`.

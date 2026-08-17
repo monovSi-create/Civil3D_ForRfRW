@@ -6,6 +6,7 @@ using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.Civil.DatabaseServices;
+using Civil3D_commands.Shared;
 using AcApp = Autodesk.AutoCAD.ApplicationServices.Application;
 // Entity и ObjectId есть и в AutoCAD-, и в Civil-пространстве имён — снимаем неоднозначность.
 using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
@@ -340,6 +341,7 @@ namespace Civil3D_commands.FaceArr
                 opts.Keywords.Add("Custom", "Индивидуальный", "Индивидуальный");
                 opts.Keywords.Add("Rows", "Ряды", "Ряды");
                 opts.Keywords.Add("Elevation", "Отметка", "Отметка");
+                opts.Keywords.Add("Setback", "Отскок", "Отскок");
                 opts.Keywords.Add("Apply", "Применить", "Применить");
                 opts.Keywords.Default = "Apply";
                 opts.AllowNone = true;
@@ -373,6 +375,10 @@ namespace Civil3D_commands.FaceArr
 
                     case "Elevation":
                         if (ChangeBaseElevation(ed, db, def)) changed = true;
+                        break;
+
+                    case "Setback":
+                        if (ChangeSetback(ed, def)) changed = true;
                         break;
                 }
             }
@@ -810,6 +816,322 @@ namespace Civil3D_commands.FaceArr
         //  выполнить заново. Ассоциативность здесь означала бы реактор,
         //  как в ProfCorrLink, и это отдельная задача.
         // =================================================================
+        /// <summary>
+        /// Отскок — горизонтальный уступ каждого ряда относительно нижнего.
+        /// Нижний ряд стоит на нуле, каждый следующий отступает ещё на эту
+        /// величину, и стена получает наклон.
+        ///
+        /// Знак не проверяется: смещение отмеряет сам Alignment по нормали,
+        /// и куда у него положительная сторона — свойство трассы, а не наше.
+        /// Наклонило не туда — задайте отрицательный отскок.
+        /// </summary>
+        private static bool ChangeSetback(Editor ed, FacingWallDefinition def)
+        {
+            ed.WriteMessage(
+                "\nОтскок сейчас: {0:F3} (смещение верхнего ряда: {1:F3}).",
+                def.RowSetback,
+                def.RowSetback * Math.Max(def.RowCount - 1, 0));
+
+            var opts = new PromptDoubleOptions(
+                "\nОтскок на каждый ряд (0 — стена вертикальная, минус — наклон в другую сторону)")
+            {
+                DefaultValue = def.RowSetback,
+                UseDefaultValue = true,
+                AllowNegative = true,
+                AllowZero = true
+            };
+
+            PromptDoubleResult res = ed.GetDouble(opts);
+            if (res.Status != PromptStatus.OK) return false;
+
+            if (Math.Abs(res.Value - def.RowSetback) < 1e-9) return false;
+
+            def.RowSetback = res.Value;
+            return true;
+        }
+
+        // =================================================================
+        //  ТАБЛИЧКИ СЛЕВА ОТ ВИДА ПРОФИЛЯ
+        // =================================================================
+
+        /// <summary>
+        /// Построить (или обновить) две таблички: сколько блоков в каждом ряду
+        /// и сколько всего по каждому наименованию.
+        ///
+        /// Заведённые однажды, дальше они обновляются сами при каждом
+        /// перестроении массива — см. FacingWallController.BuildAll.
+        /// </summary>
+        [CommandMethod("FACINGWALLTABLE")]
+        public static void BuildTables()
+        {
+            Document doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            FacingWallGrips.Enable();
+
+            ObjectId controllerId = SelectController(doc);
+            if (controllerId.IsNull) return;
+
+            var opts = new PromptKeywordOptions("\nТаблички");
+            opts.Keywords.Add("Build", "Построить", "Построить");
+            opts.Keywords.Add("Delete", "Удалить", "Удалить");
+            opts.Keywords.Default = "Build";   // глобальное имя, не подпись
+            opts.AllowNone = true;
+
+            PromptResult res = ed.GetKeywords(opts);
+            if (res.Status != PromptStatus.OK) return;
+
+            bool remove = res.StringResult == "Delete";
+            bool done = false;
+            int total = 0;
+
+            try
+            {
+                using (doc.LockDocument())
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    FacingWallDefinition def = FacingWallController.Load(controllerId, tr);
+                    if (def == null)
+                    {
+                        ed.WriteMessage("\nНе удалось прочитать контроллер.");
+                        tr.Commit();
+                        return;
+                    }
+
+                    if (remove)
+                    {
+                        FacingWallTables.Erase(tr, def);
+                        done = true;
+                    }
+                    else
+                    {
+                        var alignment = tr.GetObject(def.AlignmentId, OpenMode.ForRead) as Alignment;
+                        total = FacingWallTables.CountBlocks(def, alignment).Total;
+                        done = FacingWallTables.Rebuild(tr, db, def);
+                    }
+
+                    FacingWallController.Save(controllerId, def, tr);
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage("\nОшибка построения табличек: " + ex.Message);
+                return;
+            }
+
+            if (remove)
+                ed.WriteMessage("\nТаблички удалены.");
+            else if (done)
+                ed.WriteMessage(
+                    "\nТаблички построены слева от вида профиля. Блоков всего: {0}." +
+                    "\nДальше они обновляются сами при каждом перестроении массива.", total);
+            else
+                ed.WriteMessage(
+                    "\nТаблички не построены: вид профиля не найден или ещё не отрисован." +
+                    "\nПокажите вид на экране и повторите команду.");
+
+            ed.Regen();
+        }
+
+        // =================================================================
+        //  РАЗРЫВ В РЯДУ
+        //
+        //  Нужен, когда стена идёт «горбами»: верхние ряды существуют только
+        //  над возвышениями. Разрыв НЕ режет ряд на два самостоятельных —
+        //  сетка перевязки идёт сквозь него, и блоки за разрывом стоят на тех
+        //  же швах, на которых стояли бы без него.
+        // =================================================================
+
+        [CommandMethod("FACINGWALLGAP")]
+        public static void EditRowGaps()
+        {
+            Document doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            FacingWallGrips.Enable();
+
+            ObjectId controllerId = SelectController(doc);
+            if (controllerId.IsNull) return;
+
+            var opts = new PromptKeywordOptions("\nРазрыв в ряду");
+            opts.Keywords.Add("Add", "Добавить", "Добавить");
+            opts.Keywords.Add("Clear", "Очистить", "Очистить");
+            opts.Keywords.Default = "Add";   // глобальное имя, не подпись
+            opts.AllowNone = true;
+
+            PromptResult modeRes = ed.GetKeywords(opts);
+            if (modeRes.Status != PromptStatus.OK) return;
+            bool clear = modeRes.StringResult == "Clear";
+
+            // Какие ряды трогаем. «Все» — обычный случай: провал рельефа
+            // проходит стену насквозь.
+            int rowIndex;
+            if (!AskRowIndex(ed, out rowIndex)) return;
+
+            double from = 0.0, to = 0.0;
+
+            if (!clear)
+            {
+                Point3d p1, p2;
+                if (!AskPoint(ed, "\nНачало разрыва (в виде профиля или в плане)", out p1)) return;
+                if (!AskPoint(ed, "\nКонец разрыва", out p2)) return;
+
+                if (!ToStations(doc, controllerId, p1, p2, out from, out to))
+                {
+                    ed.WriteMessage(
+                        "\nТочки не попали ни в вид профиля, ни на трассу — разрыв не создан." +
+                        "\nЩёлкайте внутри сетки вида профиля либо рядом с осью в плане.");
+                    return;
+                }
+
+                if (Math.Abs(to - from) < 1e-6)
+                {
+                    ed.WriteMessage("\nНулевая длина разрыва — ничего не изменено.");
+                    return;
+                }
+
+                ed.WriteMessage("\nРазрыв {0:F3} .. {1:F3}.", Math.Min(from, to), Math.Max(from, to));
+            }
+
+            int touched = 0;
+
+            try
+            {
+                using (doc.LockDocument())
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    FacingWallDefinition def = FacingWallController.Load(controllerId, tr);
+                    if (def == null)
+                    {
+                        ed.WriteMessage("\nНе удалось прочитать контроллер.");
+                        tr.Commit();
+                        return;
+                    }
+
+                    foreach (FacingWallRowDefinition row in def.Rows)
+                    {
+                        if (row == null) continue;
+                        if (rowIndex >= 0 && row.RowIndex != rowIndex) continue;
+
+                        if (clear)
+                        {
+                            if (row.Gaps.Count == 0) continue;
+                            row.Gaps.Clear();
+                        }
+                        else
+                        {
+                            row.Gaps.Add(new FacingWallRowGap { Start = from, End = to });
+                        }
+
+                        touched++;
+                    }
+
+                    if (touched > 0)
+                    {
+                        FacingWallController.BuildAll(tr, db, controllerId, def);
+                        FacingWallController.Save(controllerId, def, tr);
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage("\nОшибка правки разрывов: " + ex.Message);
+                return;
+            }
+
+            ed.WriteMessage(clear
+                ? string.Format("\nРазрывы сняты в рядах: {0}.", touched)
+                : string.Format("\nРазрыв добавлен в рядах: {0}.", touched));
+
+            if (touched == 0)
+                ed.WriteMessage("\nПодходящих рядов не нашлось — проверьте номер ряда.");
+
+            ed.Regen();
+        }
+
+        /// <summary>Номер ряда или −1 для «всех». Ряды нумеруются с нуля снизу.</summary>
+        private static bool AskRowIndex(Editor ed, out int rowIndex)
+        {
+            rowIndex = -1;
+
+            var opts = new PromptIntegerOptions(
+                "\nНомер ряда (0 — нижний)")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                DefaultValue = 0,
+                UseDefaultValue = true
+            };
+            opts.Keywords.Add("All", "Все", "Все");
+            opts.AppendKeywordsToMessage = true;
+
+            PromptIntegerResult res = ed.GetInteger(opts);
+
+            if (res.Status == PromptStatus.Keyword && res.StringResult == "All")
+            {
+                rowIndex = -1;
+                return true;
+            }
+
+            if (res.Status != PromptStatus.OK) return false;
+
+            rowIndex = res.Value;
+            return true;
+        }
+
+        private static bool AskPoint(Editor ed, string message, out Point3d point)
+        {
+            point = Point3d.Origin;
+
+            PromptPointResult res = ed.GetPoint(message);
+            if (res.Status != PromptStatus.OK) return false;
+
+            point = res.Value;
+            return true;
+        }
+
+        /// <summary>
+        /// Две точки → два пикета. Точку сначала пробуем в виде профиля, затем
+        /// сносим на трассу: так разрыв задаётся откуда удобнее, тем же приёмом,
+        /// что и разрыв коридора в RW_CREATEBREAK.
+        /// </summary>
+        private static bool ToStations(
+            Document doc, ObjectId controllerId, Point3d p1, Point3d p2,
+            out double from, out double to)
+        {
+            from = 0.0;
+            to = 0.0;
+
+            using (Transaction tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                FacingWallDefinition def = FacingWallController.Load(controllerId, tr);
+                if (def == null) { tr.Commit(); return false; }
+
+                var pv = tr.GetObject(def.ProfileViewId, OpenMode.ForRead) as ProfileView;
+                var al = tr.GetObject(def.AlignmentId, OpenMode.ForRead) as Alignment;
+
+                bool ok = ToStation(pv, al, p1, out from) && ToStation(pv, al, p2, out to);
+
+                tr.Commit();
+                return ok;
+            }
+        }
+
+        private static bool ToStation(ProfileView pv, Alignment al, Point3d point, out double station)
+        {
+            if (RwGeometry.TryStationInProfileView(pv, point, out station)) return true;
+            return RwGeometry.TryStationOnAlignment(al, point, out station);
+        }
+
         [CommandMethod("FACINGBYPROFILE")]
         public static void FitRowsToProfile()
         {
@@ -824,17 +1146,51 @@ namespace Civil3D_commands.FaceArr
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
 
-            var pOpts = new PromptEntityOptions(
-                "\nВыберите профиль, ниже которого должна остаться стена: ");
-            pOpts.SetRejectMessage("\nНужен профиль (Profile).");
-            pOpts.AddAllowedClass(typeof(Profile), true);
+            // Профилей теперь два, и оба необязательны: стену подрезает верхний,
+            // а нижний выбивает нижние ряды там, где земля поднялась выше их
+            // низа. Задать можно любой один — или оба сразу.
+            ObjectId topId, bottomId;
+            if (!AskProfile(ed, "\nПрофиль ВЕРХА — ниже него должна остаться стена", out topId)) return;
+            if (!AskProfile(ed, "\nПрофиль НИЗА — выше него должна остаться стена", out bottomId)) return;
 
-            PromptEntityResult pRes = ed.GetEntity(pOpts);
-            if (pRes.Status != PromptStatus.OK) return;
+            if (topId.IsNull && bottomId.IsNull)
+            {
+                ed.WriteMessage("\nНи одного профиля не задано — нечего подрезать.");
+                return;
+            }
+
+            bool leaveGaps = true;
+
+            if (bottomId.IsNull)
+            {
+                // Что делать там, где профиль опускается ниже стены. Разрывы — то,
+                // ради чего команда и переделана: стена с несколькими возвышениями
+                // («горбами») иначе обрывалась на первом же провале.
+                var modeOpts = new PromptKeywordOptions(
+                    "\nГде профиль ниже стены");
+                modeOpts.Keywords.Add("Gaps", "Разрыв", "Разрыв");
+                modeOpts.Keywords.Add("Trim", "Оборвать", "Оборвать");
+                modeOpts.Keywords.Default = "Gaps";   // глобальное имя, не подпись
+                modeOpts.AllowNone = true;
+
+                PromptResult modeRes = ed.GetKeywords(modeOpts);
+                if (modeRes.Status != PromptStatus.OK) return;
+                leaveGaps = modeRes.StringResult != "Trim";
+            }
+            else
+            {
+                // «Оборвать» умеет отрезать только хвост ряда, а профиль низа
+                // выбивает блоки из СЕРЕДИНЫ: земля поднимается там, где ей
+                // угодно. Выразить это обрывом нельзя, поэтому режим не спрашиваем.
+                ed.WriteMessage(
+                    "\nС профилем низа ряды режутся разрывами: обрыв умеет отрезать" +
+                    " только хвост, а земля поднимается и посреди стены.");
+            }
 
             int shortened = 0;
             int emptied = 0;
             int total = 0;
+            int gaps = 0;
 
             try
             {
@@ -844,8 +1200,10 @@ namespace Civil3D_commands.FaceArr
                     FacingWallDefinition def = FacingWallController.Load(controllerId, tr);
                     if (def == null) { tr.Commit(); return; }
 
-                    var profile = tr.GetObject(pRes.ObjectId, OpenMode.ForRead) as Profile;
-                    if (profile == null)
+                    var topProfile = OpenProfile(tr, topId);
+                    var bottomProfile = OpenProfile(tr, bottomId);
+
+                    if (topProfile == null && bottomProfile == null)
                     {
                         ed.WriteMessage("\nНе удалось открыть профиль.");
                         tr.Commit();
@@ -858,11 +1216,31 @@ namespace Civil3D_commands.FaceArr
                     {
                         if (row == null) continue;
 
-                        double full = row.EndStation;
-                        row.EndStation = FitRowUnderProfile(def, row, profile);
+                        // Разрывы прежнего запуска сбрасываются: команда считает
+                        // от границ раскладки, иначе второй запуск давал бы
+                        // не тот же результат, что первый.
+                        row.Gaps.Clear();
 
-                        if (Math.Abs(row.EndStation - row.StartStation) < 1e-9) emptied++;
-                        else if (Math.Abs(row.EndStation - full) > 1e-9) shortened++;
+                        double full = row.EndStation;
+
+                        if (leaveGaps)
+                        {
+                            int fitted;
+                            row.Gaps.AddRange(GapsByProfiles(
+                                def, row, topProfile, bottomProfile, out fitted));
+
+                            if (fitted == 0) emptied++;
+                            else if (row.Gaps.Count > 0) shortened++;
+
+                            gaps += row.Gaps.Count;
+                        }
+                        else
+                        {
+                            row.EndStation = FitRowUnderProfile(def, row, topProfile);
+
+                            if (Math.Abs(row.EndStation - row.StartStation) < 1e-9) emptied++;
+                            else if (Math.Abs(row.EndStation - full) > 1e-9) shortened++;
+                        }
 
                         total++;
                     }
@@ -879,22 +1257,104 @@ namespace Civil3D_commands.FaceArr
             }
 
             ed.WriteMessage(
-                "\nРядов: {0}, подрезано: {1}, пустых: {2}.",
-                total, shortened, emptied);
+                "\nРядов: {0}, изменено: {1}, пустых: {2}{3}.",
+                total, shortened, emptied,
+                leaveGaps ? ", разрывов: " + gaps : string.Empty);
 
             if (emptied == total && total > 0)
                 ed.WriteMessage(
-                    "\nПод профилем не поместился ни один блок — профиль ниже " +
-                    "отметки низа стены или слишком близко к ней.");
+                    "\nМежду профилями не поместился ни один блок. Проверьте, что" +
+                    " профиль верха выше отметки низа стены, а профиль низа — ниже" +
+                    " её верха, и что оба покрывают раскладку по длине.");
             else if (emptied > 0)
                 ed.WriteMessage(
                     "\nПустые ряды не удалены: команда считает от границ раскладки, " +
                     "и с другим профилем они вернутся. Убрать совсем — FACINGWALLEDIT.");
 
+            if (!bottomId.IsNull)
+                ed.WriteMessage(
+                    "\nПикет, до которого профиль не достаёт, считается непроходимым:" +
+                    " профиль низа короче раскладки выбьет ей края.");
+
             ed.WriteMessage(
-                "\nСвязь с профилем не сохранена: изменили профиль — выполните команду заново.");
+                "\nСвязь с профилями не сохранена: изменили профиль — выполните команду заново.");
 
             ed.Regen();
+        }
+
+        /// <summary>
+        /// Разрывы ряда там, где он не помещается между профилями: верхний
+        /// срезает стену сверху, нижний выбивает нижние ряды там, где земля
+        /// поднялась выше их низа. Любой из двух может быть null.
+        ///
+        /// Проверки симметричны, и это не совпадение: сверху блок обязан быть
+        /// целиком НИЖЕ профиля, снизу — целиком ВЫШЕ. Поэтому нижние ряды
+        /// подстраиваются под низ ровно так же, как верхние под верх, и стена
+        /// получает ступени с обеих сторон.
+        ///
+        /// В отличие от <see cref="FitRowUnderProfile"/> ряд не обрывается на
+        /// первом непоместившемся блоке, а продолжается за провалом: стена
+        /// с несколькими возвышениями («горбами») именно так и выглядит.
+        /// Ряд остаётся во всю область раскладки, а пустыми объявляются
+        /// отдельные её куски.
+        ///
+        /// Соседние непоместившиеся места сливаются в один разрыв: иначе на
+        /// каждый блок завёлся бы свой, и запись раздулась бы на ровном месте.
+        /// Слияние идёт по отсортированным отрезкам, а не по ходу перечисления:
+        /// при обратной раскладке пикеты убывают, и «следующий» там левее.
+        /// </summary>
+        private static List<FacingWallRowGap> GapsByProfiles(
+            FacingWallDefinition def, FacingWallRowDefinition row,
+            Profile topProfile, Profile bottomProfile, out int fitted)
+        {
+            const double eps = 1e-6;
+
+            double bottom = FacingWallBuilder.RowElevation(def, row);
+            double top = bottom + def.BlockHeight;
+
+            var raw = new List<FacingWallRowGap>();
+            fitted = 0;
+
+            foreach (FacingWallBlockPlacement block in FacingWallBuilder.EnumerateBlocks(def, row))
+            {
+                // Место годится, только если блок целиком между профилями.
+                // Незаданный профиль ничего не запрещает — так одна и та же
+                // проверка обслуживает и «только верх», и «только низ», и оба.
+                bool ok = (topProfile == null || IsUnderProfile(topProfile, block, top))
+                       && (bottomProfile == null || IsAboveProfile(bottomProfile, block, bottom));
+
+                if (ok) { fitted++; continue; }
+
+                raw.Add(new FacingWallRowGap
+                {
+                    Start = block.Station,
+                    End = block.Station + block.Width
+                });
+            }
+
+            raw.Sort((a, b) => a.Low.CompareTo(b.Low));
+
+            var merged = new List<FacingWallRowGap>();
+
+            foreach (FacingWallRowGap gap in raw)
+            {
+                if (merged.Count > 0)
+                {
+                    FacingWallRowGap last = merged[merged.Count - 1];
+
+                    // Соприкасающиеся отрезки — это один разрыв. Допуск тот же
+                    // eps: блоки стоят вплотную, и «касание» здесь точное.
+                    if (gap.Low <= last.High + eps)
+                    {
+                        if (gap.High > last.High) last.End = gap.High;
+                        continue;
+                    }
+                }
+
+                merged.Add(new FacingWallRowGap { Start = gap.Low, End = gap.High });
+            }
+
+            return merged;
         }
 
         /// <summary>
@@ -910,6 +1370,8 @@ namespace Civil3D_commands.FaceArr
         private static double FitRowUnderProfile(
             FacingWallDefinition def, FacingWallRowDefinition row, Profile profile)
         {
+            if (profile == null) return row.EndStation;   // подрезать нечем
+
             double top = FacingWallBuilder.RowElevation(def, row) + def.BlockHeight;
             double edge = row.StartStation;   // ничего не поместилось — ряд пуст
 
@@ -960,6 +1422,90 @@ namespace Civil3D_commands.FaceArr
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Весь контур блока строго ВЫШЕ профиля низа?
+        ///
+        /// Зеркало <see cref="IsUnderProfile"/>, и оговорки те же: профиль между
+        /// пикетами может выгибаться вверх, поэтому проверяются не только края
+        /// блока, а пикет, до которого профиль не достаёт, считается непроходимым.
+        ///
+        /// Последнее стоит помнить: профиль низа КОРОЧЕ стены выбьет ей края.
+        /// Правило то же, что у верхнего профиля с 12 августа 2026, — гарантировать
+        /// там нечем, — но с низом это заметнее: его обычно рисуют по факту,
+        /// и он легко оказывается короче раскладки.
+        /// </summary>
+        private static bool IsAboveProfile(
+            Profile profile, FacingWallBlockPlacement block, double bottom)
+        {
+            const double eps = 1e-6;
+
+            int samples = (int)Math.Ceiling(block.Width / 0.1);
+            if (samples < 4) samples = 4;
+            if (samples > 200) samples = 200;
+
+            for (int k = 0; k <= samples; k++)
+            {
+                double station = block.Station + block.Width * k / samples;
+
+                double elevation;
+                try
+                {
+                    elevation = profile.ElevationAt(station);
+                }
+                catch (System.Exception)
+                {
+                    return false;   // профиль сюда не дотягивается
+                }
+
+                if (double.IsNaN(elevation)) return false;
+                if (elevation >= bottom - eps) return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Спросить профиль, разрешив его не задавать.
+        ///
+        /// Пустой ответ — не отказ от команды, а «этой границы нет»: подрезать
+        /// можно и только сверху, и только снизу.
+        /// </summary>
+        private static bool AskProfile(Editor ed, string message, out ObjectId profileId)
+        {
+            profileId = ObjectId.Null;
+
+            var opts = new PromptEntityOptions(message + " ");
+            opts.SetRejectMessage("\nНужен профиль (Profile).");
+            opts.AddAllowedClass(typeof(Profile), true);
+            opts.Keywords.Add("Skip", "Пропустить", "Пропустить");
+            opts.AllowNone = true;
+            opts.AppendKeywordsToMessage = true;
+
+            PromptEntityResult res = ed.GetEntity(opts);
+
+            // Пустой ввод и ключевое слово означают одно и то же — профиля нет.
+            if (res.Status == PromptStatus.None) return true;
+            if (res.Status == PromptStatus.Keyword) return true;
+            if (res.Status != PromptStatus.OK) return false;
+
+            profileId = res.ObjectId;
+            return true;
+        }
+
+        private static Profile OpenProfile(Transaction tr, ObjectId id)
+        {
+            if (id.IsNull) return null;
+
+            try
+            {
+                return tr.GetObject(id, OpenMode.ForRead) as Profile;
+            }
+            catch (System.Exception)
+            {
+                return null;
+            }
         }
 
         // =================================================================
