@@ -73,7 +73,7 @@ namespace Civil3D_commands.AssociativeBreaks
         /// вид объектов: заведи их отдельным классом, и пришлось бы дублировать
         /// и оверрул ручек, и реактор, и кламп по соседям.
         ///
-        /// Идемпотентна: зовётся из мастера, из RW_EDITLINKS и из RW_REFRESHBREAKS,
+        /// Идемпотентна: зовётся из мастера, из RW_EDITMODE и из RW_REFRESHBREAKS,
         /// потому что чертежи прежних версий концевых границ не содержат.
         /// </summary>
         public int EnsureTerminals(BreakLink link)
@@ -187,7 +187,7 @@ namespace Civil3D_commands.AssociativeBreaks
                 // У концевой границы поглощать нечего: она не разделяет пару
                 // областей, а держит внешний край крайней. Стирается только сам
                 // маркер с прокси — край коридора остаётся там, где стоял,
-                // а RW_EDITLINKS заведёт границу заново.
+                // а RW_EDITMODE заведёт границу заново.
                 Baseline bl = _session.GetBaseline(tr, m);
                 if (!m.IsTerminal && bl != null &&
                     ProfileGeometryOps.RemoveBreak(bl, m, out Guid removed, out Guid surviving))
@@ -251,6 +251,60 @@ namespace Civil3D_commands.AssociativeBreaks
             }
             _session.Store.SaveToDatabase(Doc.Database);
             _session.SaveLinks();
+        }
+
+        /// <summary>
+        /// Назначить конструкцию одному участку коридора — тому, чей Guid
+        /// прочитан с заливки в виде профиля.
+        ///
+        /// Отдельно от <see cref="ApplyProperties(Guid,bool,double,double,ObjectId,ObjectId)"/>
+        /// потому, что там участок задаётся косвенно — «слева и справа от разрыва»,
+        /// — и до крайних участков так не добраться иначе как через концевую
+        /// границу. Здесь участок называется прямо, и разрыв для этого не нужен.
+        ///
+        /// Возвращает false, если области с таким Guid у базовой линии больше нет:
+        /// оформление могло устареть, а перестраивать его молча под чужой
+        /// конструкцией нельзя.
+        /// </summary>
+        public bool SetRegionAssembly(BreakLink link, Guid regionId, ObjectId assemblyId)
+        {
+            if (link == null || regionId == Guid.Empty || assemblyId.IsNull) return false;
+
+            bool done = false;
+
+            using (Doc.LockDocument())
+            using (_session.Suspend())
+            using (var tr = Doc.Database.TransactionManager.StartTransaction())
+            {
+                BreakOverlay.Unlock(tr, Doc.Database);
+
+                Baseline bl = _session.GetBaseline(tr, link);
+                if (bl != null)
+                {
+                    foreach (BaselineRegion r in bl.BaselineRegions)
+                    {
+                        if (r.RegionGUID != regionId) continue;
+                        r.AssemblyId = assemblyId;
+                        done = true;
+                        break;
+                    }
+                }
+
+                if (done)
+                {
+                    Corridor corridor = _session.GetCorridor(tr, link);
+                    corridor?.Rebuild();
+
+                    // Имя конструкции подписано на границах участка — оформление
+                    // устарело ровно сейчас.
+                    RefreshOverlay(tr, link);
+                }
+
+                tr.Commit();
+            }
+
+            if (done) _session.SaveLinks();
+            return done;
         }
 
         /// <summary>

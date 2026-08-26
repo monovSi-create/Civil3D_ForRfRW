@@ -152,12 +152,12 @@ namespace Civil3D_commands.AssociativeBreaks
             }
             else
             {
-                var corrOpt = new PromptEntityOptions("\nВыберите существующий коридор");
-                corrOpt.SetRejectMessage("\nНужен коридор");
-                corrOpt.AddAllowedClass(typeof(Corridor), true);
-                var corrRes = ed.GetEntity(corrOpt);
-                if (corrRes.Status != PromptStatus.OK) return;
-                existingCorrId = corrRes.ObjectId;
+                // Список, а не указание мышью: коридор — объект во весь план,
+                // ткнуть в него надо попасть по звену, а два коридора рядом
+                // ещё и перекрывают друг друга. По имени же он выбирается
+                // однозначно, и видно сразу все, какие есть в чертеже.
+                existingCorrId = PickCorridorFromList(ed, db, civDoc);
+                if (existingCorrId.IsNull) return;
 
                 // У существующего коридора базовая линия уже построена по своему
                 // профилю — берём его, вместо того чтобы городить второй.
@@ -220,31 +220,12 @@ namespace Civil3D_commands.AssociativeBreaks
                 else return;
             }
 
-            // 5) Конструкция (Assembly) — только при создании нового коридора
+            // 5) Конструкция (Assembly) — только при создании нового коридора.
+            //    Тоже списком: конструкции стоят в стороне от плана, и найти
+            //    нужную взглядом среди десятка похожих труднее, чем по имени.
             ObjectId assemblyId = ObjectId.Null;
             if (createNew)
-            {
-                var asmKw = new PromptKeywordOptions(
-                    "\nЗадать конструкцию (Assembly) коридора?");
-                asmKw.Keywords.Add("Yes", "Да", "Да");
-                asmKw.Keywords.Add("No", "Нет", "Нет");
-                // Default — ГЛОБАЛЬНОЕ имя. Русское здесь бросает eInvalidInput
-                // («значение не попадает в ожидаемый диапазон») ещё до показа
-                // запроса, и команда обрывается молча.
-                asmKw.Keywords.Default = "No";
-                var asmKwRes = ed.GetKeywords(asmKw);
-                if (asmKwRes.Status != PromptStatus.OK) return;
-
-                if (asmKwRes.StringResult == "Yes")
-                {
-                    var asmOpt = new PromptEntityOptions("\nВыберите конструкцию (Assembly)");
-                    asmOpt.SetRejectMessage("\nНужна Assembly");
-                    asmOpt.AddAllowedClass(typeof(Assembly), true);
-                    var asmRes = ed.GetEntity(asmOpt);
-                    if (asmRes.Status != PromptStatus.OK) return;
-                    assemblyId = asmRes.ObjectId;
-                }
-            }
+                assemblyId = PickAssemblyFromList(ed, db, civDoc, "коридора", true);
 
             // ------------------------------------------------------------------
             // Создаём профиль, коридор (если нужно), базовую линию
@@ -298,6 +279,10 @@ namespace Civil3D_commands.AssociativeBreaks
                     profile.PVIs.AddPVI(alStart, baseElevation);
                     profile.PVIs.AddPVI(alEnd,   baseElevation);
                     profHandle = profile.Handle;
+
+                    // Созданный профиль обязан быть ВИДЕН в виде, иначе им
+                    // нельзя пользоваться: границы разрывов ставятся по нему.
+                    EnsureProfileVisible(tr, db, ed, pvRes.ObjectId, profile, baseElevation);
                 }
 
                 // --- Свойство режима редактирования ---
@@ -381,52 +366,94 @@ namespace Civil3D_commands.AssociativeBreaks
             session.Manager.EnsureTerminals(session.ActiveLink);
             session.RefreshOverlay();
 
+            // Новый профиль появляется в уже нарисованном виде только после
+            // перерисовки: сам вид о добавленном профиле не узнаёт, пока его
+            // не перестроят. Без этого мастер заканчивался пустым видом,
+            // и профиль «пропадал» до первого ручного REGEN.
+            ed.Regen();
+
             ed.WriteMessage(
                 $"\nГотово, связь «{session.ActiveLink.Label}» создана." +
-                "\nВыбрать связь и включить редактирование: RW_EDITLINKS");
+                "\nВыбрать связь и включить редактирование: RW_EDITMODE");
+        }
+
+        /// <summary>
+        /// Убедиться, что только что созданный профиль будет виден в этом виде,
+        /// и назвать помеху, если убрать её мы не вправе.
+        ///
+        /// Причин невидимости ровно три, и разделяются они здесь:
+        ///  • вид показывает заданный вручную диапазон отметок, а профиль лёг
+        ///    выше или ниже — диапазон расширяем, это ровно то, чего хотел
+        ///    пользователь (при автоматическом режиме Civil расширит сам);
+        ///  • стиль профиля не рисует линию — стиль чужой, менять его молча
+        ///    нельзя, поэтому печатаем имя: подмену видно сразу;
+        ///  • слой профиля выключен или заморожен — тоже сообщаем.
+        /// </summary>
+        private static void EnsureProfileVisible(Transaction tr, Database db, Editor ed,
+                                                 ObjectId profileViewId, Profile profile,
+                                                 double elevation)
+        {
+            try
+            {
+                ed.WriteMessage(
+                    $"\nПрофиль «{profile.Name}» создан на отметке {elevation:F3}," +
+                    $" стиль «{profile.StyleName}», слой «{profile.Layer}».");
+
+                var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+                if (lt.Has(profile.Layer))
+                {
+                    var ltr = (LayerTableRecord)tr.GetObject(lt[profile.Layer], OpenMode.ForRead);
+                    if (ltr.IsOff || ltr.IsFrozen)
+                        ed.WriteMessage(
+                            $"\nСлой «{profile.Layer}» {(ltr.IsOff ? "выключен" : "заморожен")}" +
+                            " — профиль на нём не показывается.");
+                }
+
+                var pv = (ProfileView)tr.GetObject(profileViewId, OpenMode.ForRead);
+
+                // При автоматическом диапазоне Civil подгонит вид под профиль сам.
+                if (pv.ElevationRangeMode != ElevationRangeType.UserSpecified) return;
+                if (elevation >= pv.ElevationMin && elevation <= pv.ElevationMax) return;
+
+                // Запас в десятую диапазона: профиль ровно по краю сетки
+                // совпадает с рамкой вида и читается как её часть.
+                double margin = Math.Max((pv.ElevationMax - pv.ElevationMin) * 0.1, 1.0);
+
+                pv.UpgradeOpen();
+                if (elevation < pv.ElevationMin) pv.ElevationMin = elevation - margin;
+                if (elevation > pv.ElevationMax) pv.ElevationMax = elevation + margin;
+
+                ed.WriteMessage(
+                    $"\nОтметка {elevation:F3} лежала вне показываемого диапазона вида —" +
+                    $" диапазон расширен до {pv.ElevationMin:F3}..{pv.ElevationMax:F3}.");
+            }
+            catch (System.Exception ex)
+            {
+                // Видимость — не механика связи: не вышло проверить, скажем об этом.
+                ed.WriteMessage($"\nПроверить видимость профиля не удалось: {ex.Message}");
+            }
         }
 
         // ------------------------------------------------------------------
-        //  РЕЖИМ РЕДАКТИРОВАНИЯ (если переключатель в палитре не читается реактором)
+        //  РЕЖИМ РЕДАКТИРОВАНИЯ — ЕДИНСТВЕННЫЙ ВХОД
+        //
+        //  Прежде правка была рассыпана по четырём командам: RW_EDITMODE
+        //  включала режим, RW_EDITLINKS выбирала связь, RW_EDITBREAK правила
+        //  свойства разрыва, RW_MOVEBREAK его переносила. Помнить четыре имени
+        //  ради одной задачи — лишняя работа для пользователя, а перебирать их
+        //  в списке команд Civil тем более.
+        //
+        //  Теперь вход один: RW_EDITMODE открывает связь и держит меню, пока
+        //  пользователь не выйдет. Прежние команды никуда не делись — они
+        //  стали ветками этого меню (см. *Core-методы) и в любой момент могут
+        //  снова получить свои [CommandMethod], если понадобятся на кнопках.
+        //  Именно поэтому их тела вынесены отдельно, а не влиты в меню.
         // ------------------------------------------------------------------
         [CommandMethod("RW_EDITMODE")]
-        public void ToggleEditMode()
-        {
-            var doc = AcAp.DocumentManager.MdiActiveDocument;
-            var session = BreakSession.Current;
-            var link = session?.ActiveLink;
-            if (link == null)
-            {
-                doc.Editor.WriteMessage(session != null && session.Links.Count > 1
-                    ? "\nСвязей в чертеже несколько — выберите нужную: RW_EDITLINKS"
-                    : "\nСначала RW_LINKPROFILECORRIDOR");
-                return;
-            }
-
-            bool now = !session.IsEditMode(link.ProfileHandle);
-            session.SetEditMode(link.ProfileHandle, now);
-            doc.Editor.WriteMessage(
-                $"\nСвязь «{link.Label}», режим редактирования: {(now ? "ВКЛ" : "ВЫКЛ")}" +
-                " (сохранён в чертеже, переживёт перезапуск)");
-            doc.Editor.Regen();
-        }
-
-        // ------------------------------------------------------------------
-        //  РЕДАКТИРОВАНИЕ СВЯЗЕЙ: ВЫБОР КОНТРОЛЛЕРА
-        //
-        //  Связей в чертеже может быть много, и командной строкой их не
-        //  различить — «профиль такой-то» пользователю ничего не говорит.
-        //  Поэтому у каждой связи есть контроллер: вставка рядом с видом
-        //  профиля с подписью «коридор-профиль» и своим цветом. Выбрали
-        //  контроллер — эта связь стала активной и открылась для правки:
-        //  границы участков разблокировались, появились заливки и надписи.
-        // ------------------------------------------------------------------
-        [CommandMethod("RW_EDITLINKS")]
-        public void EditLinks()
+        public void EditMode()
         {
             var doc = AcAp.DocumentManager.MdiActiveDocument;
             var ed = doc.Editor;
-            var db = doc.Database;
             var session = BreakSession.Current;
 
             if (session == null) { ed.WriteMessage("\nСессии нет."); return; }
@@ -454,28 +481,107 @@ namespace Civil3D_commands.AssociativeBreaks
                 ed.WriteMessage(
                     $"\n  {l.Label}{(session.IsEditMode(l.ProfileHandle) ? "  [правится]" : string.Empty)}");
 
+            // Связь одна — открываем её сразу; несколько — сперва выбор
+            // контроллера, иначе непонятно, чьи границы разблокированы.
+            if (session.ActiveLink == null && !PickLink(doc, session)) return;
+            Activate(session, session.ActiveLink);
+            ed.Regen();
+
+            Menu(doc, session);
+        }
+
+        /// <summary>
+        /// Меню режима. Крутится, пока пользователь не выйдет: за один заход
+        /// обычно правят несколько границ подряд, и выходить в командную строку
+        /// после каждой — те же четыре команды, только сбоку.
+        /// </summary>
+        private static void Menu(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
+
+            while (true)
+            {
+                BreakLink link = session.ActiveLink;
+                if (link == null) return;
+
+                var kw = new PromptKeywordOptions(
+                    $"\n[{link.Label}] Что правим? (Esc — выйти, режим останется включённым)");
+
+                // Латиницей ТОЛЬКО глобальное имя: второй и третий параметры
+                // обязаны быть тем самым русским словом, которое показано.
+                // Первые буквы у всех пяти разные — иначе AutoCAD не разберёт,
+                // что набрано.
+                kw.Keywords.Add("Links",    "Связь",      "Связь");
+                kw.Keywords.Add("Break",    "Разрыв",     "Разрыв");
+                kw.Keywords.Add("Move",     "Перенести",  "Перенести");
+                kw.Keywords.Add("Assembly", "Конструкция", "Конструкция");
+                kw.Keywords.Add("Off",      "Выключить",  "Выключить");
+                kw.Keywords.Default = "Break";   // глобальное имя, не подпись
+
+                PromptResult res = ed.GetKeywords(kw);
+                if (res.Status != PromptStatus.OK) return;
+
+                switch (res.StringResult)
+                {
+                    case "Links":
+                        if (PickLink(doc, session))
+                        {
+                            Activate(session, session.ActiveLink);
+                            ed.Regen();
+                        }
+                        break;
+
+                    case "Break":
+                        using (new BoundaryUnlock(doc, session)) EditBreakCore(doc, session);
+                        break;
+
+                    case "Move":
+                        using (new BoundaryUnlock(doc, session)) MoveBreakCore(doc, session);
+                        break;
+
+                    case "Assembly":
+                        using (new BoundaryUnlock(doc, session)) ChangeRegionAssemblyCore(doc, session);
+                        break;
+
+                    case "Off":
+                        TurnOffAll(session);
+                        ed.WriteMessage(
+                            "\nРедактирование выключено у всех связей." +
+                            "\nВидны границы участков и имена конструкций; границы заблокированы.");
+                        ed.Regen();
+                        return;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        //  ВЫБОР СВЯЗИ ПО КОНТРОЛЛЕРУ
+        //
+        //  Связей в чертеже может быть много, и командной строкой их не
+        //  различить — «профиль такой-то» пользователю ничего не говорит.
+        //  Поэтому у каждой связи есть контроллер: вставка рядом с видом
+        //  профиля с подписью «коридор-профиль» и своим цветом.
+        // ------------------------------------------------------------------
+        private static bool PickLink(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
+            var db = doc.Database;
+
+            // Связь одна — выбирать не из чего, и требовать щелчка незачем.
+            if (session.Links.Count == 1)
+            {
+                session.ActiveLink = session.Links[0];
+                ed.WriteMessage($"\nСвязь в чертеже одна: «{session.ActiveLink.Label}».");
+                return true;
+            }
+
             var opt = new PromptEntityOptions(
                 "\nВыберите контроллер связи (вставка с подписью «коридор-профиль»)");
             opt.SetRejectMessage("\nНужен контроллер связи");
             opt.AddAllowedClass(typeof(BlockReference), false);
-            // Латиницей только глобальное имя: второй и третий параметры обязаны
-            // быть тем самым русским словом, которое показано пользователю.
-            opt.Keywords.Add("Off", "Выключить", "Выключить");
-            opt.AppendKeywordsToMessage = true;
 
             var res = ed.GetEntity(opt);
-
-            if (res.Status == PromptStatus.Keyword && res.StringResult == "Off")
-            {
-                TurnOffAll(session);
-                ed.WriteMessage(
-                    "\nРедактирование выключено у всех связей." +
-                    "\nВидны границы участков и имена конструкций; границы заблокированы.");
-                ed.Regen();
-                return;
-            }
-
-            if (res.Status != PromptStatus.OK) return;
+            if (res.Status != PromptStatus.OK) return false;
 
             BreakLink link = FindLinkByController(session, db, res.ObjectId);
             if (link == null)
@@ -483,24 +589,30 @@ namespace Civil3D_commands.AssociativeBreaks
                 ed.WriteMessage(
                     "\nЭта вставка в модели не числится контроллером связи." +
                     "\nЕсли это копия контроллера — удалите её: копия ничем не управляет.");
-                return;
+                return false;
             }
 
-            // Правится всегда одна связь: слои общие на чертёж, и держать
-            // разблокированными границы сразу нескольких коридоров значит
-            // потерять саму защиту от случайного смещения.
+            session.ActiveLink = link;
+            return true;
+        }
+
+        /// <summary>
+        /// Открыть связь для правки, закрыв остальные.
+        ///
+        /// Правится всегда одна: слои оформления общие на чертёж, и держать
+        /// разблокированными границы сразу нескольких коридоров значит потерять
+        /// саму защиту от случайного смещения.
+        /// </summary>
+        private static void Activate(BreakSession session, BreakLink link)
+        {
+            if (link == null) return;
+
             foreach (BreakLink other in session.Links.ToList())
                 if (other != link && session.IsEditMode(other.ProfileHandle))
                     session.SetEditMode(other.ProfileHandle, false);
 
-            session.ActiveLink = link;
-            session.SetEditMode(link.ProfileHandle, true);
-
-            ed.WriteMessage(
-                $"\nСвязь «{link.Label}» открыта для правки: границы разблокированы," +
-                " показаны участки и подписи." +
-                "\nВыключить: RW_EDITMODE или RW_EDITLINKS → Выключить.");
-            ed.Regen();
+            if (!session.IsEditMode(link.ProfileHandle))
+                session.SetEditMode(link.ProfileHandle, true);
         }
 
         /// <summary>
@@ -597,7 +709,7 @@ namespace Civil3D_commands.AssociativeBreaks
             {
                 // Активной связи нет по двум разным причинам, и советы у них разные.
                 ed.WriteMessage(session != null && session.Links.Count > 1
-                    ? "\nСвязей в чертеже несколько — выберите нужную: RW_EDITLINKS"
+                    ? "\nСвязей в чертеже несколько — выберите нужную: RW_EDITMODE"
                     : "\nСначала RW_LINKPROFILECORRIDOR");
                 return;
             }
@@ -722,7 +834,7 @@ namespace Civil3D_commands.AssociativeBreaks
 
             ed.WriteMessage(
                 $"\nРазрыв создан на пикете {station:F3}, микроразрыв {marker.Gap:F4}." +
-                "\nИзменить свойства: RW_EDITBREAK.");
+                "\nИзменить свойства: RW_EDITMODE, ветка «Разрыв».");
         }
 
         // ------------------------------------------------------------------
@@ -795,17 +907,11 @@ namespace Civil3D_commands.AssociativeBreaks
         //  показывается будущая граница — отрезок от курсора до его проекции
         //  на ось. Проекция идёт по нормали, поэтому отрезок перпендикулярен
         //  оси сам собой, а его конец скользит по ней.
+        //
+        //  Своей команды больше нет: ветка «Перенести» в RW_EDITMODE. Тело
+        //  осталось отдельным методом ровно затем, чтобы вернуть команду
+        //  можно было одной строкой [CommandMethod].
         // ------------------------------------------------------------------
-        [CommandMethod("RW_MOVEBREAK")]
-        public void MoveBreak()
-        {
-            var doc = AcAp.DocumentManager.MdiActiveDocument;
-            var session = BreakSession.Current;
-            if (session == null) return;
-
-            using (new BoundaryUnlock(doc, session)) MoveBreakCore(doc, session);
-        }
-
         private static void MoveBreakCore(Document doc, BreakSession session)
         {
             var ed = doc.Editor;
@@ -1040,17 +1146,8 @@ namespace Civil3D_commands.AssociativeBreaks
         // ------------------------------------------------------------------
         //  ИЗМЕНИТЬ СВОЙСТВА РАЗРЫВА
         //  До этого свойства задавались только при создании и потом не менялись.
+        //  Своей команды больше нет: ветка «Разрыв» в RW_EDITMODE.
         // ------------------------------------------------------------------
-        [CommandMethod("RW_EDITBREAK")]
-        public void EditBreak()
-        {
-            var doc = AcAp.DocumentManager.MdiActiveDocument;
-            var session = BreakSession.Current;
-            if (session == null) return;
-
-            using (new BoundaryUnlock(doc, session)) EditBreakCore(doc, session);
-        }
-
         private static void EditBreakCore(Document doc, BreakSession session)
         {
             var ed = doc.Editor;
@@ -1120,15 +1217,25 @@ namespace Civil3D_commands.AssociativeBreaks
             // Конструкции соседних участков. «Предыдущий» и «следующий» —
             // по ходу пикетажа, то есть те же левый и правый, что у границы.
             string leftName, rightName;
+            string leftAsmName, rightAsmName;
+
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
                 Baseline bl = session.GetBaseline(tr, m);
                 ProfileGeometryOps.DescribeRegions(bl, m, out leftName, out rightName);
+
+                // Нынешние конструкции — чтобы окно подсветило то, что стоит
+                // сейчас: подтвердить прежнее должно быть так же легко,
+                // как выбрать другое.
+                leftAsmName = AssemblyNameOf(tr, bl, m.LeftRegionId);
+                rightAsmName = AssemblyNameOf(tr, bl, m.RightRegionId);
                 tr.Commit();
             }
 
-            ObjectId leftAsm = AskAssembly(ed, $"предыдущего участка «{leftName}»");
-            ObjectId rightAsm = AskAssembly(ed, $"следующего участка «{rightName}»");
+            ObjectId leftAsm = AskAssembly(
+                doc, $"предыдущего участка «{leftName}»", leftAsmName);
+            ObjectId rightAsm = AskAssembly(
+                doc, $"следующего участка «{rightName}»", rightAsmName);
 
             session.Manager.ApplyProperties(m.Id, isStep, stepH, gap, leftAsm, rightAsm);
             ed.WriteMessage("\nСвойства разрыва изменены, коридор перестроен.");
@@ -1137,7 +1244,7 @@ namespace Civil3D_commands.AssociativeBreaks
         /// <summary>
         /// Правка концевой границы коридора. Менять здесь можно ровно одно —
         /// конструкцию того единственного участка, который к ней примыкает.
-        /// Пикет правится ручкой или RW_MOVEBREAK, как и у разрыва.
+        /// Пикет правится ручкой или веткой «Перенести», как и у разрыва.
         /// </summary>
         private static void EditTerminalCore(Document doc, BreakSession session, StationMarker m)
         {
@@ -1145,21 +1252,27 @@ namespace Civil3D_commands.AssociativeBreaks
             bool isStart = m.Role == StationMarker.MarkerRole.Start;
 
             string regionName;
+            string assemblyName;
+
             using (var tr = doc.Database.TransactionManager.StartTransaction())
             {
                 Baseline bl = session.GetBaseline(tr, m);
                 string left, right;
                 ProfileGeometryOps.DescribeRegions(bl, m, out left, out right);
                 regionName = isStart ? right : left;
+
+                assemblyName = AssemblyNameOf(
+                    tr, bl, isStart ? m.RightRegionId : m.LeftRegionId);
                 tr.Commit();
             }
 
             ed.WriteMessage(
                 $"\n{(isStart ? "Начало" : "Конец")} коридора на пикете {m.Station:F3}" +
                 $" ({BreakOverlay.FormatStation(m.Station)}), участок «{regionName}»." +
-                "\nСтупени и микроразрыва у конца коридора нет; пикет правится ручкой или RW_MOVEBREAK.");
+                "\nСтупени и микроразрыва у конца коридора нет;" +
+                " пикет правится ручкой или веткой «Перенести».");
 
-            ObjectId assembly = AskAssembly(ed, $"участка «{regionName}»");
+            ObjectId assembly = AskAssembly(doc, $"участка «{regionName}»", assemblyName);
             if (assembly.IsNull) { ed.WriteMessage("\nНичего не изменено."); return; }
 
             // Конструкция назначается той стороне, с которой участок и лежит.
@@ -1169,6 +1282,119 @@ namespace Civil3D_commands.AssociativeBreaks
                 isStart ? assembly : ObjectId.Null);
 
             ed.WriteMessage("\nКонструкция участка изменена, коридор перестроен.");
+        }
+
+        // ------------------------------------------------------------------
+        //  КОНСТРУКЦИЯ НА УЧАСТКЕ
+        //
+        //  Участок выбирается щелчком по СВОЕЙ ЗАЛИВКЕ — тому единственному,
+        //  что у области коридора есть в виде профиля. Через разрыв до участка
+        //  тоже можно добраться («слева» и «справа» в ветке «Разрыв»), но там
+        //  он называется косвенно, и крайние участки достаются только через
+        //  концевую границу. Здесь пользователь показывает пальцем ровно ту
+        //  полосу, которую видит.
+        //
+        //  Guid области записан в XData самой заливки: у области нет своей
+        //  геометрии в виде, а координаты полосы уезжают при каждом переносе
+        //  границы — искать «по пикету» значило бы промахиваться.
+        // ------------------------------------------------------------------
+        private static void ChangeRegionAssemblyCore(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
+            var db = doc.Database;
+
+            BreakLink active = session.ActiveLink;
+            if (active == null) { ed.WriteMessage("\nАктивной связи нет."); return; }
+
+            var opt = new PromptEntityOptions(
+                "\nУкажите заливку участка, которому меняем конструкцию");
+            opt.SetRejectMessage("\nНужна заливка участка (цветная полоса в виде профиля)");
+            opt.AddAllowedClass(typeof(Hatch), true);
+
+            var res = ed.GetEntity(opt);
+            if (res.Status != PromptStatus.OK) return;
+
+            Guid? linkId = null;
+            Guid? regionId = null;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                // Entity есть и в AutoCAD, и в Civil — здесь нужна автокадовская.
+                var ent = tr.GetObject(res.ObjectId, OpenMode.ForRead)
+                          as Autodesk.AutoCAD.DatabaseServices.Entity;
+                if (ent != null)
+                {
+                    linkId = BreakOverlay.GetOverlayLinkId(ent);
+                    regionId = BreakOverlay.GetOverlayRegionId(ent);
+                }
+                tr.Commit();
+            }
+
+            if (linkId == null || regionId == null)
+            {
+                ed.WriteMessage(
+                    "\nЭта штриховка не заливка участка." +
+                    "\nЕсли полосы рисовались прежней версией, они ещё без метки участка:" +
+                    " перестройте оформление командой RW_REFRESHBREAKS.");
+                return;
+            }
+
+            // Владение — по хэндлу из модели, а не по Guid из XData: у КОПИИ
+            // заливки Guid ровно тот же, и копия правила бы настоящий участок.
+            BreakLink owner = session.FindLink(linkId.Value);
+            if (owner == null || !owner.OverlayHandles.Contains(res.ObjectId.Handle))
+            {
+                ed.WriteMessage(
+                    "\nЭта заливка в модели не числится — похоже, копия." +
+                    " Удалите её: копия ничем не управляет.");
+                return;
+            }
+
+            // Заливка чужой связи — правим ту связь, которой полоса принадлежит:
+            // пользователь ткнул именно в неё, и подменять участок молча нельзя.
+            if (owner != active)
+                ed.WriteMessage($"\nЭта полоса принадлежит связи «{owner.Label}» — правим её.");
+
+            string regionName = null;
+            string currentAssembly = null;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                Baseline bl = session.GetBaseline(tr, owner);
+                if (bl != null)
+                {
+                    foreach (BaselineRegion r in bl.BaselineRegions)
+                    {
+                        if (r.RegionGUID != regionId.Value) continue;
+
+                        regionName = r.Name;
+                        currentAssembly = AssemblyNameOf(tr, bl, regionId.Value);
+                        break;
+                    }
+                }
+                tr.Commit();
+            }
+
+            if (regionName == null)
+            {
+                ed.WriteMessage(
+                    "\nУчастка с таким номером у коридора больше нет — оформление устарело." +
+                    "\nПерестройте его командой RW_REFRESHBREAKS и повторите.");
+                return;
+            }
+
+            ed.WriteMessage(
+                $"\nУчасток «{regionName}», сейчас конструкция «{currentAssembly ?? "—"}».");
+
+            ObjectId assembly = AskAssembly(
+                doc, $"участка «{regionName}»", currentAssembly);
+            if (assembly.IsNull) { ed.WriteMessage("\nНичего не изменено."); return; }
+
+            if (session.Manager.SetRegionAssembly(owner, regionId.Value, assembly))
+                ed.WriteMessage(
+                    $"\nУчастку «{regionName}» назначена конструкция, коридор перестроен.");
+            else
+                ed.WriteMessage("\nНазначить конструкцию не удалось: участок не найден.");
         }
 
         // ------------------------------------------------------------------
@@ -1275,7 +1501,7 @@ namespace Civil3D_commands.AssociativeBreaks
                     $"\nсвязь «{l.Label}»{(active ? "  [активная]" : string.Empty)}" +
                     $"\n    профиль {l.ProfileHandle}, вид {l.ProfileViewHandle}, " +
                     $"ось {l.AlignmentHandle}, коридор {l.CorridorHandle}" +
-                    $"\n    контроллер: {(ctrl.IsNull ? "НЕТ (RW_EDITLINKS создаст)" : ctrl.Handle.ToString())}" +
+                    $"\n    контроллер: {(ctrl.IsNull ? "НЕТ (RW_EDITMODE создаст)" : ctrl.Handle.ToString())}" +
                     $", цвет {BreakController.ColorOf(l)}, оформление: {l.OverlayHandles.Count} об." +
                     $"\n    режим редактирования: {(session.IsEditMode(l.ProfileHandle) ? "ВКЛ" : "ВЫКЛ")}");
             }
@@ -1306,7 +1532,41 @@ namespace Civil3D_commands.AssociativeBreaks
 
                         ed.WriteMessage(
                             $"\nвид: отметки {pv.ElevationMin:F3}..{pv.ElevationMax:F3}" +
-                            $" (диапазон {pv.ElevationMax - pv.ElevationMin:F3}), габарит по Y {extents}");
+                            $" (диапазон {pv.ElevationMax - pv.ElevationMin:F3}), габарит по Y {extents}" +
+                            $"\n     диапазон отметок задан {(pv.ElevationRangeMode == ElevationRangeType.UserSpecified ? "вручную" : "автоматически")}" +
+                            $", пикеты {(pv.StationRangeMode == StationRangeType.UserSpecified ? "вручную" : "автоматически")}" +
+                            $" {pv.StationStart:F3}..{pv.StationEnd:F3}");
+                    }
+
+                    // Почему профиль может быть не виден в своём же виде: стиль
+                    // не рисует линию, слой погашен, отметки вне показываемого
+                    // диапазона, пикеты профиля вне пикетов вида. Все четыре
+                    // ответа — здесь, иначе разбирать это можно только вслепую.
+                    var prof = RwHandles.Open<Profile>(
+                        tr, doc.Database, link.ProfileHandle, OpenMode.ForRead);
+
+                    if (prof == null)
+                        ed.WriteMessage("\nпрофиль связи не открылся (стёрт?)");
+                    else
+                    {
+                        string layerState = "?";
+                        try
+                        {
+                            var lt = (LayerTable)tr.GetObject(doc.Database.LayerTableId, OpenMode.ForRead);
+                            if (lt.Has(prof.Layer))
+                            {
+                                var ltr = (LayerTableRecord)tr.GetObject(lt[prof.Layer], OpenMode.ForRead);
+                                layerState = ltr.IsOff ? "ВЫКЛЮЧЕН"
+                                           : ltr.IsFrozen ? "ЗАМОРОЖЕН"
+                                           : "виден";
+                            }
+                        }
+                        catch (System.Exception) { }
+
+                        ed.WriteMessage(
+                            $"\nпрофиль «{prof.Name}»: стиль «{prof.StyleName}», слой «{prof.Layer}» ({layerState})" +
+                            $", пикеты {prof.StartingStation:F3}..{prof.EndingStation:F3}" +
+                            $", отметки {prof.ElevationMin:F3}..{prof.ElevationMax:F3}");
                     }
                 }
 
@@ -1404,25 +1664,174 @@ namespace Civil3D_commands.AssociativeBreaks
             g == Guid.Empty ? "—" : g.ToString("N").Substring(0, 8);
 
         /// <summary>
-        /// Спросить конструкцию участка. «Нет» означает «оставить как есть» —
-        /// в 99 случаях из 100 менять надо одну сторону, а не обе.
+        /// Имя конструкции, назначенной области. null — области нет,
+        /// конструкции нет или она удалена: всё это для окна выбора одно
+        /// и то же — «подсвечивать нечего».
         /// </summary>
-        private static ObjectId AskAssembly(Editor ed, string what)
+        private static string AssemblyNameOf(Transaction tr, Baseline baseline, Guid regionId)
         {
-            var kw = new PromptKeywordOptions($"\nМенять конструкцию {what}?");
-            kw.Keywords.Add("Yes", "Да", "Да");
-            kw.Keywords.Add("No", "Нет", "Нет");
-            kw.Keywords.Default = "No";   // глобальное имя
+            if (baseline == null || regionId == Guid.Empty) return null;
 
-            var res = ed.GetKeywords(kw);
-            if (res.Status != PromptStatus.OK || res.StringResult != "Yes") return ObjectId.Null;
+            try
+            {
+                foreach (BaselineRegion r in baseline.BaselineRegions)
+                {
+                    if (r.RegionGUID != regionId) continue;
 
-            var opt = new PromptEntityOptions("\nВыберите конструкцию (Assembly)");
-            opt.SetRejectMessage("\nНужна Assembly");
-            opt.AddAllowedClass(typeof(Assembly), true);
+                    var asm = tr.GetObject(r.AssemblyId, OpenMode.ForRead) as Assembly;
+                    return asm?.Name;
+                }
+            }
+            catch (System.Exception) { }
 
-            var entRes = ed.GetEntity(opt);
-            return entRes.Status == PromptStatus.OK ? entRes.ObjectId : ObjectId.Null;
+            return null;
+        }
+
+        /// <summary>
+        /// Спросить конструкцию участка окном со списком. ObjectId.Null означает
+        /// «оставить как есть» — в 99 случаях из 100 менять надо одну сторону,
+        /// а не обе, и отказ должен быть в одно движение (Отмена или Esc).
+        ///
+        /// Путь сюда был долгим: сначала «Да/Нет» плюс указание конструкции
+        /// мышью в чертеже, потом нумерованный список в командной строке,
+        /// теперь окно. Конструкции стоят в стороне от плана отдельной грядкой
+        /// и различаются только подписью — щёлкнуть нужную в чертеже трудно,
+        /// а набирать номер, сверяясь с напечатанным списком, долго.
+        /// </summary>
+        /// <param name="currentName">
+        /// Имя нынешней конструкции участка — подсвечивается в списке.
+        /// null, если нынешней нет или она неизвестна.
+        /// </param>
+        private static ObjectId AskAssembly(Document doc, string what, string currentName = null)
+        {
+            return PickAssemblyFromList(
+                doc.Editor, doc.Database, CivilApplication.ActiveDocument,
+                what, false, currentName);
+        }
+
+        /// <summary>
+        /// Коридор из списка имеющихся в чертеже. ObjectId.Null — отказ.
+        /// </summary>
+        private static ObjectId PickCorridorFromList(Editor ed, Database db, CivilDocument civDoc)
+        {
+            var names = new System.Collections.Generic.List<string>();
+            var ids = new System.Collections.Generic.List<ObjectId>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (ObjectId id in civDoc.CorridorCollection)
+                {
+                    var corridor = tr.GetObject(id, OpenMode.ForRead) as Corridor;
+                    if (corridor == null) continue;
+
+                    names.Add(corridor.Name);
+                    ids.Add(id);
+                }
+                tr.Commit();
+            }
+
+            if (ids.Count == 0)
+            {
+                ed.WriteMessage("\nВ чертеже нет ни одного коридора.");
+                return ObjectId.Null;
+            }
+
+            return PickFromList(ed, "Коридоры чертежа", "Номер коридора", names, ids);
+        }
+
+        /// <summary>
+        /// Конструкция из списка имеющихся в чертеже — ОКНОМ со списком имён,
+        /// выбор мышью. ObjectId.Null — отказ.
+        ///
+        /// <paramref name="optional"/> различает два смысла отказа: при создании
+        /// коридора это «строить без конструкции», при правке — «не менять».
+        /// Смысл написан в самом окне, чтобы «Отмена» ничем не удивляла.
+        /// </summary>
+        private static ObjectId PickAssemblyFromList(Editor ed, Database db, CivilDocument civDoc,
+                                                     string what, bool optional,
+                                                     string currentName = null)
+        {
+            var names = new System.Collections.Generic.List<string>();
+            var ids = new System.Collections.Generic.List<ObjectId>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (ObjectId id in civDoc.AssemblyCollection)
+                {
+                    var asm = tr.GetObject(id, OpenMode.ForRead) as Assembly;
+                    if (asm == null) continue;
+
+                    names.Add(asm.Name);
+                    ids.Add(id);
+                }
+                tr.Commit();
+            }
+
+            if (ids.Count == 0)
+            {
+                ed.WriteMessage("\nВ чертеже нет ни одной конструкции (Assembly).");
+                return ObjectId.Null;
+            }
+
+            // Имена конструкций уникальны в пределах чертежа, поэтому нынешняя
+            // находится по имени: держать ещё и её ObjectId ради подсветки
+            // значило бы протаскивать его через полкоманды.
+            int current = string.IsNullOrEmpty(currentName)
+                ? -1
+                : names.FindIndex(n => string.Equals(n, currentName, StringComparison.Ordinal));
+
+            int index = PickListDialog.Show(
+                "Конструкция коридора",
+                $"Конструкция {what}." +
+                (optional
+                    ? "\nОтмена — строить коридор без конструкции."
+                    : "\nОтмена — оставить прежнюю."),
+                names, current);
+
+            if (index < 0)
+            {
+                ed.WriteMessage(optional
+                    ? "\nКонструкция не выбрана — коридор строится без неё."
+                    : "\nКонструкция не выбрана — оставлена прежняя.");
+                return ObjectId.Null;
+            }
+
+            ed.WriteMessage($"\nКонструкция: «{names[index]}».");
+            return ids[index];
+        }
+
+        /// <summary>
+        /// Нумерованный список в командной строке: печатаем имена, спрашиваем
+        /// номер. Ноль — отказ, и он же значение по умолчанию, чтобы Enter
+        /// ничего не менял.
+        ///
+        /// Здесь окна нет намеренно: коридор выбирается ровно один раз, в самом
+        /// начале мастера, и всплывающее окно посреди цепочки запросов сбивало
+        /// бы ввод. Окно заведено только для конструкций — их перебирают часто
+        /// и помногу (см. <see cref="PickListDialog"/>).
+        /// </summary>
+        private static ObjectId PickFromList(Editor ed, string title, string prompt,
+                                             System.Collections.Generic.List<string> names,
+                                             System.Collections.Generic.List<ObjectId> ids)
+        {
+            ed.WriteMessage($"\n{title}:");
+            for (int i = 0; i < names.Count; i++)
+                ed.WriteMessage($"\n  {i + 1}. {names[i]}");
+
+            var opt = new PromptIntegerOptions($"\n{prompt} (0 — отказаться)")
+            {
+                DefaultValue = 0,
+                UseDefaultValue = true,
+                LowerLimit = 0,
+                UpperLimit = ids.Count,
+                AllowNegative = false,
+                AllowZero = true
+            };
+
+            var res = ed.GetInteger(opt);
+            if (res.Status != PromptStatus.OK || res.Value <= 0) return ObjectId.Null;
+
+            return ids[res.Value - 1];
         }
 
         private static ObjectId Resolve(Database db, Handle h) => RwHandles.Resolve(db, h);

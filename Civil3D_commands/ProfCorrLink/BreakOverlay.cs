@@ -372,7 +372,9 @@ namespace Civil3D_commands.AssociativeBreaks
                 hatch.Transparency = new Transparency(
                     (byte)(255 * (100 - FillTransparencyPercent) / 100));
 
-                Tag(tr, db, hatch, link);
+                // Метка с участком: по ней команда «Конструкция» узнаёт, какой
+                // области принадлежит полоса, в которую ткнули.
+                Tag(tr, db, hatch, link, region.Id);
                 link.OverlayHandles.Add(hatch.Handle);
 
                 // В самый низ: иначе заливка перекроет сетку и линию профиля.
@@ -707,6 +709,18 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>
+        /// Разрешённые цвета оформления: 30, 40, ... 150.
+        ///
+        /// Прежде цвет брался из всех 240 индексов, и соседние участки то и дело
+        /// получали неразличимо близкие оттенки, а часть — почти чёрные и почти
+        /// белые, невидимые на своём фоне. Шаг в десять индексов идёт по разным
+        /// секторам круга AutoCAD, поэтому любые два цвета набора различаются
+        /// на глаз, и все они читаются и на светлом, и на тёмном фоне.
+        /// </summary>
+        private static readonly short[] Palette =
+            { 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150 };
+
+        /// <summary>
         /// Цвет по Guid. Не <c>Random</c>: цвет обязан пережить перестроение
         /// и перезапуск, иначе участок каждый раз менял бы вид и запомнить его
         /// было бы нельзя. <c>Guid.GetHashCode</c> считается по байтам значения,
@@ -715,10 +729,7 @@ namespace Civil3D_commands.AssociativeBreaks
         public static short RandomColor(Guid seed)
         {
             int hash = seed.GetHashCode() & 0x7FFFFFFF;
-
-            // 1..240: дальше идут служебные оттенки серого, а 7 — цвет фона.
-            short color = (short)(1 + hash % 240);
-            return color == 7 ? (short)8 : color;
+            return Palette[hash % Palette.Length];
         }
 
         /// <summary>
@@ -823,6 +834,20 @@ namespace Civil3D_commands.AssociativeBreaks
         /// </summary>
         private static void Tag(Transaction tr, Database db, Entity entity, BreakLink link)
         {
+            Tag(tr, db, entity, link, Guid.Empty);
+        }
+
+        /// <summary>
+        /// То же плюс Guid участка коридора — им помечены заливки.
+        ///
+        /// Именно эта метка позволяет ткнуть в полосу и получить область, которой
+        /// она нарисована: другого способа связать штриховку с <c>BaselineRegion</c>
+        /// нет — у области нет своей геометрии в виде профиля, а координаты полосы
+        /// сдвигаются при каждом переносе границы.
+        /// </summary>
+        private static void Tag(Transaction tr, Database db, Entity entity,
+                                BreakLink link, Guid region)
+        {
             try
             {
                 var rat = (RegAppTable)tr.GetObject(db.RegAppTableId, OpenMode.ForRead);
@@ -834,11 +859,51 @@ namespace Civil3D_commands.AssociativeBreaks
                     tr.AddNewlyCreatedDBObject(rec, true);
                 }
 
-                entity.XData = new ResultBuffer(
+                var values = new List<TypedValue>
+                {
                     new TypedValue((int)DxfCode.ExtendedDataRegAppName, XAppName),
-                    new TypedValue((int)DxfCode.ExtendedDataAsciiString, link.Id.ToString("N")));
+                    new TypedValue((int)DxfCode.ExtendedDataAsciiString, link.Id.ToString("N"))
+                };
+
+                // Порядок значим: связь первой, участок вторым — по нему их
+                // и разбирают обратно.
+                if (region != Guid.Empty)
+                    values.Add(new TypedValue(
+                        (int)DxfCode.ExtendedDataAsciiString, region.ToString("N")));
+
+                entity.XData = new ResultBuffer(values.ToArray());
             }
             catch (System.Exception) { }
+        }
+
+        /// <summary>
+        /// Guid участка из XData заливки — вторая строка метки. null означает,
+        /// что объект не заливка: у границ и надписей записана только связь.
+        /// </summary>
+        public static Guid? GetOverlayRegionId(Entity entity)
+        {
+            if (entity == null) return null;
+
+            try
+            {
+                ResultBuffer rb = entity.GetXDataForApplication(XAppName);
+                if (rb == null) return null;
+
+                bool first = true;
+                foreach (TypedValue tv in rb)
+                {
+                    if (tv.TypeCode != (int)DxfCode.ExtendedDataAsciiString) continue;
+
+                    // Первая строка — связь, она здесь не нужна.
+                    if (first) { first = false; continue; }
+
+                    Guid g;
+                    if (Guid.TryParseExact(tv.Value.ToString(), "N", out g)) return g;
+                }
+            }
+            catch (System.Exception) { }
+
+            return null;
         }
 
         /// <summary>Guid связи из XData объекта оформления. null — объект не наш.</summary>

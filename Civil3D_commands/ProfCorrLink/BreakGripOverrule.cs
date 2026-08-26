@@ -68,7 +68,7 @@ namespace Civil3D_commands.AssociativeBreaks
             // тем, что при перетаскивании линия пропадала с экрана и правка
             // до модели не доходила: своя геометрия, поставленная в обход base,
             // видимо, оставалась на временной копии. Не повторять — для точной
-            // постановки границы есть RW_MOVEBREAK с настоящим jig.
+            // постановки границы есть ветка «Перенести» в RW_EDITMODE с настоящим jig.
             try { base.MoveGripPointsAt(entity, grips, Constrain(entity, offset), bitFlags); }
             catch { }
         }

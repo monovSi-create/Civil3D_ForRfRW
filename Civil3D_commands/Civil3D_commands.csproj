@@ -115,6 +115,7 @@
     <Compile Include="LinkingCommands.cs" />
     <Compile Include="CorridorSurfaceCreator.cs" />
     <Compile Include="ProfCorrLink\MarkerStore.cs" />
+    <Compile Include="ProfCorrLink\PickListDialog.cs" />
     <Compile Include="ProfCorrLink\ProfileGeometryOps.cs" />
     <Compile Include="ProfileToPlaneTransparent.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
