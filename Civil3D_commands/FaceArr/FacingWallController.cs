@@ -83,7 +83,7 @@ namespace Civil3D_commands.FaceArr
         // 12 — отскок ряда, таблички слева от вида профиля, разрывы в рядах.
         // Старые записи читаются: недостающее берётся по умолчанию, а
         // недостающие отрезки-ручки создаст FACINGWALLREBUILDALL.
-        private const int DataVersion = 12;
+        private const int DataVersion = 13;
 
         // =================================================================
         //  ЖИЗНЕННЫЙ ЦИКЛ
@@ -162,6 +162,7 @@ namespace Civil3D_commands.FaceArr
                         FacingWallBuilder.EraseAll(tr, row.BlockIds);
                         FacingWallBuilder.EraseAll(tr, row.ProjectionIds);
                         FacingWallProjection.EraseGripLine(tr, row);
+                        FacingWallProjection.EraseGapLines(tr, row);
                     }
                 }
 
@@ -219,6 +220,7 @@ namespace Civil3D_commands.FaceArr
 
                 FacingWallProjection.ReprojectRow(tr, db, def, row);
                 FacingWallProjection.EnsureGripLine(tr, db, controllerId, def, row);
+                FacingWallProjection.EnsureGapLines(tr, db, controllerId, def, row);
             }
 
             // Ручка массива в плане одна на все ряды — после них.
@@ -268,6 +270,7 @@ namespace Civil3D_commands.FaceArr
 
             // 4. отрезки-ручки не пересоздаются, а сдвигаются: их могут тянуть прямо сейчас
             FacingWallProjection.EnsureGripLine(tr, db, controllerId, def, row);
+            FacingWallProjection.EnsureGapLines(tr, db, controllerId, def, row);
 
             // 5. границы массива могли измениться — подтягиваем плановую ручку
             FacingWallLayoutGrip.EnsureMarkers(tr, db, controllerId, def);
@@ -535,6 +538,11 @@ namespace Civil3D_commands.FaceArr
             rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(def.RowTableId)));
             rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(def.TotalsTableId)));
 
+            // версия 13: профили подрезки. Направления раскладки здесь нет
+            // намеренно — оно уже записано порядком LayoutStart/LayoutEnd.
+            rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(def.TopProfileId)));
+            rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(def.BottomProfileId)));
+
             var rows = def.Rows ?? new List<FacingWallRowDefinition>();
             rb.Add(new TypedValue((int)DxfCode.Int32, rows.Count));
 
@@ -567,6 +575,10 @@ namespace Civil3D_commands.FaceArr
                 {
                     rb.Add(new TypedValue((int)DxfCode.Real, gap.Start));
                     rb.Add(new TypedValue((int)DxfCode.Real, gap.End));
+
+                    // версия 13: чей разрыв и чем его тянут
+                    rb.Add(new TypedValue((int)DxfCode.Int32, gap.Manual ? 1 : 0));
+                    rb.Add(new TypedValue((int)DxfCode.Text, HandleOf(gap.GripLineId)));
                 }
             }
 
@@ -672,6 +684,12 @@ namespace Civil3D_commands.FaceArr
                 def.TotalsTableId = IdOf(db, v[i++].Value.ToString());
             }
 
+            if (version >= 13)
+            {
+                def.TopProfileId = IdOf(db, v[i++].Value.ToString());
+                def.BottomProfileId = IdOf(db, v[i++].Value.ToString());
+            }
+
             int rowCount = Convert.ToInt32(v[i++].Value);
 
             for (int r = 0; r < rowCount; r++)
@@ -710,11 +728,35 @@ namespace Civil3D_commands.FaceArr
 
                     for (int k = 0; k < gapCount; k++)
                     {
-                        row.Gaps.Add(new FacingWallRowGap
+                        var gap = new FacingWallRowGap
                         {
                             Start = Convert.ToDouble(v[i++].Value),
                             End = Convert.ToDouble(v[i++].Value)
-                        });
+                        };
+
+                        if (version >= 13)
+                        {
+                            gap.Manual = Convert.ToInt32(v[i++].Value) != 0;
+                            gap.GripLineId = IdOf(db, v[i++].Value.ToString());
+                        }
+                        else
+                        {
+                            // Разрывы версии 12 ставились и руками (FACINGWALLGAP),
+                            // и расчётом по профилям, а отличить их уже нечем.
+                            // Считаем расчётными, то есть при следующем
+                            // FACINGBYPROFILE они пересчитаются заново.
+                            //
+                            // Обратное решение выглядит бережнее, но ломает
+                            // главное: объявив их ручными, мы бы сделали так,
+                            // что в уже размеченном чертеже стена НИКОГДА не
+                            // пересчитывается — старые разрывы держались бы
+                            // вечно и не давали ей вырасти. Потерянный ручной
+                            // разрыв ставится заново одной командой, а
+                            // неработающая подрезка не лечится ничем.
+                            gap.Manual = false;
+                        }
+
+                        row.Gaps.Add(gap);
                     }
                 }
 

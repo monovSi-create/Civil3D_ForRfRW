@@ -51,9 +51,27 @@ namespace Civil3D_commands.FaceArr
             return rowIndex == PlanStartRowIndex || rowIndex == PlanEndRowIndex;
         }
 
+        /// <summary>Метка не относится к разрыву: обычная ручка ряда или раскладки.</summary>
+        public const int NoGap = -1;
+
         /// <summary>Пометить объект: чей контроллер и какой ряд.</summary>
         public static void Set(
             Transaction tr, Database db, Entity ent, ObjectId controllerId, int rowIndex)
+        {
+            Set(tr, db, ent, controllerId, rowIndex, NoGap);
+        }
+
+        /// <summary>
+        /// То же плюс номер разрыва в ряду — им помечены отрезки-ручки разрывов.
+        ///
+        /// Номер идёт ВТОРЫМ целым, и это существенно: метки прежних версий
+        /// несут только одно целое, и читаются они по-прежнему — как ручка
+        /// ряда без разрыва. Порядок чисел в XData сохраняется, поэтому
+        /// «первое — ряд, второе — разрыв» разбирается однозначно.
+        /// </summary>
+        public static void Set(
+            Transaction tr, Database db, Entity ent,
+            ObjectId controllerId, int rowIndex, int gapIndex)
         {
             var rat = (RegAppTable)tr.GetObject(db.RegAppTableId, OpenMode.ForRead);
             if (!rat.Has(FacingWallController.XAppName))
@@ -64,10 +82,17 @@ namespace Civil3D_commands.FaceArr
                 tr.AddNewlyCreatedDBObject(rec, true);
             }
 
-            ent.XData = new ResultBuffer(
+            var values = new List<TypedValue>
+            {
                 new TypedValue((int)DxfCode.ExtendedDataRegAppName, FacingWallController.XAppName),
                 new TypedValue((int)DxfCode.ExtendedDataAsciiString, controllerId.Handle.ToString()),
-                new TypedValue((int)DxfCode.ExtendedDataInteger32, rowIndex));
+                new TypedValue((int)DxfCode.ExtendedDataInteger32, rowIndex)
+            };
+
+            if (gapIndex >= 0)
+                values.Add(new TypedValue((int)DxfCode.ExtendedDataInteger32, gapIndex));
+
+            ent.XData = new ResultBuffer(values.ToArray());
         }
 
         /// <summary>
@@ -75,8 +100,20 @@ namespace Civil3D_commands.FaceArr
         /// </summary>
         public static bool TryRead(Entity ent, out ObjectId controllerId, out int rowIndex)
         {
+            int gapIndex;
+            return TryRead(ent, out controllerId, out rowIndex, out gapIndex);
+        }
+
+        /// <summary>
+        /// То же плюс номер разрыва. <see cref="NoGap"/> означает, что отрезок
+        /// принадлежит ряду или раскладке, а не разрыву.
+        /// </summary>
+        public static bool TryRead(
+            Entity ent, out ObjectId controllerId, out int rowIndex, out int gapIndex)
+        {
             controllerId = ObjectId.Null;
             rowIndex = 0;
+            gapIndex = NoGap;
 
             if (ent == null) return false;
 
@@ -87,20 +124,26 @@ namespace Civil3D_commands.FaceArr
                 if (rb == null) return false;
 
                 string handleText = null;
-                bool haveRow = false;
+                int seen = 0;
 
                 foreach (TypedValue tv in rb)
                 {
                     if (tv.TypeCode == (int)DxfCode.ExtendedDataAsciiString)
+                    {
                         handleText = tv.Value.ToString();
+                    }
                     else if (tv.TypeCode == (int)DxfCode.ExtendedDataInteger32)
                     {
-                        rowIndex = Convert.ToInt32(tv.Value);
-                        haveRow = true;
+                        // Первое целое — ряд, второе — разрыв. Прежде здесь
+                        // брали ПОСЛЕДНЕЕ, и второе число подменило бы номер ряда.
+                        if (seen == 0) rowIndex = Convert.ToInt32(tv.Value);
+                        else if (seen == 1) gapIndex = Convert.ToInt32(tv.Value);
+
+                        seen++;
                     }
                 }
 
-                if (string.IsNullOrEmpty(handleText) || !haveRow) return false;
+                if (string.IsNullOrEmpty(handleText) || seen == 0) return false;
 
                 controllerId = RwHandles.Resolve(ent.Database, handleText);
                 return !controllerId.IsNull;

@@ -99,9 +99,10 @@ namespace Civil3D_commands.FaceArr
             var line = entity as Line;
             ObjectId controllerId;
             int rowIndex;
+            int gapIndex;
 
             if (line == null ||
-                !FacingWallProjection.TryReadGripTag(line, out controllerId, out rowIndex))
+                !FacingWallGripTag.TryRead(line, out controllerId, out rowIndex, out gapIndex))
             {
                 base.MoveGripPointsAt(entity, grips, offset, bitFlags);
                 return;
@@ -111,7 +112,7 @@ namespace Civil3D_commands.FaceArr
             foreach (GripData g in grips)
                 kinds.Add(Classify(line, g.GripPoint));
 
-            ApplyMove(line, controllerId, rowIndex, kinds, offset);
+            ApplyMove(line, controllerId, rowIndex, gapIndex, kinds, offset);
         }
 
         public override void MoveGripPointsAt(
@@ -122,9 +123,10 @@ namespace Civil3D_commands.FaceArr
             var line = entity as Line;
             ObjectId controllerId;
             int rowIndex;
+            int gapIndex;
 
             if (line == null ||
-                !FacingWallProjection.TryReadGripTag(line, out controllerId, out rowIndex))
+                !FacingWallGripTag.TryRead(line, out controllerId, out rowIndex, out gapIndex))
             {
                 base.MoveGripPointsAt(entity, indices, offset);
                 return;
@@ -152,7 +154,7 @@ namespace Civil3D_commands.FaceArr
                 }
             }
 
-            ApplyMove(line, controllerId, rowIndex, kinds, offset);
+            ApplyMove(line, controllerId, rowIndex, gapIndex, kinds, offset);
         }
 
         // =================================================================
@@ -179,7 +181,7 @@ namespace Civil3D_commands.FaceArr
         /// отрицательный номер ряда означает плановую ручку всего массива.
         /// </summary>
         private static void ApplyMove(
-            Line line, ObjectId controllerId, int rowIndex,
+            Line line, ObjectId controllerId, int rowIndex, int gapIndex,
             List<GripKind> kinds, Vector3d offset)
         {
             if (_busy || line == null || kinds == null || kinds.Count == 0) return;
@@ -200,12 +202,26 @@ namespace Civil3D_commands.FaceArr
                     FacingWallDefinition def = FacingWallController.Load(controllerId, tr);
                     if (def == null) { tr.Commit(); return; }
 
-                    if (!OwnsThisLine(def, line, rowIndex)) { tr.Commit(); return; }
+                    // Номер разрыва в метке — подсказка, а не адрес: разрывы
+                    // сливаются, и места в списке сдвигаются. Настоящий адрес —
+                    // сам отрезок, записанный в модели.
+                    if (gapIndex >= 0)
+                    {
+                        int byLine = FindGapByLine(def, rowIndex, line.ObjectId);
+                        if (byLine >= 0) gapIndex = byLine;
+                    }
 
-                    moved = FacingWallGripTag.IsLayout(rowIndex)
-                        ? MoveLayoutMarker(
-                            tr, line, controllerId, def, rowIndex, kinds, offset, ref newStart, ref newEnd)
-                        : MoveSingleRow(
+                    if (!OwnsThisLine(def, line, rowIndex, gapIndex)) { tr.Commit(); return; }
+
+                    if (gapIndex >= 0)
+                        moved = MoveGap(
+                            tr, line, controllerId, def, rowIndex, gapIndex,
+                            kinds, offset, ref newStart, ref newEnd);
+                    else if (FacingWallGripTag.IsLayout(rowIndex))
+                        moved = MoveLayoutMarker(
+                            tr, line, controllerId, def, rowIndex, kinds, offset, ref newStart, ref newEnd);
+                    else
+                        moved = MoveSingleRow(
                             tr, line, controllerId, def, rowIndex, kinds, offset, ref newStart, ref newEnd);
 
                     if (moved)
@@ -248,7 +264,8 @@ namespace Civil3D_commands.FaceArr
         /// запись контроллера не сохраниться. Занятый живым отрезком слот —
         /// отказ, это и есть признак копии.
         /// </summary>
-        private static bool OwnsThisLine(FacingWallDefinition def, Line line, int rowIndex)
+        private static bool OwnsThisLine(
+            FacingWallDefinition def, Line line, int rowIndex, int gapIndex)
         {
             if (def.IsDetachedCopy)
             {
@@ -256,6 +273,32 @@ namespace Civil3D_commands.FaceArr
                             "Сделайте FACINGWALLREBUILDALL, чтобы массив стал самостоятельным.";
                 LastAction = "отказ: копия контроллера";
                 return false;
+            }
+
+            // Ручка разрыва числится не за рядом, а за самим разрывом. Правило
+            // то же: копия отрезка в модели не записана и ничем не управляет.
+            if (gapIndex >= 0)
+            {
+                FacingWallRowGap gap = GapAt(def, rowIndex, gapIndex);
+
+                if (gap == null)
+                {
+                    LastError = "Разрыв, за которым числится этот отрезок, больше не существует.";
+                    LastAction = "отказ: разрыв исчез";
+                    return false;
+                }
+
+                if (gap.GripLineId == line.ObjectId) return true;
+
+                if (!gap.GripLineId.IsNull && gap.GripLineId.IsValid && !gap.GripLineId.IsErased)
+                {
+                    LastError = "Отрезок-ручка разрыва не числится в контроллере (копия?).";
+                    LastAction = "отказ: чужой отрезок разрыва";
+                    return false;
+                }
+
+                gap.GripLineId = line.ObjectId;
+                return true;
             }
 
             ObjectId registered = def.GetGripLineId(rowIndex);
@@ -271,6 +314,144 @@ namespace Civil3D_commands.FaceArr
             }
 
             def.SetGripLineId(rowIndex, line.ObjectId);
+            return true;
+        }
+
+        /// <summary>
+        /// Номер разрыва, за которым числится этот отрезок. −1 — ни за каким.
+        ///
+        /// Это и есть настоящая проверка владения: номер в метке после слияния
+        /// разрывов устаревает, а связь «разрыв → его отрезок» живёт в модели
+        /// и потому не врёт. То же правило, что у прокси и контроллеров.
+        /// </summary>
+        private static int FindGapByLine(
+            FacingWallDefinition def, int rowIndex, ObjectId lineId)
+        {
+            FacingWallRowDefinition row = def.GetRow(rowIndex);
+            if (row == null || row.Gaps == null || lineId.IsNull) return -1;
+
+            for (int i = 0; i < row.Gaps.Count; i++)
+            {
+                FacingWallRowGap gap = row.Gaps[i];
+                if (gap != null && gap.GripLineId == lineId) return i;
+            }
+
+            return -1;
+        }
+
+        /// <summary>Разрыв по номеру ряда и номеру в списке. null — такого нет.</summary>
+        private static FacingWallRowGap GapAt(
+            FacingWallDefinition def, int rowIndex, int gapIndex)
+        {
+            FacingWallRowDefinition row = def.GetRow(rowIndex);
+            if (row == null || row.Gaps == null) return null;
+            if (gapIndex < 0 || gapIndex >= row.Gaps.Count) return null;
+
+            return row.Gaps[gapIndex];
+        }
+
+        /// <summary>
+        /// Ручка разрыва: концы двигают его границы, середина — весь разрыв.
+        ///
+        /// Границы встают на швы перевязки — на ту же сетку в полблока, по
+        /// которой ходят концы рядов. Иначе край стены оказывался бы посреди
+        /// блока: блок, наполовину заехавший в разрыв, пропадает целиком,
+        /// и стена обрывалась бы не там, куда привели отрезок.
+        ///
+        /// Свели два разрыва вплотную — они сливаются в один (NormalizeGaps),
+        /// и лишний отрезок стирается. Свели разрыв в точку — он исчезает
+        /// вместе со своим отрезком: это самый естественный способ его убрать.
+        /// </summary>
+        private static bool MoveGap(
+            Transaction tr, Line line, ObjectId controllerId, FacingWallDefinition def,
+            int rowIndex, int gapIndex, List<GripKind> kinds, Vector3d offset,
+            ref Point3d newStart, ref Point3d newEnd)
+        {
+            FacingWallRowDefinition row = def.GetRow(rowIndex);
+            FacingWallRowGap gap = GapAt(def, rowIndex, gapIndex);
+            if (row == null || gap == null) return false;
+
+            var pv = tr.GetObject(def.ProfileViewId, OpenMode.ForRead) as ProfileView;
+            if (pv == null) return false;
+
+            double low = gap.Low;
+            double high = gap.High;
+            bool moved = false;
+
+            foreach (GripKind kind in kinds)
+            {
+                if (kind == GripKind.None) continue;
+
+                double station, elevation;
+                if (!TryStationAt(pv, GripPoint(line, kind) + offset, out station, out elevation))
+                    continue;
+
+                station = FacingWallBuilder.SnapToSeam(def, station);
+
+                if (kind == GripKind.Middle)
+                {
+                    // Середина двигает разрыв целиком: длина сохраняется,
+                    // поэтому шаг считаем по снятой на сетку середине.
+                    double oldMid = FacingWallBuilder.SnapToSeam(def, (low + high) / 2.0);
+                    double delta = station - oldMid;
+
+                    low += delta;
+                    high += delta;
+                }
+                else
+                {
+                    // Отрезок разрыва рисуется от Low к High, поэтому его
+                    // начало — всегда меньший пикет, независимо от того,
+                    // куда идёт раскладка.
+                    if (kind == GripKind.Start) low = station;
+                    else high = station;
+                }
+
+                moved = true;
+            }
+
+            if (!moved) return false;
+
+            gap.Start = Math.Min(low, high);
+            gap.End = Math.Max(low, high);
+
+            // Правка руками — теперь этот разрыв переживёт FACINGBYPROFILE.
+            gap.Manual = true;
+
+            // Схлопнутый разрыв убираем вместе с его отрезком; соприкоснувшиеся
+            // сливаются. И то и другое делает NormalizeGaps — с оговоркой, что
+            // отрезок, за который держится мышь, стирать нельзя.
+            FacingWallBuilder.NormalizeGaps(row, line.ObjectId);
+
+            FacingWallController.RebuildRow(tr, line.Database, controllerId, def, rowIndex);
+
+            // Разрыв мог исчезнуть — тогда и отрезка больше нет, двигать нечего.
+            double elev = FacingWallBuilder.RowElevation(def, row)
+                        + def.BlockHeight * FacingWallProjection.GapLineHeightFactor;
+
+            FacingWallRowGap survivor = null;
+            foreach (FacingWallRowGap g in row.Gaps)
+                if (g != null && g.GripLineId == line.ObjectId) { survivor = g; break; }
+
+            if (survivor != null)
+            {
+                Point3d[] pts = RwGeometry.ProfileSegment(
+                    pv, survivor.Low, elev, survivor.High, elev);
+
+                if (pts != null)
+                {
+                    newStart = pts[0];
+                    newEnd = pts[1];
+                }
+
+                LastAction = string.Format(
+                    "разрыв ряда {0}: {1:F3}..{2:F3}", rowIndex, survivor.Low, survivor.High);
+            }
+            else
+            {
+                LastAction = string.Format("разрыв ряда {0} убран", rowIndex);
+            }
+
             return true;
         }
 

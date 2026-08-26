@@ -43,6 +43,14 @@ namespace Civil3D_commands.FaceArr
         public const string GripLayerName = "RW_FACINGWALL_GRIP";
 
         /// <summary>
+        /// Слой отрезков-ручек РАЗРЫВОВ. Отдельный от ручек рядов не ради
+        /// красоты: отрезок разрыва лежит внутри отрезка ряда, и без разделения
+        /// по слоям (а значит, и по цвету) попасть мышью в нужный было бы
+        /// делом случая.
+        /// </summary>
+        public const string GapGripLayerName = "RW_FACINGWALL_GRIP_GAP";
+
+        /// <summary>
         /// Построить проекции ОДНОГО ряда. Возвращает созданные объекты.
         /// </summary>
         public static List<ObjectId> ProjectRow(
@@ -385,6 +393,173 @@ namespace Civil3D_commands.FaceArr
 
             FacingWallBuilder.EraseAll(tr, new List<ObjectId> { row.GripLineId });
             row.GripLineId = ObjectId.Null;
+        }
+
+        // =================================================================
+        //  ОТРЕЗКИ-РУЧКИ РАЗРЫВОВ
+        //
+        //  У каждого разрыва свой отрезок: концы тянут его границы, середина
+        //  двигает разрыв целиком. Свели два отрезка вплотную — разрывы
+        //  слились в один (см. FacingWallBuilder.NormalizeGaps).
+        //
+        //  Лежат они на четверти высоты ряда, а не на середине, где проходит
+        //  отрезок самого ряда: две ручки на одной линии не выбрать мышью.
+        // =================================================================
+
+        /// <summary>
+        /// Доля высоты ряда, на которой идёт отрезок разрыва.
+        /// Открыта наружу: по ней же ставит отрезок на место обработчик ручки
+        /// после коммита транзакции, а два числа 0.25 в разных файлах
+        /// однажды разошлись бы.
+        /// </summary>
+        public const double GapLineHeightFactor = 0.25;
+
+        /// <summary>
+        /// Создать, подвинуть и убрать лишние отрезки-ручки разрывов ряда.
+        ///
+        /// Существующие именно ДВИГАЮТСЯ: стирать объект, который сейчас тянут
+        /// мышью, нельзя — по той же причине, что и у отрезка ряда.
+        /// </summary>
+        public static void EnsureGapLines(
+            Transaction tr,
+            Database db,
+            ObjectId controllerId,
+            FacingWallDefinition def,
+            FacingWallRowDefinition row)
+        {
+            if (def == null || row == null || def.ProfileViewId.IsNull) return;
+
+            // Ручки разрывов, оставшиеся от слияний и пересчётов, стираем здесь:
+            // это единственное место, где у нас есть и транзакция, и список.
+            //
+            // Не стёршиеся из списка НЕ выбрасываем: отрезок, открытый на запись
+            // грип-системой, стереть нельзя, и молча забыть о нём значило бы
+            // оставить в чертеже ручку несуществующего разрыва навсегда.
+            // Следующее перестроение попробует ещё раз.
+            if (row.OrphanGapLines != null && row.OrphanGapLines.Count > 0)
+            {
+                FacingWallBuilder.EraseAll(tr, row.OrphanGapLines);
+
+                var stuck = new List<ObjectId>();
+                foreach (ObjectId id in row.OrphanGapLines)
+                    if (!id.IsNull && id.IsValid && !id.IsErased) stuck.Add(id);
+
+                row.OrphanGapLines = stuck;
+            }
+
+            var pv = tr.GetObject(def.ProfileViewId, OpenMode.ForRead) as ProfileView;
+            if (pv == null) return;
+
+            var gaps = row.Gaps ?? new List<FacingWallRowGap>();
+
+            double elevation = FacingWallBuilder.RowElevation(def, row)
+                             + def.BlockHeight * GapLineHeightFactor;
+
+            BlockTableRecord btr = null;
+            ObjectId layerId = ObjectId.Null;
+
+            for (int i = 0; i < gaps.Count; i++)
+            {
+                FacingWallRowGap gap = gaps[i];
+                if (gap == null) continue;
+
+                Point3d[] pts = RwGeometry.ProfileSegment(
+                    pv, gap.Low, elevation, gap.High, elevation);
+                if (pts == null) continue;
+
+                if (!gap.GripLineId.IsNull && gap.GripLineId.IsValid && !gap.GripLineId.IsErased)
+                {
+                    try
+                    {
+                        var existing = tr.GetObject(gap.GripLineId, OpenMode.ForWrite, false) as Line;
+                        if (existing != null)
+                        {
+                            existing.StartPoint = pts[0];
+                            existing.EndPoint = pts[1];
+                        }
+                    }
+                    catch (Autodesk.AutoCAD.Runtime.Exception)
+                    {
+                        // Открыт на запись грип-системой — геометрию поправит
+                        // FacingWallGrips после транзакции.
+                    }
+                    continue;
+                }
+
+                if (btr == null)
+                    btr = (BlockTableRecord)tr.GetObject(
+                        SymbolUtilityServices.GetBlockModelSpaceId(db), OpenMode.ForWrite);
+
+                if (layerId.IsNull) layerId = EnsureLayer(tr, db, GapGripLayerName, 1);
+
+                var line = new Line(pts[0], pts[1]);
+                line.SetDatabaseDefaults();
+                line.LayerId = layerId;
+
+                gap.GripLineId = btr.AppendEntity(line);
+                tr.AddNewlyCreatedDBObject(line, true);
+
+                FacingWallGripTag.Set(tr, db, line, controllerId, row.RowIndex, i);
+            }
+
+            // Номер разрыва — это его место в списке, и после слияния места
+            // сдвигаются. Метки переписываем целиком: дешевле, чем искать,
+            // какая из них разъехалась.
+            RetagGapLines(tr, db, controllerId, row);
+        }
+
+        /// <summary>
+        /// Переписать номера в метках отрезков разрывов. Зовётся после любого
+        /// изменения состава: метка адресует разрыв номером в списке.
+        /// </summary>
+        private static void RetagGapLines(
+            Transaction tr, Database db, ObjectId controllerId, FacingWallRowDefinition row)
+        {
+            if (row == null || row.Gaps == null) return;
+
+            for (int i = 0; i < row.Gaps.Count; i++)
+            {
+                FacingWallRowGap gap = row.Gaps[i];
+                if (gap == null || gap.GripLineId.IsNull) continue;
+                if (!gap.GripLineId.IsValid || gap.GripLineId.IsErased) continue;
+
+                try
+                {
+                    var line = tr.GetObject(gap.GripLineId, OpenMode.ForWrite, false) as Line;
+                    if (line != null)
+                        FacingWallGripTag.Set(tr, db, line, controllerId, row.RowIndex, i);
+                }
+                catch (Autodesk.AutoCAD.Runtime.Exception)
+                {
+                    // Занят грип-системой — номер поправится на следующем
+                    // перестроении; до тех пор метка указывает на прежнее место.
+                }
+            }
+        }
+
+        /// <summary>Удалить все отрезки-ручки разрывов ряда.</summary>
+        public static void EraseGapLines(Transaction tr, FacingWallRowDefinition row)
+        {
+            if (row == null) return;
+
+            var ids = new List<ObjectId>();
+
+            if (row.Gaps != null)
+                foreach (FacingWallRowGap gap in row.Gaps)
+                {
+                    if (gap == null || gap.GripLineId.IsNull) continue;
+
+                    ids.Add(gap.GripLineId);
+                    gap.GripLineId = ObjectId.Null;
+                }
+
+            if (row.OrphanGapLines != null)
+            {
+                ids.AddRange(row.OrphanGapLines);
+                row.OrphanGapLines = new List<ObjectId>();
+            }
+
+            FacingWallBuilder.EraseAll(tr, ids);
         }
 
         /// <summary>

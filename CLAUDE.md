@@ -96,7 +96,7 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 |------|-----|
 | `Shared/` | Общее для обоих модулей: `RwGeometry` (пикет↔точка в плане и в виде профиля, перпендикуляр к оси, Clamp, середина отрезка) и `RwHandles` (Handle↔текст↔ObjectId, правило «стёртое = пусто»). Новый код по этим темам писать здесь, а не рядом. |
 | `FaceArr/` | Facing Wall — параметрическая облицовка стены, команды `FACINGWALL*` (включая `FACINGWALLGAP` — разрывы в ряду, `FACINGWALLTABLE` — таблички слева от вида профиля) **плюс `FACINGBYPROFILE`** (имя без `WALL` — так попросил пользователь; по маске модуль не найти) (namespace `Civil3D_commands.FaceArr`). **Есть свой `README.md` — читать его первым при работе с модулем.** |
-| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITLINKS`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_EDITBREAK`, `RW_MOVEBREAK`, `RW_DELETEBREAK`, `RW_REFRESHBREAKS`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **Namespace не совпадает с папкой: `Civil3D_commands.AssociativeBreaks`** — искать классы модуля по имени папки бесполезно. **Есть свой `README.md` — читать его первым при работе с модулем.** |
+| `ProfCorrLink/` | Ассоциативные разрывы коридора по профилю (`RW_LINKPROFILECORRIDOR`, `RW_EDITMODE`, `RW_CREATEBREAK`, `RW_DELETEBREAK`, `RW_REFRESHBREAKS`, `RW_SAVEBREAKS`, `RW_BREAKDIAG`). **`RW_EDITMODE` — единственный вход в правку**: прежние `RW_EDITLINKS`, `RW_EDITBREAK` и `RW_MOVEBREAK` стали ветками его меню и своих `CommandMethod` больше не имеют — искать их надо как `*Core`-методы. **Namespace не совпадает с папкой: `Civil3D_commands.AssociativeBreaks`** — искать классы модуля по имени папки бесполезно. **Есть свой `README.md` — читать его первым при работе с модулем.** |
 | `CorridorSurfaceCreator.cs` | Сборная солянка из семи независимых классов (~1700 строк): поверхности коридора, переименование подсборок/областей, нарезка коридора по профилю, ступени (`RW_CREATESURFACES`, `RW_RENAMESUBS`, `RW_SPLITCORRBYPROF`, `RW_ADDSTEPS`, `RW_DELETESURF`). Ещё два `CommandMethod` в файле закомментированы (`LinkCorridor`, `UpdateRegions`) — в сборке их нет. |
 | `RetrieveReinfSoilMaterials.cs` | Ведомость материалов стены + таблица через `EntityJig` (`RW_MATERIALS`, `RW_WallPolylines`). |
 | `CorridorPolylineExtractor.cs` | Полилинии из коридора по группировке Z (`RW_ExtractCorridorPolylines`). |
@@ -135,7 +135,7 @@ Civil 3D, так что `Alignment`/`ProfileView` там не существую
 
 | Модуль | Словарь NOD | XData (RegApp) | Слои / блоки |
 |--------|-------------|----------------|--------------|
-| `FaceArr` | `FACINGWALL_DATA` (Xrecord у контроллера) | `RW_FACINGWALL`, метка `"FACINGWALL"` | блок `FACINGWALL_CONTROLLER`; слои `RW_FACINGWALL_PROFILE`, `RW_FACINGWALL_GRIP`, `RW_FACINGWALL_GRIP_PLAN`, `RW_FACINGWALL_GRIP_LAYOUT` |
+| `FaceArr` | `FACINGWALL_DATA` (Xrecord у контроллера) | `RW_FACINGWALL`, метка `"FACINGWALL"` | блок `FACINGWALL_CONTROLLER`; слои `RW_FACINGWALL_PROFILE`, `RW_FACINGWALL_GRIP`, `RW_FACINGWALL_GRIP_GAP`, `RW_FACINGWALL_GRIP_PLAN`, `RW_FACINGWALL_GRIP_LAYOUT` |
 | `ProfCorrLink` | `RW_AssocBreaks` → подсловари `Markers`, `EditMode/Profiles`, `Link/Active` (прежний формат, только чтение), `Links` (`LK_<guid>`) | `RW_BREAK` (Guid маркера), `RW_BREAKLINK` (Guid связи, на контроллере), `RW_BREAKOVL` (Guid связи, на оформлении) | блок `RW_BREAK_CONTROLLER`; слои `RW_BREAK_BOUNDARY`, `RW_BREAK_FILL`, `RW_BREAK_INFO`, `RW_BREAK_ASSEMBLY`, `RW_BREAK_CONTROLLER`; служебные прокси-`Line` |
 | `LinkingCommands` | `AsdkLinks` → `AsdkLinkedObjects` | — | — |
 

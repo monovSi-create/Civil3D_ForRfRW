@@ -342,6 +342,8 @@ namespace Civil3D_commands.FaceArr
                 opts.Keywords.Add("Rows", "Ряды", "Ряды");
                 opts.Keywords.Add("Elevation", "Отметка", "Отметка");
                 opts.Keywords.Add("Setback", "Отскок", "Отскок");
+                opts.Keywords.Add("Direction", "Направление", "Направление");
+                opts.Keywords.Add("Profiles", "Профили", "Профили");
                 opts.Keywords.Add("Apply", "Применить", "Применить");
                 opts.Keywords.Default = "Apply";
                 opts.AllowNone = true;
@@ -379,6 +381,14 @@ namespace Civil3D_commands.FaceArr
 
                     case "Setback":
                         if (ChangeSetback(ed, def)) changed = true;
+                        break;
+
+                    case "Direction":
+                        if (ChangeDirection(ed, def)) changed = true;
+                        break;
+
+                    case "Profiles":
+                        if (ChangeProfiles(ed, db, def)) changed = true;
                         break;
                 }
             }
@@ -454,6 +464,24 @@ namespace Civil3D_commands.FaceArr
             ed.WriteMessage("\nРядов ....................... {0}", def.RowCount);
             ed.WriteMessage("\nОтметка низа / верха ........ {0:F3} / {1:F3}",
                 def.BaseElevation, def.BaseElevation + def.RowCount * def.BlockHeight);
+            ed.WriteMessage("\nНаправление раскладки ....... {0} ({1:F3} -> {2:F3})",
+                def.LayoutForward() ? "по ходу пикетажа" : "против хода пикетажа",
+                def.LayoutStartStation, def.LayoutEndStation);
+
+            int gapCount = 0;
+            int manualGaps = 0;
+
+            foreach (FacingWallRowDefinition row in def.Rows)
+            {
+                if (row == null || row.Gaps == null) continue;
+
+                gapCount += row.Gaps.Count;
+                foreach (FacingWallRowGap gap in row.Gaps)
+                    if (gap != null && gap.Manual) manualGaps++;
+            }
+
+            ed.WriteMessage("\nРазрывов .................... {0} (из них ручных {1})",
+                gapCount, manualGaps);
             ed.WriteMessage("\nОтображение на профиле ...... {0}",
                 ModeLabel(def.ProjectionMode));
         }
@@ -723,6 +751,114 @@ namespace Civil3D_commands.FaceArr
             ed.WriteMessage("\nРядов: {0} -> {1}, верх стены {2:F3}.",
                 current, def.RowCount,
                 def.BaseElevation + def.RowCount * def.BlockHeight);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Сменить направление раскладки: по ходу пикетажа или против него.
+        ///
+        /// Физически стена остаётся на месте — меняется край, с которого
+        /// начинают ложиться блоки. Видно это по половинке: она переезжает
+        /// на противоположный конец ряда, потому что сетка перевязки теперь
+        /// отсчитывается от другого края. Ради этого всё и делается: половинку
+        /// обычно хотят с определённой стороны.
+        /// </summary>
+        private static bool ChangeDirection(Editor ed, FacingWallDefinition def)
+        {
+            bool forward = def.LayoutForward();
+
+            var opts = new PromptKeywordOptions(
+                string.Format("\nНаправление раскладки (сейчас {0})",
+                              forward ? "по ходу пикетажа" : "против хода пикетажа"));
+
+            // Латиницей только глобальное имя: второй и третий параметры обязаны
+            // быть тем самым русским словом, которое показано пользователю.
+            opts.Keywords.Add("Forward", "Прямое", "Прямое");
+            opts.Keywords.Add("Back", "Обратное", "Обратное");
+            opts.Keywords.Default = forward ? "Forward" : "Back";   // глобальное имя
+            opts.AllowNone = true;
+
+            PromptResult res = ed.GetKeywords(opts);
+            if (res.Status != PromptStatus.OK) return false;
+
+            bool wanted = res.StringResult == "Forward";
+            if (wanted == forward)
+            {
+                ed.WriteMessage("\nНаправление не изменено.");
+                return false;
+            }
+
+            def.ReverseLayout();
+
+            ed.WriteMessage(
+                "\nРаскладка идёт {0}; якорь {1:F3}, дальняя граница {2:F3}." +
+                "\nПоловинчатые блоки переехали на другой конец рядов.",
+                wanted ? "по ходу пикетажа" : "против хода пикетажа",
+                def.LayoutStartStation, def.LayoutEndStation);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Профили подрезки: заменить верхний, заменить нижний или снять оба.
+        ///
+        /// Сама подрезка здесь не выполняется — только запоминаются профили.
+        /// Считает по ним FACINGBYPROFILE, и разделение намеренное: сменить
+        /// профиль и пересчитать стену — разные решения, и второе бывает
+        /// дорогим на длинной стене.
+        /// </summary>
+        private static bool ChangeProfiles(Editor ed, Database db, FacingWallDefinition def)
+        {
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                ed.WriteMessage(
+                    "\nСейчас: верх «{0}», низ «{1}».",
+                    ProfileName(tr, def.TopProfileId), ProfileName(tr, def.BottomProfileId));
+                tr.Commit();
+            }
+
+            var opts = new PromptKeywordOptions("\nКакой профиль");
+            opts.Keywords.Add("Top", "Верх", "Верх");
+            opts.Keywords.Add("Bottom", "Низ", "Низ");
+            opts.Keywords.Add("Clear", "Снять", "Снять");
+            opts.Keywords.Default = "Top";   // глобальное имя
+            opts.AllowNone = true;
+
+            PromptResult res = ed.GetKeywords(opts);
+            if (res.Status != PromptStatus.OK) return false;
+
+            if (res.StringResult == "Clear")
+            {
+                if (!def.HasProfiles())
+                {
+                    ed.WriteMessage("\nПрофили и так не заданы.");
+                    return false;
+                }
+
+                def.TopProfileId = ObjectId.Null;
+                def.BottomProfileId = ObjectId.Null;
+
+                ed.WriteMessage(
+                    "\nПрофили сняты. Разрывы, которые они поставили, останутся" +
+                    " до следующего FACINGBYPROFILE — стена сама себя не пересчитывает.");
+                return true;
+            }
+
+            bool top = res.StringResult == "Top";
+
+            ObjectId id;
+            if (!AskProfile(ed, top
+                    ? "\nПрофиль ВЕРХА — ниже него должна остаться стена"
+                    : "\nПрофиль НИЗА — выше него должна остаться стена", out id))
+                return false;
+
+            if (top) def.TopProfileId = id;
+            else def.BottomProfileId = id;
+
+            ed.WriteMessage(
+                "\nПрофиль {0} {1}. Пересчитать стену: FACINGBYPROFILE.",
+                top ? "верха" : "низа", id.IsNull ? "снят" : "задан");
 
             return true;
         }
@@ -1023,11 +1159,28 @@ namespace Civil3D_commands.FaceArr
                         if (clear)
                         {
                             if (row.Gaps.Count == 0) continue;
+
+                            // Отрезки-ручки стираются вместе с разрывами:
+                            // иначе в чертеже остались бы ручки, которым нечем
+                            // управлять.
+                            FacingWallProjection.EraseGapLines(tr, row);
                             row.Gaps.Clear();
                         }
                         else
                         {
-                            row.Gaps.Add(new FacingWallRowGap { Start = from, End = to });
+                            // Границы — на швы перевязки: край стены обязан
+                            // совпасть с краем блока, иначе блок, наполовину
+                            // заехавший в разрыв, пропадёт целиком, и стена
+                            // оборвётся не там, где провёл пользователь.
+                            row.Gaps.Add(new FacingWallRowGap
+                            {
+                                Start = FacingWallBuilder.SnapToSeam(def, from),
+                                End = FacingWallBuilder.SnapToSeam(def, to),
+                                Manual = true   // расчёт по профилям его не сотрёт
+                            });
+
+                            // Лёг вплотную к соседнему — значит это один разрыв.
+                            FacingWallBuilder.NormalizeGaps(row);
                         }
 
                         touched++;
@@ -1146,12 +1299,55 @@ namespace Civil3D_commands.FaceArr
             ObjectId controllerId = SelectController(doc);
             if (controllerId.IsNull) return;
 
-            // Профилей теперь два, и оба необязательны: стену подрезает верхний,
-            // а нижний выбивает нижние ряды там, где земля поднялась выше их
-            // низа. Задать можно любой один — или оба сразу.
-            ObjectId topId, bottomId;
-            if (!AskProfile(ed, "\nПрофиль ВЕРХА — ниже него должна остаться стена", out topId)) return;
-            if (!AskProfile(ed, "\nПрофиль НИЗА — выше него должна остаться стена", out bottomId)) return;
+            // Профили, с которыми стену подрезали в прошлый раз. Теперь они
+            // хранятся у неё самой: подрезка — не разовая операция, профиль
+            // правят и стену пересчитывают, и выбирать оба заново после каждой
+            // правки значит превращать уточнение в обряд.
+            ObjectId topId = ObjectId.Null;
+            ObjectId bottomId = ObjectId.Null;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                FacingWallDefinition stored = FacingWallController.Load(controllerId, tr);
+                if (stored != null)
+                {
+                    topId = Alive(stored.TopProfileId);
+                    bottomId = Alive(stored.BottomProfileId);
+                }
+                tr.Commit();
+            }
+
+            bool reuse = false;
+
+            if (!topId.IsNull || !bottomId.IsNull)
+            {
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    ed.WriteMessage(
+                        "\nЗапомнены профили: верх «{0}», низ «{1}».",
+                        ProfileName(tr, topId), ProfileName(tr, bottomId));
+                    tr.Commit();
+                }
+
+                var kw = new PromptKeywordOptions("\nПрофили");
+                kw.Keywords.Add("Keep", "Прежние", "Прежние");
+                kw.Keywords.Add("Pick", "Выбрать", "Выбрать");
+                kw.Keywords.Default = "Keep";   // глобальное имя, не подпись
+                kw.AllowNone = true;
+
+                PromptResult kwRes = ed.GetKeywords(kw);
+                if (kwRes.Status != PromptStatus.OK) return;
+                reuse = kwRes.StringResult != "Pick";
+            }
+
+            if (!reuse)
+            {
+                // Профилей два, и оба необязательны: стену подрезает верхний,
+                // а нижний выбивает нижние ряды там, где земля поднялась выше
+                // их низа. Задать можно любой один — или оба сразу.
+                if (!AskProfile(ed, "\nПрофиль ВЕРХА — ниже него должна остаться стена", out topId)) return;
+                if (!AskProfile(ed, "\nПрофиль НИЗА — выше него должна остаться стена", out bottomId)) return;
+            }
 
             if (topId.IsNull && bottomId.IsNull)
             {
@@ -1191,6 +1387,9 @@ namespace Civil3D_commands.FaceArr
             int emptied = 0;
             int total = 0;
             int gaps = 0;
+            int kept = 0;
+            int added = 0;
+            string coverage = null;
 
             try
             {
@@ -1210,16 +1409,32 @@ namespace Civil3D_commands.FaceArr
                         return;
                     }
 
+                    // Профили запоминаются у стены — следующий запуск не будет
+                    // спрашивать их заново.
+                    def.TopProfileId = topProfile != null ? topId : ObjectId.Null;
+                    def.BottomProfileId = bottomProfile != null ? bottomId : ObjectId.Null;
+
+                    coverage = DescribeCoverage(def, topProfile, bottomProfile);
+
+                    // Стена умела только УБЫВАТЬ: где земля поднималась, ей
+                    // не хватало рядов, и подрезка молча оставляла её низкой.
+                    // Теперь ряды добавляются — верхние всё равно будут выбиты
+                    // разрывами там, где они не нужны.
+                    if (leaveGaps) added = GrowRowsToProfile(def, topProfile);
+
                     def.ResetRowsToLayout();
 
                     foreach (FacingWallRowDefinition row in def.Rows)
                     {
                         if (row == null) continue;
 
-                        // Разрывы прежнего запуска сбрасываются: команда считает
-                        // от границ раскладки, иначе второй запуск давал бы
-                        // не тот же результат, что первый.
-                        row.Gaps.Clear();
+                        // Сбрасываются только СВОИ разрывы прошлого запуска:
+                        // команда считает от границ раскладки, иначе второй
+                        // запуск давал бы не тот же результат, что первый.
+                        // Поставленные человеком остаются — их правка не должна
+                        // пропадать от пересчёта.
+                        FacingWallBuilder.ClearAutoGaps(row);
+                        kept += row.Gaps.Count;
 
                         double full = row.EndStation;
 
@@ -1228,6 +1443,10 @@ namespace Civil3D_commands.FaceArr
                             int fitted;
                             row.Gaps.AddRange(GapsByProfiles(
                                 def, row, topProfile, bottomProfile, out fitted));
+
+                            // Ручные и расчётные разрывы могли наложиться —
+                            // сводим их в непересекающийся набор.
+                            FacingWallBuilder.NormalizeGaps(row);
 
                             if (fitted == 0) emptied++;
                             else if (row.Gaps.Count > 0) shortened++;
@@ -1256,30 +1475,177 @@ namespace Civil3D_commands.FaceArr
                 return;
             }
 
+            if (added > 0)
+                ed.WriteMessage("\nДобавлено рядов под профиль верха: {0}.", added);
+
             ed.WriteMessage(
                 "\nРядов: {0}, изменено: {1}, пустых: {2}{3}.",
                 total, shortened, emptied,
                 leaveGaps ? ", разрывов: " + gaps : string.Empty);
 
+            if (kept > 0)
+                ed.WriteMessage("\nРучных разрывов сохранено: {0}.", kept);
+
+            if (coverage != null) ed.WriteMessage(coverage);
+
             if (emptied == total && total > 0)
                 ed.WriteMessage(
                     "\nМежду профилями не поместился ни один блок. Проверьте, что" +
                     " профиль верха выше отметки низа стены, а профиль низа — ниже" +
-                    " её верха, и что оба покрывают раскладку по длине.");
+                    " её верха.");
             else if (emptied > 0)
                 ed.WriteMessage(
                     "\nПустые ряды не удалены: команда считает от границ раскладки, " +
                     "и с другим профилем они вернутся. Убрать совсем — FACINGWALLEDIT.");
 
-            if (!bottomId.IsNull)
-                ed.WriteMessage(
-                    "\nПикет, до которого профиль не достаёт, считается непроходимым:" +
-                    " профиль низа короче раскладки выбьет ей края.");
-
             ed.WriteMessage(
-                "\nСвязь с профилями не сохранена: изменили профиль — выполните команду заново.");
+                "\nПрофили запомнены: следующий запуск предложит их же." +
+                "\nГраницы разрывов правятся ручками красных отрезков в виде профиля.");
 
             ed.Regen();
+        }
+
+        /// <summary>Живой ли объект. Стёртый профиль — всё равно что незаданный.</summary>
+        private static ObjectId Alive(ObjectId id)
+        {
+            return !id.IsNull && id.IsValid && !id.IsErased ? id : ObjectId.Null;
+        }
+
+        /// <summary>Имя профиля для сообщения. «не задан» — если его нет.</summary>
+        private static string ProfileName(Transaction tr, ObjectId id)
+        {
+            Profile profile = OpenProfile(tr, id);
+            return profile == null ? "не задан" : profile.Name;
+        }
+
+        /// <summary>
+        /// Докуда профили дотягиваются по пикету относительно раскладки.
+        ///
+        /// Печатается всегда, а не только при беде: «стена обрезана раньше, чем
+        /// я ждал» почти всегда означает, что профиль просто короче раскладки,
+        /// и увидеть это надо сразу, а не после получаса поисков.
+        /// </summary>
+        private static string DescribeCoverage(
+            FacingWallDefinition def, Profile topProfile, Profile bottomProfile)
+        {
+            double lo = def.LayoutLowStation();
+            double hi = def.LayoutHighStation();
+
+            var text = new System.Text.StringBuilder();
+            text.AppendFormat("\nРаскладка {0:F3}..{1:F3}", lo, hi);
+
+            AppendCoverage(text, "верх", topProfile, lo, hi);
+            AppendCoverage(text, "низ", bottomProfile, lo, hi);
+
+            return text.ToString();
+        }
+
+        private static void AppendCoverage(
+            System.Text.StringBuilder text, string what, Profile profile, double lo, double hi)
+        {
+            if (profile == null) return;
+
+            double from = profile.StartingStation;
+            double to = profile.EndingStation;
+
+            text.AppendFormat("\n  профиль {0}: {1:F3}..{2:F3}", what, from, to);
+
+            if (from > lo + 1e-6 || to < hi - 1e-6)
+                text.Append(" — короче раскладки; за его пределами стена строится без подрезки");
+        }
+
+        /// <summary>
+        /// Нарастить стену так, чтобы её верх всюду доставал до профиля верха.
+        ///
+        /// Стена задаётся числом рядов, а подрезка умеет только убирать блоки —
+        /// поэтому на подъёме земли ей просто НЕЧЕМ было дотянуться, и команда
+        /// «не работала при росте высоты». Считаем самое высокое место профиля
+        /// в границах раскладки и добавляем ряды до него; лишние в низких
+        /// местах выбьются разрывами, как и раньше.
+        ///
+        /// Ряды только ДОБАВЛЯЮТСЯ. Снимать их здесь нельзя: ряд — это ещё и
+        /// замены блоков, и ручные разрывы, и снять его молча значит потерять
+        /// чужую работу. Лишние ряды убирает FACINGWALLEDIT, где об этом
+        /// спрашивают.
+        /// </summary>
+        private static int GrowRowsToProfile(FacingWallDefinition def, Profile profile)
+        {
+            if (profile == null || def == null) return 0;
+            if (def.BlockHeight <= 1e-9) return 0;
+
+            double lo = def.LayoutLowStation();
+            double hi = def.LayoutHighStation();
+            if (hi - lo <= 1e-9) return 0;
+
+            // Шаг опроса — полблока: мельче незачем, ряды всё равно целые,
+            // а на длинной стене частый опрос профиля стоит заметно.
+            double step = def.HalfStep();
+            if (step <= 1e-9) step = 1.0;
+
+            double highest = double.NegativeInfinity;
+
+            for (double station = lo; station <= hi + 1e-9; station += step)
+            {
+                double elevation;
+                if (!TryElevationAt(profile, station, out elevation)) continue;
+                if (elevation > highest) highest = elevation;
+            }
+
+            // Конец раскладки в цикл мог не попасть, а он-то и бывает верхом стены.
+            double last;
+            if (TryElevationAt(profile, hi, out last) && last > highest) highest = last;
+
+            if (double.IsNegativeInfinity(highest)) return 0;
+
+            // Ряд считается нужным, только если помещается ЦЕЛИКОМ: наполовину
+            // торчащий над профилем ряд всё равно был бы выбит разрывами весь.
+            int needed = (int)Math.Floor((highest - def.BaseElevation) / def.BlockHeight + 1e-6);
+            if (needed <= def.RowCount) return 0;
+
+            // Предохранитель от опечатки в высоте блока: без него ошибка в разряде
+            // даёт тысячи рядов и повисший Civil.
+            const int limit = 500;
+            if (needed > limit) needed = limit;
+
+            int added = 0;
+
+            while (def.RowCount < needed)
+            {
+                FacingWallRowDefinition top = TopRow(def);
+                int index = top == null ? 0 : top.RowIndex + 1;
+
+                def.Rows.Add(new FacingWallRowDefinition
+                {
+                    RowIndex = index,
+                    StartStation = def.LayoutStartStation,
+                    EndStation = def.LayoutEndStation
+                });
+
+                added++;
+            }
+
+            return added;
+        }
+
+        /// <summary>
+        /// Отметка профиля на пикете. false — профиль сюда не дотягивается.
+        /// Civil бросает исключение за пределами профиля, поэтому try/catch,
+        /// а не проверка диапазона: у профиля с разрывами их несколько.
+        /// </summary>
+        private static bool TryElevationAt(Profile profile, double station, out double elevation)
+        {
+            elevation = 0.0;
+            if (profile == null) return false;
+
+            try
+            {
+                elevation = profile.ElevationAt(station);
+                return !double.IsNaN(elevation);
+            }
+            catch (System.Exception)
+            {
+                return false;
+            }
         }
 
         /// <summary>
@@ -1302,6 +1668,14 @@ namespace Civil3D_commands.FaceArr
         /// каждый блок завёлся бы свой, и запись раздулась бы на ровном месте.
         /// Слияние идёт по отсортированным отрезкам, а не по ходу перечисления:
         /// при обратной раскладке пикеты убывают, и «следующий» там левее.
+        ///
+        /// Разрыв закрывает ЯЧЕЙКУ сетки целиком, а не ширину самого блока.
+        /// Половинчатый блок бывает уже своей ячейки, и разрыв по его ширине
+        /// оставлял бы позади огрызок ячейки: следующий разрыв к нему уже
+        /// не примыкал бы, слияние не срабатывало, а на виде профиля между
+        /// двумя разрывами оставалась щель шириной с половинку — ровно та,
+        /// в которой половинки «пропадали». Ячейка задаётся парой
+        /// Station/NextStation и в обе стороны раскладки считается одинаково.
         /// </summary>
         private static List<FacingWallRowGap> GapsByProfiles(
             FacingWallDefinition def, FacingWallRowDefinition row,
@@ -1327,8 +1701,8 @@ namespace Civil3D_commands.FaceArr
 
                 raw.Add(new FacingWallRowGap
                 {
-                    Start = block.Station,
-                    End = block.Station + block.Width
+                    Start = Math.Min(block.Station, block.NextStation),
+                    End = Math.Max(block.Station + block.Width, block.NextStation)
                 });
             }
 
@@ -1391,8 +1765,14 @@ namespace Civil3D_commands.FaceArr
         /// поэтому проверяются не только края блока. Шаг опроса держим около
         /// 0.1 м: у облицовочного блока это те же 4-5 точек, что и раньше, а
         /// у длинного блока-заменителя провал профиля больше не проскочит
-        /// между краями. Пикет, до которого профиль не достаёт, считается
-        /// непроходимым: гарантировать, что блок под ним, там нечем.
+        /// между краями.
+        ///
+        /// Пикет, до которого профиль НЕ ДОТЯГИВАЕТСЯ, запретом не считается.
+        /// Прежде считался — и это выбивало стене края: профиль рисуют по
+        /// фактическому участку, он почти всегда короче раскладки, и за его
+        /// концом стена пропадала без всякой на то причины. Нет профиля — нет
+        /// и запрета: там стена строится как обычно, а докуда профиль достал,
+        /// команда печатает.
         /// </summary>
         private static bool IsUnderProfile(
             Profile profile, FacingWallBlockPlacement block, double top)
@@ -1408,16 +1788,8 @@ namespace Civil3D_commands.FaceArr
                 double station = block.Station + block.Width * k / samples;
 
                 double elevation;
-                try
-                {
-                    elevation = profile.ElevationAt(station);
-                }
-                catch (System.Exception)
-                {
-                    return false;   // профиль сюда не дотягивается
-                }
+                if (!TryElevationAt(profile, station, out elevation)) continue;
 
-                if (double.IsNaN(elevation)) return false;
                 if (elevation <= top + eps) return false;
             }
 
@@ -1429,12 +1801,12 @@ namespace Civil3D_commands.FaceArr
         ///
         /// Зеркало <see cref="IsUnderProfile"/>, и оговорки те же: профиль между
         /// пикетами может выгибаться вверх, поэтому проверяются не только края
-        /// блока, а пикет, до которого профиль не достаёт, считается непроходимым.
+        /// блока, а пикет, до которого профиль не дотягивается, запретом
+        /// не считается.
         ///
-        /// Последнее стоит помнить: профиль низа КОРОЧЕ стены выбьет ей края.
-        /// Правило то же, что у верхнего профиля с 12 августа 2026, — гарантировать
-        /// там нечем, — но с низом это заметнее: его обычно рисуют по факту,
-        /// и он легко оказывается короче раскладки.
+        /// Последнее здесь и было главной бедой: профиль низа рисуют по факту,
+        /// он почти всегда короче раскладки, и прежнее правило «не достаёт —
+        /// значит нельзя» съедало стене края.
         /// </summary>
         private static bool IsAboveProfile(
             Profile profile, FacingWallBlockPlacement block, double bottom)
@@ -1450,16 +1822,8 @@ namespace Civil3D_commands.FaceArr
                 double station = block.Station + block.Width * k / samples;
 
                 double elevation;
-                try
-                {
-                    elevation = profile.ElevationAt(station);
-                }
-                catch (System.Exception)
-                {
-                    return false;   // профиль сюда не дотягивается
-                }
+                if (!TryElevationAt(profile, station, out elevation)) continue;
 
-                if (double.IsNaN(elevation)) return false;
                 if (elevation >= bottom - eps) return false;
             }
 
@@ -2330,6 +2694,40 @@ namespace Civil3D_commands.FaceArr
                         row.RowIndex, row.StartStation, row.EndStation,
                         row.BlockIds.Count,
                         ok ? row.GripLineId.Handle.ToString() : "НЕТ");
+
+                    // Что раскладка НАМЕРЕНА поставить в этом ряду, по видам
+                    // блоков. Сравнение с числом созданных объектов выше и с
+                    // числом проекций ниже показывает, на каком шаге место
+                    // потерялось: в раскладке, в плане или на виде профиля.
+                    int whole = 0, half = 0, custom = 0;
+
+                    foreach (FacingWallBlockPlacement place in
+                             FacingWallBuilder.EnumerateBlocks(def, row))
+                    {
+                        if (place.Kind == FacingWallBlockKind.Half) half++;
+                        else if (place.Kind == FacingWallBlockKind.Custom) custom++;
+                        else whole++;
+                    }
+
+                    ed.WriteMessage(
+                        "\n      раскладка: целых {0}, половинок {1}, замен {2}; проекций {3}",
+                        whole, half, custom,
+                        row.ProjectionIds == null ? 0 : row.ProjectionIds.Count);
+
+                    if (row.Gaps != null && row.Gaps.Count > 0)
+                        foreach (FacingWallRowGap gap in row.Gaps)
+                        {
+                            if (gap == null) continue;
+
+                            bool gapLine = !gap.GripLineId.IsNull &&
+                                           gap.GripLineId.IsValid &&
+                                           !gap.GripLineId.IsErased;
+
+                            ed.WriteMessage(
+                                "\n      разрыв {0:F3}..{1:F3} ({2}), отрезок {3}",
+                                gap.Low, gap.High, gap.Manual ? "ручной" : "по профилю",
+                                gapLine ? gap.GripLineId.Handle.ToString() : "НЕТ");
+                        }
                 }
 
                 bool planOk = IsAlive(def.PlanStartGripId) && IsAlive(def.PlanEndGripId) &&

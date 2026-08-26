@@ -107,6 +107,22 @@ namespace Civil3D_commands.FaceArr
         public double Start;
         public double End;
 
+        /// <summary>
+        /// Разрыв поставлен человеком (FACINGWALLGAP или ручкой), а не расчётом
+        /// по профилям.
+        ///
+        /// Различие нужно ровно для одного: FACINGBYPROFILE пересчитывает свои
+        /// разрывы с нуля, и без метки повторный запуск стирал бы ручную правку.
+        /// Стирает он теперь только СВОИ — те, что сам и поставил.
+        /// </summary>
+        public bool Manual;
+
+        /// <summary>
+        /// Отрезок-ручка этого разрыва в виде профиля. Концы тянут границы,
+        /// середина двигает разрыв целиком.
+        /// </summary>
+        public ObjectId GripLineId { get; set; }
+
         public double Low { get { return Math.Min(Start, End); } }
         public double High { get { return Math.Max(Start, End); } }
 
@@ -354,6 +370,68 @@ namespace Civil3D_commands.FaceArr
         public ObjectId TotalsTableId { get; set; }
 
         /// <summary>
+        /// Профиль ВЕРХА, которым стена подрезана сверху. Пусто — не задавался.
+        ///
+        /// Хранится у стены, а не спрашивается каждый раз: подрезка — не разовая
+        /// операция. Профиль правят, стену пересчитывают, и заставлять выбирать
+        /// оба профиля заново после каждой правки значит превращать уточнение
+        /// в обряд.
+        /// </summary>
+        public ObjectId TopProfileId { get; set; }
+
+        /// <summary>Профиль НИЗА, которым выбиты нижние ряды. Пусто — не задавался.</summary>
+        public ObjectId BottomProfileId { get; set; }
+
+        /// <summary>Хоть один профиль подрезки задан?</summary>
+        public bool HasProfiles()
+        {
+            return !TopProfileId.IsNull || !BottomProfileId.IsNull;
+        }
+
+        /// <summary>
+        /// Раскладка идёт по ходу пикетажа?
+        ///
+        /// Отдельного поля под направление нет намеренно: оно уже записано
+        /// взаимным порядком якоря и дальней границы. Завести флаг значило бы
+        /// держать два источника истины, которые однажды разойдутся, — и весь
+        /// расчёт раскладки всё равно смотрит на этот знак.
+        /// </summary>
+        public bool LayoutForward()
+        {
+            return LayoutEndStation >= LayoutStartStation;
+        }
+
+        /// <summary>
+        /// Развернуть раскладку: якорь и дальняя граница меняются местами,
+        /// вместе с ними — концы каждого ряда.
+        ///
+        /// Физически стена остаётся на месте: меняется только то, с какого края
+        /// начинают ложиться блоки. Видно это по половинке — она переезжает
+        /// на противоположный конец ряда, потому что сетка перевязки теперь
+        /// отсчитывается от другого края.
+        ///
+        /// Разрывы и замены блоков не трогаем: у них абсолютные пикеты,
+        /// направление им безразлично.
+        /// </summary>
+        public void ReverseLayout()
+        {
+            double swap = LayoutStartStation;
+            LayoutStartStation = LayoutEndStation;
+            LayoutEndStation = swap;
+
+            if (Rows == null) return;
+
+            foreach (FacingWallRowDefinition row in Rows)
+            {
+                if (row == null) continue;
+
+                swap = row.StartStation;
+                row.StartStation = row.EndStation;
+                row.EndStation = swap;
+            }
+        }
+
+        /// <summary>
         /// Проекции, созданные штатным инструментом Civil 3D (режим MvBlock).
         /// Хранятся отдельно от ProjectionIds рядов: те мы рисуем сами и знаем
         /// поштучно, а эти создаёт Civil, и опознаются они только по разнице
@@ -515,6 +593,18 @@ namespace Civil3D_commands.FaceArr
             = new List<FacingWallRowGap>();
 
         /// <summary>
+        /// Отрезки-ручки разрывов, которых больше нет: слились с соседом или
+        /// были пересчитаны заново.
+        ///
+        /// В чертёж НЕ сохраняется — это список на стирание, живущий от правки
+        /// до ближайшего перестроения. Держать его в модели приходится потому,
+        /// что слияние разрывов считается там, где транзакции ещё нет,
+        /// а стирать объекты можно только в ней.
+        /// </summary>
+        public List<ObjectId> OrphanGapLines { get; set; }
+            = new List<ObjectId>();
+
+        /// <summary>
         /// Служебный отрезок-ручка ряда в виде профиля.
         /// Именно за него тянут мышью: ручки на его концах рисует сам AutoCAD.
         /// Хранится отдельно от ProjectionIds, потому что при перестроении ряда
@@ -562,6 +652,139 @@ namespace Civil3D_commands.FaceArr
         private const double Eps = 1e-6;
 
         /// <summary>
+        /// Притянуть пикет к сетке в ПОЛБЛОКА, отсчитанной от якоря раскладки.
+        ///
+        /// Полшага, а не шаг: только так к краю можно приставить половинчатый
+        /// блок. По этой же сетке ходят концы рядов и границы разрывов —
+        /// иначе край стены оказывался бы посреди блока, и блок пропадал
+        /// целиком, не совпав с тем, что провёл пользователь.
+        ///
+        /// Сам якорь не притягивается: он и задаёт начало сетки.
+        /// </summary>
+        public static double SnapToSeam(FacingWallDefinition def, double station)
+        {
+            if (def == null) return station;
+
+            double step = def.HalfStep();
+            if (step <= 1e-9) return station;
+
+            double k = Math.Round((station - def.LayoutStartStation) / step);
+            return def.LayoutStartStation + k * step;
+        }
+
+        /// <summary>
+        /// Привести разрывы ряда в порядок: выбросить вырожденные, отсортировать
+        /// и слить соприкасающиеся.
+        ///
+        /// Слияние соприкоснувшихся — это и есть обещанное пользователю
+        /// поведение отрезков-ручек: свели два разрыва вплотную, получили один.
+        /// Оно же убирает мусор после расчёта по профилям, где каждый
+        /// непоместившийся блок сначала даёт отдельный отрезок.
+        ///
+        /// Слитый разрыв считается РУЧНЫМ, если ручным был хоть один из его
+        /// кусков: иначе следующий FACINGBYPROFILE стёр бы половину того,
+        /// что человек свёл руками.
+        /// </summary>
+        public static void NormalizeGaps(FacingWallRowDefinition row)
+        {
+            NormalizeGaps(row, ObjectId.Null);
+        }
+
+        /// <summary>
+        /// То же, но слитый разрыв оставляет себе ОТРЕЗОК <paramref name="preferred"/>,
+        /// если тот участвовал в слиянии.
+        ///
+        /// Нужно ровно для одного случая: когда разрывы сливаются перетаскиванием,
+        /// нельзя стереть тот отрезок, за который в этот момент держится мышь, —
+        /// он открыт на запись грип-системой, и его исчезновение обрывает
+        /// редактирование. Выживает он, а лишним оказывается сосед.
+        /// </summary>
+        public static void NormalizeGaps(FacingWallRowDefinition row, ObjectId preferred)
+        {
+            if (row == null || row.Gaps == null || row.Gaps.Count == 0) return;
+
+            var live = new List<FacingWallRowGap>();
+            foreach (FacingWallRowGap gap in row.Gaps)
+                if (gap != null && gap.Length > Eps) live.Add(gap);
+
+            live.Sort((a, b) => a.Low.CompareTo(b.Low));
+
+            var merged = new List<FacingWallRowGap>();
+
+            foreach (FacingWallRowGap gap in live)
+            {
+                if (merged.Count > 0)
+                {
+                    FacingWallRowGap last = merged[merged.Count - 1];
+
+                    if (gap.Low <= last.High + Eps)
+                    {
+                        if (gap.High > last.High) last.End = gap.High;
+                        last.Manual = last.Manual || gap.Manual;
+
+                        // Из двух отрезков выживает один. Обычно тот, что был
+                        // раньше по пикету, но если в слиянии участвует тот,
+                        // за который сейчас тянут, — выживает он.
+                        ObjectId keep = last.GripLineId;
+                        ObjectId drop = gap.GripLineId;
+
+                        if (!preferred.IsNull && drop == preferred)
+                        {
+                            keep = drop;
+                            drop = last.GripLineId;
+                        }
+
+                        last.GripLineId = keep;
+
+                        if (!drop.IsNull && drop != keep) row.OrphanGapLines.Add(drop);
+                        continue;
+                    }
+                }
+
+                merged.Add(new FacingWallRowGap
+                {
+                    Start = gap.Low,
+                    End = gap.High,
+                    Manual = gap.Manual,
+                    GripLineId = gap.GripLineId
+                });
+            }
+
+            // Вырожденные тоже могли нести отрезок-ручку.
+            foreach (FacingWallRowGap gap in row.Gaps)
+            {
+                if (gap == null || gap.GripLineId.IsNull) continue;
+                if (merged.Exists(m => m.GripLineId == gap.GripLineId)) continue;
+
+                row.OrphanGapLines.Add(gap.GripLineId);
+            }
+
+            row.Gaps = merged;
+        }
+
+        /// <summary>
+        /// Убрать разрывы, поставленные расчётом по профилям, оставив ручные.
+        /// Их отрезки-ручки помечаются на стирание: без этого в чертеже
+        /// накапливались бы ручки несуществующих разрывов.
+        /// </summary>
+        public static void ClearAutoGaps(FacingWallRowDefinition row)
+        {
+            if (row == null || row.Gaps == null) return;
+
+            var kept = new List<FacingWallRowGap>();
+
+            foreach (FacingWallRowGap gap in row.Gaps)
+            {
+                if (gap == null) continue;
+
+                if (gap.Manual) { kept.Add(gap); continue; }
+                if (!gap.GripLineId.IsNull) row.OrphanGapLines.Add(gap.GripLineId);
+            }
+
+            row.Gaps = kept;
+        }
+
+        /// <summary>
         /// Единственный источник истины по раскладке: начальные станции блоков ряда.
         /// Этим же перечислением пользуется профильное отображение, поэтому план
         /// и профиль не могут разъехаться.
@@ -589,7 +812,7 @@ namespace Civil3D_commands.FaceArr
             double span = Math.Abs(row.EndStation - row.StartStation);
             if (span <= Eps) yield break;
 
-            bool forward = def.LayoutEndStation >= def.LayoutStartStation;
+            bool forward = def.LayoutForward();
 
             // ЯЧЕЙКА сетки (whole/2) и ШИРИНА половинчатого блока — разные вещи.
             // Сетка задаёт, где проходят швы, и по ней же ходят ручки; блок
