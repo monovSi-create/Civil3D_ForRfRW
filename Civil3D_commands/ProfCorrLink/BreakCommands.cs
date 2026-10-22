@@ -42,6 +42,17 @@ namespace Civil3D_commands.AssociativeBreaks
                 // не смертельно: любая команда FACINGWALL* включает их сама
             }
 
+            // Отметки разрезов на профиле: тот же приём — свой оверрул на Line
+            // (опознаётся только по XData) и свой реактор, а инициализация отсюда.
+            try
+            {
+                SectionMarks.SectionMarkGrips.Enable();
+            }
+            catch (System.Exception)
+            {
+                // не смертельно: любая команда RW_SECTIONMARK* включает их сама
+            }
+
             AcAp.DocumentManager.DocumentActivated    += (s, e) => AttachTo(e.Document);
             AcAp.DocumentManager.DocumentDestroyed    += (s, e) => BreakSession.DetachByFileName(e.FileName);
             var doc = AcAp.DocumentManager.MdiActiveDocument;
@@ -77,6 +88,15 @@ namespace Civil3D_commands.AssociativeBreaks
                 tr.Commit();
             }
             BreakProxyFactory.EnsureRegApp(doc.Database);
+
+            try
+            {
+                SectionMarks.SectionMarkReactor.For(doc);
+            }
+            catch (System.Exception)
+            {
+                // реактор отметок не должен мешать остальным модулям
+            }
         }
 
         // ------------------------------------------------------------------

@@ -92,6 +92,10 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="ExportCleanup\ExportCleanup.cs" />
+    <Compile Include="SectionMarks\SectionMark.cs" />
+    <Compile Include="SectionMarks\SectionMarkCommands.cs" />
+    <Compile Include="SectionMarks\SectionMarkReactor.cs" />
     <Compile Include="Shared\RwGeometry.cs" />
     <Compile Include="Shared\RwHandles.cs" />
     <Compile Include="FaceArr\FacingWallArray.cs" />
