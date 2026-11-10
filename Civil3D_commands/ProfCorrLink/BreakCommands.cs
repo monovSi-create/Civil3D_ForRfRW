@@ -536,6 +536,7 @@ namespace Civil3D_commands.AssociativeBreaks
                 kw.Keywords.Add("Move",     "Перенести",  "Перенести");
                 kw.Keywords.Add("Assembly", "Конструкция", "Конструкция");
                 kw.Keywords.Add("Off",      "Выключить",  "Выключить");
+                kw.Keywords.Add("Delete",   "Удалить",    "Удалить");
                 kw.Keywords.Default = "Break";   // глобальное имя, не подпись
 
                 PromptResult res = ed.GetKeywords(kw);
@@ -563,6 +564,12 @@ namespace Civil3D_commands.AssociativeBreaks
                         using (new BoundaryUnlock(doc, session)) ChangeRegionAssemblyCore(doc, session);
                         break;
 
+                    case "Delete":
+                        // Связи не стало — активной больше нет, и крутить меню
+                        // над ней нечем: выходим, как и при «Выключить».
+                        if (DeleteLinkCore(doc, session)) return;
+                        break;
+
                     case "Off":
                         TurnOffAll(session);
                         ed.WriteMessage(
@@ -572,6 +579,83 @@ namespace Civil3D_commands.AssociativeBreaks
                         return;
                 }
             }
+        }
+
+        // ------------------------------------------------------------------
+        //  УДАЛИТЬ СВЯЗЬ
+        //
+        //  Снимает только ассоциацию: разрывы, их прокси, оформление и
+        //  контроллер. Сами коридор и профиль остаются как есть — ступени
+        //  в профиле и границы участков коридора уже сделаны, и откатывать
+        //  их молча значило бы менять проект без спроса.
+        // ------------------------------------------------------------------
+        private static bool DeleteLinkCore(Document doc, BreakSession session)
+        {
+            var ed = doc.Editor;
+            var db = doc.Database;
+            BreakLink link = session.ActiveLink;
+            if (link == null) return false;
+
+            var markers = session.Store.All.Where(m => link.Covers(m)).ToList();
+
+            var kw = new PromptKeywordOptions(
+                $"\nУдалить связь «{link.Label}»? Разрывов в ней: {markers.Count}. " +
+                "Коридор и профиль останутся как есть, исчезнут только маркеры, границы и контроллер.");
+            kw.Keywords.Add("Yes", "Да", "Да");
+            kw.Keywords.Add("No", "Нет", "Нет");
+            kw.Keywords.Default = "No";   // необратимо, поэтому «по Enter» — отказ
+            PromptResult res = ed.GetKeywords(kw);
+            if (res.Status != PromptStatus.OK || res.StringResult != "Yes") return false;
+
+            try
+            {
+                using (doc.LockDocument())
+                using (session.Suspend())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    BreakOverlay.Unlock(tr, db);
+
+                    foreach (StationMarker m in markers)
+                    {
+                        foreach (Handle h in new[] { m.ProfileProxyHandle, m.PlanProxyHandle })
+                        {
+                            ObjectId id = Resolve(db, h);
+                            if (!id.IsNull) tr.GetObject(id, OpenMode.ForWrite).Erase();
+                        }
+
+                        session.Store.Remove(m.Id);
+                    }
+
+                    BreakOverlay.Erase(tr, db, link);
+                    BreakController.Erase(tr, db, link);
+                    tr.Commit();
+                }
+
+                session.Store.SaveToDatabase(db);
+
+                // Сначала связь выводится из сессии: SetEditMode перестраивает
+                // оформление всех связей сеанса, и удаляемая успела бы нарисовать
+                // его заново — осиротевшее, без владельца.
+                session.RemoveLink(link);
+                session.SaveLinks();   // стирает и устаревшую запись в словаре
+
+                // Флаг режима лежит по хэндлу профиля и сам не уйдёт.
+                if (session.IsEditMode(link.ProfileHandle))
+                    session.SetEditMode(link.ProfileHandle, false);
+                else
+                    session.RefreshOverlay();
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\nУдалить связь не удалось: {ex.Message}");
+                return false;
+            }
+
+            ed.WriteMessage(
+                $"\nСвязь «{link.Label}» удалена. Коридор и профиль не тронуты." +
+                "\nОстальные связи правятся через RW_EDITMODE.");
+            ed.Regen();
+            return true;
         }
 
         // ------------------------------------------------------------------
@@ -1508,6 +1592,8 @@ namespace Civil3D_commands.AssociativeBreaks
 
             var link = session.ActiveLink;
             ed.WriteMessage("\n--- RW_Break ---");
+            ed.WriteMessage("\nЖурнал операций (последняя строка — шаг, на котором мог быть вылет): " +
+                            BreakTrace.Path);
 
             if (session.Links.Count == 0)
                 ed.WriteMessage("\nСвязей нет — нужен RW_LINKPROFILECORRIDOR");

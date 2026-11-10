@@ -36,30 +36,82 @@ namespace Civil3D_commands.AssociativeBreaks
                 var alignment = (Alignment)tr.GetObject(Resolve(template.AlignmentHandle), OpenMode.ForRead);
 
                 // Кламп ещё на этапе создания.
+                BreakTrace.Snapshot(tr, Doc.Database, _session, template,
+                    string.Format("СОЗДАТЬ разрыв, пикет {0:F3}, ступень {1}, высота {2}, зазор {3}",
+                                  template.Station, template.IsStep, template.StepHeight, template.Gap));
+
                 Baseline bl = _session.GetBaseline(tr, template);
                 ClampToNeighbors(template, bl);
+
+                // Всё, что можно проверить заранее, проверяется ДО первой правки:
+                // нативный вызов Civil, получивший негодные данные, нередко не
+                // бросает исключение, а роняет процесс.
+                Preflight(profile, bl, template);
+                BreakTrace.Step("проверка пройдена");
 
                 template.BaseElevation =
                     ProfileGeometryOps.BaseElevationAt(profile, template.Station, template.HalfGap);
 
                 if (template.IsStep)
+                {
+                    BreakTrace.Step("профиль: вставка ступени (AddPVI)");
                     ProfileGeometryOps.InsertStep(
                         profile, template.Station, template.StepHeight, template.HalfGap);
+                }
 
+                BreakTrace.Step("прокси разрыва");
                 BreakProxyFactory.CreateProxies(tr, Doc.Database, template, pv, alignment);
                 _session.Store.Add(template);
 
                 // Режет ровно одну область — ту, внутрь которой попал разрыв.
-                if (bl != null) ProfileGeometryOps.ApplyBreak(bl, template, template.Station);
+                if (bl != null)
+                {
+                    BreakTrace.Step("коридор: разрез/перестановка границ участков");
+                    ProfileGeometryOps.ApplyBreak(bl, template, template.Station);
+                }
+
+                BreakTrace.Step("наборы характеристик");
                 WriteProps(tr, template);
+                BreakTrace.Step("коридор: Rebuild");
                 RebuildCorridor(tr, template);
+                BreakTrace.Step("оформление");
                 RefreshOverlay(tr, template);
 
+                BreakTrace.Step("коммит транзакции");
                 tr.Commit();
+                BreakTrace.Step("коммит прошёл");
             }
             _session.Store.SaveToDatabase(Doc.Database);
             _session.SaveLinks();
             return template.Id;
+        }
+
+        /// <summary>
+        /// Проверки нового разрыва до правок. Бросает InvalidOperationException
+        /// с понятным текстом: команда его печатает, транзакция откатывается,
+        /// профиль и коридор остаются нетронутыми.
+        /// </summary>
+        private static void Preflight(Profile profile, Baseline bl, StationMarker m)
+        {
+            if (m.IsStep)
+            {
+                // AddPVI работает только на профиле по трассе. На профиле коридора,
+                // наложенном или смещённом правка точек не определена.
+                if (profile.ProfileType != ProfileType.FG)
+                    throw new InvalidOperationException(
+                        "Ступень можно вставить только в проектный профиль (FG), а этот — " +
+                        profile.ProfileType + ". Создайте разрыв без ступени.");
+
+                if (!ProfileGeometryOps.CanPlaceStep(profile, m.Station, m.HalfGap))
+                    throw new InvalidOperationException(
+                        "Пара точек ступени не помещается в профиль на пикете " +
+                        m.Station.ToString("F3") + ".");
+            }
+
+            if (!ProfileGeometryOps.CanApplyBreak(bl, m))
+                throw new InvalidOperationException(
+                    "Пикет " + m.Station.ToString("F3") +
+                    " не попадает ни в один участок коридора (с запасом на микроразрыв).");
         }
 
         /// <summary>
@@ -175,8 +227,14 @@ namespace Civil3D_commands.AssociativeBreaks
 
                 var profile = (Profile)tr.GetObject(Resolve(m.ProfileHandle), OpenMode.ForWrite);
 
+                BreakTrace.Snapshot(tr, Doc.Database, _session, m,
+                    string.Format("УДАЛИТЬ разрыв, пикет {0:F3}, ступень {1}", m.Station, m.IsStep));
+
                 if (m.IsStep)
+                {
+                    BreakTrace.Step("профиль: снятие ступени");
                     ProfileGeometryOps.RemoveStep(profile, m.Station, m.StepHeight, m.HalfGap);
+                }
 
                 EraseIfValid(tr, m.ProfileProxyHandle);
                 EraseIfValid(tr, m.PlanProxyHandle);
@@ -195,9 +253,11 @@ namespace Civil3D_commands.AssociativeBreaks
 
                 _session.Store.Remove(id);
 
+                BreakTrace.Step("коридор: Rebuild");
                 RebuildCorridor(tr, m);
                 RefreshOverlay(tr, m);
                 tr.Commit();
+                BreakTrace.Step("коммит прошёл");
             }
             _session.Store.SaveToDatabase(Doc.Database);
             _session.SaveLinks();
@@ -230,6 +290,9 @@ namespace Civil3D_commands.AssociativeBreaks
 
                 if (Math.Abs(m.Station - old) > 1e-6)
                 {
+                    BreakTrace.Snapshot(tr, Doc.Database, _session, m,
+                        string.Format("ПЕРЕНОС границы {0:F3} -> {1:F3}", old, m.Station));
+
                     if (m.IsStep)
                     {
                         ProfileGeometryOps.MoveStep(profile, old, m.Station, m.StepHeight, m.HalfGap);

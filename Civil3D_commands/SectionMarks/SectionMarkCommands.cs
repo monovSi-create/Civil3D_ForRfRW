@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
@@ -9,19 +10,20 @@ using Civil3D_commands.AssociativeBreaks;
 using Civil3D_commands.Shared;
 using AcAp = Autodesk.AutoCAD.ApplicationServices.Application;
 using Alignment = Autodesk.Civil.DatabaseServices.Alignment;
-using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
 using ObjectId = Autodesk.AutoCAD.DatabaseServices.ObjectId;
 using ProfileView = Autodesk.Civil.DatabaseServices.ProfileView;
 using SampleLine = Autodesk.Civil.DatabaseServices.SampleLine;
 using SampleLineGroup = Autodesk.Civil.DatabaseServices.SampleLineGroup;
-using SectionView = Autodesk.Civil.DatabaseServices.SectionView;
+using Site = Autodesk.Civil.DatabaseServices.Site;
 
 [assembly: CommandClass(typeof(Civil3D_commands.SectionMarks.SectionMarkCommands))]
 
 namespace Civil3D_commands.SectionMarks
 {
     /// <summary>
-    /// Отметки разрезов на продольном профиле. Подробности — README.md модуля.
+    /// Отметки разрезов на продольном профиле. Всё сводится к двум командам:
+    /// RW_SECTIONMARKS — вынести сечения на вид, RW_SECTIONMARKEDIT — править
+    /// их отображение. Подробности — README.md модуля.
     /// </summary>
     public class SectionMarkCommands
     {
@@ -32,9 +34,9 @@ namespace Civil3D_commands.SectionMarks
             return SectionMarkReactor.For(doc);
         }
 
-        // -----------------------------------------------------------------
-        //  RW_SECTIONMARKS — создать/обновить отметки по видам сечений
-        // -----------------------------------------------------------------
+        // =================================================================
+        //  RW_SECTIONMARKS — вынести поперечные сечения на вид профиля
+        // =================================================================
         [CommandMethod("RW_SECTIONMARKS")]
         public void CreateMarks()
         {
@@ -43,77 +45,80 @@ namespace Civil3D_commands.SectionMarks
             Database db = doc.Database;
             SectionMarkReactor reactor = Activate(doc);
 
-            var opt = new PromptEntityOptions("\nВыберите вид продольного профиля");
+            var opt = new PromptEntityOptions("\nВыберите вид профиля, на который нужно вынести сечения");
             opt.SetRejectMessage("\nНужен ProfileView");
             opt.AddAllowedClass(typeof(ProfileView), true);
             PromptEntityResult res = ed.GetEntity(opt);
             if (res.Status != PromptStatus.OK) return;
+            ObjectId pvId = res.ObjectId;
 
-            int created = 0, updated = 0, noViews = 0;
-            var names = new List<string>();
+            // Откуда брать сечения. Указание в плане — основной путь: так выбирают
+            // сечения соседней трассы; «Группа» — когда их много и щёлкать лень.
+            var kw = new PromptKeywordOptions("\nСечения: указать в плане / группа линий выборки / своей трассы?");
+            kw.Keywords.Add("Pick", "Указать", "Указать");
+            kw.Keywords.Add("Group", "Группа", "Группа");
+            kw.Keywords.Add("Own", "Своей", "Своей");
+            kw.Keywords.Default = "Pick";   // глобальное имя, не подпись
+            PromptResult kr = ed.GetKeywords(kw);
+            if (kr.Status != PromptStatus.OK) return;
+
+            List<ObjectId> lineIds;
+            switch (kr.StringResult)
+            {
+                case "Group": lineIds = PickGroups(doc, pvId, false); break;
+                case "Own": lineIds = PickGroups(doc, pvId, true); break;
+                default: lineIds = PickInPlan(ed, db); break;
+            }
+
+            if (lineIds == null || lineIds.Count == 0)
+            {
+                ed.WriteMessage("\nЛиний выборки не выбрано.");
+                return;
+            }
+
+            int created = 0, updated = 0;
+            var missed = new List<string>();
 
             using (reactor.Suspend())
             using (doc.LockDocument())
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                var pv = (ProfileView)tr.GetObject(res.ObjectId, OpenMode.ForRead);
-                var al = tr.GetObject(pv.AlignmentId, OpenMode.ForRead) as Alignment;
-                if (al == null)
-                {
-                    ed.WriteMessage("\nУ вида профиля нет трассы.");
-                    return;
-                }
-
+                var pv = (ProfileView)tr.GetObject(pvId, OpenMode.ForRead);
                 List<SectionMark> marks = SectionMarkStore.LoadAll(tr, db);
                 string blockName = SectionMarkStore.GetDefaultBlock(tr, db);
 
-                foreach (ObjectId groupId in al.GetSampleLineGroupIds())
+                foreach (ObjectId slId in lineIds)
                 {
-                    var group = tr.GetObject(groupId, OpenMode.ForRead) as SampleLineGroup;
-                    if (group == null) continue;
+                    var sl = tr.GetObject(slId, OpenMode.ForRead) as SampleLine;
+                    if (sl == null) continue;
 
-                    foreach (ObjectId slId in group.GetSampleLineIds())
+                    SectionMark m = marks.Find(x =>
+                        x.SampleLineHandle == sl.Handle && x.ProfileViewHandle == pv.Handle);
+
+                    bool isNew = m == null;
+                    if (isNew)
                     {
-                        var sl = tr.GetObject(slId, OpenMode.ForRead) as SampleLine;
-                        if (sl == null) continue;
-                        if (sl.Station < pv.StationStart || sl.Station > pv.StationEnd) continue;
-
-                        ObjectId svId = ObjectId.Null;
-                        foreach (ObjectId id in sl.GetSectionViewIds()) { svId = id; break; }
-
-                        if (svId.IsNull)
+                        m = new SectionMark
                         {
-                            noViews++;
-                            continue;
-                        }
-
-                        SectionMark m = marks.Find(x =>
-                            x.SectionViewHandle == svId.Handle &&
-                            x.ProfileViewHandle == pv.Handle);
-
-                        bool isNew = m == null;
-                        if (isNew)
-                        {
-                            m = new SectionMark
-                            {
-                                ProfileViewHandle = pv.Handle,
-                                SampleLineHandle = sl.Handle,
-                                SectionViewHandle = svId.Handle,
-                                BlockName = blockName
-                            };
-                            marks.Add(m);
-                        }
-
-                        if (!SectionMarkBuilder.Sync(tr, db, m))
-                        {
-                            marks.Remove(m);
-                            continue;
-                        }
-
-                        SectionMarkStore.Save(tr, db, m);
-                        if (isNew) created++; else updated++;
-                        names.Add(m.Name);
+                            ProfileViewHandle = pv.Handle,
+                            SampleLineHandle = sl.Handle,
+                            BlockName = blockName
+                        };
                     }
+
+                    if (!SectionMarkBuilder.Sync(tr, db, m)) continue;
+
+                    // Ничего не нарисовано: линия не пересекает трассу вида или
+                    // пересечение за краем вида. Новую запись не заводим.
+                    if (m.BlockHandle.Value == 0 && isNew)
+                    {
+                        missed.Add(sl.Name);
+                        continue;
+                    }
+
+                    if (isNew) marks.Add(m);
+                    SectionMarkStore.Save(tr, db, m);
+                    if (isNew) created++; else updated++;
                 }
 
                 tr.Commit();
@@ -121,25 +126,161 @@ namespace Civil3D_commands.SectionMarks
             }
 
             ed.WriteMessage(string.Format(
-                "\nОтметок разрезов: создано {0}, обновлено {1}. {2}",
-                created, updated,
-                noViews > 0
-                    ? string.Format("Линий выборки без вида сечения: {0} (пропущены).", noViews)
-                    : ""));
-            if (created + updated == 0)
-                ed.WriteMessage("\nНа этом профиле нет линий выборки с видами сечений.");
+                "\nСечений вынесено: {0}, обновлено: {1}.", created, updated));
+            if (missed.Count > 0)
+                ed.WriteMessage(string.Format(
+                    "\nНе пересекают трассу вида или лежат за его краем ({0}): {1}",
+                    missed.Count, string.Join(", ", missed)));
+            ed.WriteMessage("\nБлок, направление, удаление: RW_SECTIONMARKEDIT.");
         }
 
-        // -----------------------------------------------------------------
-        //  RW_SECTIONMARKBLOCK — выбрать блок отметки из блоков чертежа
-        // -----------------------------------------------------------------
-        [CommandMethod("RW_SECTIONMARKBLOCK")]
-        public void ChooseBlock()
+        /// <summary>Линии выборки, указанные мышью в плане.</summary>
+        private static List<ObjectId> PickInPlan(Editor ed, Database db)
+        {
+            var so = new PromptSelectionOptions
+            {
+                MessageForAdding = "\nВыберите линии выборки (сечения) в плане"
+            };
+            PromptSelectionResult sr = ed.GetSelection(so);
+            if (sr.Status != PromptStatus.OK) return null;
+
+            var result = new List<ObjectId>();
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (ObjectId id in sr.Value.GetObjectIds())
+                    if (tr.GetObject(id, OpenMode.ForRead) is SampleLine) result.Add(id);
+
+                tr.Commit();
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Группы линий выборки в окне с флажками. ownOnly — только трассы вида.
+        /// </summary>
+        private static List<ObjectId> PickGroups(Document doc, ObjectId pvId, bool ownOnly)
+        {
+            Database db = doc.Database;
+
+            var labels = new List<string>();
+            var groups = new List<ObjectId>();
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                var pv = (ProfileView)tr.GetObject(pvId, OpenMode.ForRead);
+
+                foreach (ObjectId alId in AllAlignmentIds(tr))
+                {
+                    if (ownOnly && alId != pv.AlignmentId) continue;
+
+                    var al = tr.GetObject(alId, OpenMode.ForRead) as Alignment;
+                    if (al == null) continue;
+
+                    foreach (ObjectId gId in al.GetSampleLineGroupIds())
+                    {
+                        var g = tr.GetObject(gId, OpenMode.ForRead) as SampleLineGroup;
+                        if (g == null) continue;
+
+                        labels.Add(string.Format("Трасса «{0}» — группа «{1}» ({2} лин.)",
+                                                 al.Name, g.Name, g.GetSampleLineIds().Count));
+                        groups.Add(gId);
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            if (groups.Count == 0)
+            {
+                doc.Editor.WriteMessage("\nГрупп линий выборки не найдено.");
+                return null;
+            }
+
+            List<int> chosen = CheckListDialog.Show(
+                "Группы линий выборки",
+                "Отметьте группы, сечения которых нужно вынести на вид профиля.",
+                labels, null);
+            if (chosen == null) return null;
+
+            var result = new List<ObjectId>();
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (int i in chosen)
+                {
+                    var g = (SampleLineGroup)tr.GetObject(groups[i], OpenMode.ForRead);
+                    foreach (ObjectId id in g.GetSampleLineIds()) result.Add(id);
+                }
+
+                tr.Commit();
+            }
+
+            return result;
+        }
+
+        /// <summary>Все трассы чертежа, в том числе лежащие в площадках.</summary>
+        private static List<ObjectId> AllAlignmentIds(Transaction tr)
+        {
+            var seen = new HashSet<ObjectId>();
+            var result = new List<ObjectId>();
+            CivilDocument civ = CivilApplication.ActiveDocument;
+
+            foreach (ObjectId id in civ.GetAlignmentIds())
+                if (seen.Add(id)) result.Add(id);
+
+            foreach (ObjectId id in civ.GetSitelessAlignmentIds())
+                if (seen.Add(id)) result.Add(id);
+
+            foreach (ObjectId siteId in civ.GetSiteIds())
+            {
+                var site = tr.GetObject(siteId, OpenMode.ForRead) as Site;
+                if (site == null) continue;
+
+                foreach (ObjectId id in site.GetAlignmentIds())
+                    if (seen.Add(id)) result.Add(id);
+            }
+
+            return result;
+        }
+
+        // =================================================================
+        //  RW_SECTIONMARKEDIT — редактировать отображение сечений
+        // =================================================================
+        [CommandMethod("RW_SECTIONMARKEDIT")]
+        public void EditMarks()
         {
             Document doc = AcAp.DocumentManager.MdiActiveDocument;
             Editor ed = doc.Editor;
-            Database db = doc.Database;
             SectionMarkReactor reactor = Activate(doc);
+
+            while (true)
+            {
+                var kw = new PromptKeywordOptions(
+                    "\nОтображение сечений: блок / развернуть стрелки / удалить / обновить (Enter — выйти)");
+                kw.AllowNone = true;
+                kw.Keywords.Add("Block", "Блок", "Блок");
+                kw.Keywords.Add("Flip", "Развернуть", "Развернуть");
+                kw.Keywords.Add("Delete", "Удалить", "Удалить");
+                kw.Keywords.Add("Refresh", "Обновить", "Обновить");
+
+                PromptResult res = ed.GetKeywords(kw);
+                if (res.Status != PromptStatus.Keyword) return;
+
+                switch (res.StringResult)
+                {
+                    case "Block": ChooseBlockCore(doc, reactor); break;
+                    case "Flip": FlipCore(doc, reactor); break;
+                    case "Delete": DeleteCore(doc, reactor); break;
+                    case "Refresh": RefreshCore(doc, reactor); break;
+                }
+            }
+        }
+
+        /// <summary>Блок отметки из блоков чертежа: ко всем отметкам и по умолчанию.</summary>
+        private static void ChooseBlockCore(Document doc, SectionMarkReactor reactor)
+        {
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
 
             List<string> blocks;
             string current;
@@ -181,19 +322,13 @@ namespace Civil3D_commands.SectionMarks
                 "\nБлок «{0}» назначен по умолчанию; переставлено отметок: {1}.", chosen, changed));
         }
 
-        // -----------------------------------------------------------------
-        //  RW_SECTIONMARKFLIP — развернуть стрелки отметки
-        // -----------------------------------------------------------------
-        [CommandMethod("RW_SECTIONMARKFLIP")]
-        public void Flip()
+        /// <summary>Развернуть стрелки отметки, указанной по любой её части.</summary>
+        private static void FlipCore(Document doc, SectionMarkReactor reactor)
         {
-            Document doc = AcAp.DocumentManager.MdiActiveDocument;
             Editor ed = doc.Editor;
             Database db = doc.Database;
-            SectionMarkReactor reactor = Activate(doc);
 
-            var opt = new PromptEntityOptions("\nВыберите блок, чёрточку или стрелку отметки разреза");
-            PromptEntityResult res = ed.GetEntity(opt);
+            PromptEntityResult res = ed.GetEntity("\nВыберите блок, чёрточку или стрелку отметки");
             if (res.Status != PromptStatus.OK) return;
 
             bool done = false;
@@ -201,16 +336,8 @@ namespace Civil3D_commands.SectionMarks
             using (doc.LockDocument())
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                Handle picked = res.ObjectId.Handle;
                 List<SectionMark> marks = SectionMarkStore.LoadAll(tr, db);
-
-                SectionMark m = marks.Find(x =>
-                {
-                    foreach (var link in x.Links())
-                        if (link.Key == picked && link.Value >= MarkPart.Block && link.Value <= MarkPart.BotArrow)
-                            return true;
-                    return false;
-                });
+                SectionMark m = FindByDrawnPart(marks, res.ObjectId.Handle);
 
                 if (m != null)
                 {
@@ -225,16 +352,80 @@ namespace Civil3D_commands.SectionMarks
             ed.WriteMessage(done ? "\nНаправление взгляда изменено." : "\nЭто не часть отметки разреза.");
         }
 
-        // -----------------------------------------------------------------
-        //  RW_SECTIONMARKREFRESH — перерисовать все отметки
-        // -----------------------------------------------------------------
-        [CommandMethod("RW_SECTIONMARKREFRESH")]
-        public void Refresh()
+        /// <summary>
+        /// Удалить отметку, указанную по любой её части, или все отметки вида профиля.
+        /// Линия выборки при этом остаётся: удаляется только вынос на профиль.
+        /// </summary>
+        private static void DeleteCore(Document doc, SectionMarkReactor reactor)
         {
-            Document doc = AcAp.DocumentManager.MdiActiveDocument;
             Editor ed = doc.Editor;
             Database db = doc.Database;
-            SectionMarkReactor reactor = Activate(doc);
+
+            var opt = new PromptEntityOptions("\nВыберите блок или чёрточку отметки [Все отметки вида профиля]");
+            opt.Keywords.Add("View", "Вид", "Вид");
+            opt.AllowNone = false;
+            PromptEntityResult res = ed.GetEntity(opt);
+
+            Handle pvHandle = new Handle(0);
+            Handle picked = new Handle(0);
+
+            if (res.Status == PromptStatus.Keyword)
+            {
+                var po = new PromptEntityOptions("\nВыберите вид профиля");
+                po.SetRejectMessage("\nНужен ProfileView");
+                po.AddAllowedClass(typeof(ProfileView), true);
+                PromptEntityResult pr = ed.GetEntity(po);
+                if (pr.Status != PromptStatus.OK) return;
+                pvHandle = pr.ObjectId.Handle;
+            }
+            else if (res.Status == PromptStatus.OK)
+            {
+                picked = res.ObjectId.Handle;
+            }
+            else
+            {
+                return;
+            }
+
+            int removed = 0;
+            using (reactor.Suspend())
+            using (doc.LockDocument())
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                List<SectionMark> marks = SectionMarkStore.LoadAll(tr, db);
+
+                List<SectionMark> victims = pvHandle.Value != 0
+                    ? marks.Where(x => x.ProfileViewHandle == pvHandle).ToList()
+                    : new List<SectionMark>();
+
+                if (picked.Value != 0)
+                {
+                    SectionMark one = FindByDrawnPart(marks, picked);
+                    if (one != null) victims.Add(one);
+                }
+
+                foreach (SectionMark m in victims)
+                {
+                    SectionMarkBuilder.EraseDrawn(tr, db, m);
+                    SectionMarkStore.Remove(tr, db, m);
+                    marks.Remove(m);
+                    removed++;
+                }
+
+                tr.Commit();
+                reactor.Reindex(marks);
+            }
+
+            ed.WriteMessage(removed > 0
+                ? string.Format("\nУдалено отметок: {0}.", removed)
+                : "\nЭто не часть отметки разреза.");
+        }
+
+        /// <summary>Перерисовать все отметки: вернуть стёртое, убрать осиротевшие.</summary>
+        private static void RefreshCore(Document doc, SectionMarkReactor reactor)
+        {
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
 
             int ok = 0, removed = 0;
             using (reactor.Suspend())
@@ -265,12 +456,23 @@ namespace Civil3D_commands.SectionMarks
             }
 
             ed.WriteMessage(string.Format(
-                "\nОтметок разрезов перерисовано: {0}, удалено осиротевших: {1}.", ok, removed));
+                "\nОтметок перерисовано: {0}, удалено осиротевших: {1}.", ok, removed));
         }
 
-        // -----------------------------------------------------------------
+        /// <summary>Отметка, чьей нарисованной частью (блок, чёрточка, стрелка) является объект.</summary>
+        private static SectionMark FindByDrawnPart(List<SectionMark> marks, Handle picked)
+        {
+            return marks.Find(x =>
+            {
+                foreach (var link in x.Links())
+                    if (link.Key == picked && link.Value <= MarkPart.BotArrow) return true;
+                return false;
+            });
+        }
+
+        // =================================================================
         //  RW_SECTIONMARKDIAG — состояние модуля
-        // -----------------------------------------------------------------
+        // =================================================================
         [CommandMethod("RW_SECTIONMARKDIAG")]
         public void Diag()
         {

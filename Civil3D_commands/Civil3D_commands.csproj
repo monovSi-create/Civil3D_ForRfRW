@@ -93,6 +93,8 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="ExportCleanup\ExportCleanup.cs" />
+    <Compile Include="SectionMarks\CheckListDialog.cs" />
+    <Compile Include="SectionMarks\SectionCrossing.cs" />
     <Compile Include="SectionMarks\SectionMark.cs" />
     <Compile Include="SectionMarks\SectionMarkCommands.cs" />
     <Compile Include="SectionMarks\SectionMarkReactor.cs" />
@@ -114,6 +116,7 @@
     <Compile Include="ProfCorrLink\BreakGripOverrule.cs" />
     <Compile Include="ProfCorrLink\BreakProxyFactory.cs" />
     <Compile Include="ProfCorrLink\BreakReactor.cs" />
+    <Compile Include="ProfCorrLink\BreakTrace.cs" />
     <Compile Include="ProfCorrLink\BreakSession.cs" />
     <Compile Include="CorridorPolylineExtractor.cs" />
     <Compile Include="LinkingCommands.cs" />

@@ -228,6 +228,25 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>
+        /// Найдётся ли для нового разрыва область, которую можно разрезать.
+        /// Проверяется ДО любых правок: профиль и коридор правятся по очереди,
+        /// и отказ на втором шаге оставлял ступень в профиле без разреза в коридоре.
+        /// </summary>
+        public static bool CanApplyBreak(Baseline baseline, StationMarker m)
+        {
+            if (baseline == null || m.IsTerminal) return true;
+            if (double.IsNaN(m.Station) || double.IsInfinity(m.Station)) return false;
+
+            var regions = baseline.BaselineRegions;
+
+            // Разрыв уже привязан к паре областей — режутся не они.
+            if (FindByGuid(regions, m.LeftRegionId) != null &&
+                FindByGuid(regions, m.RightRegionId) != null) return true;
+
+            return FindRegionAt(regions, m.Station, m.HalfGap) != null;
+        }
+
+        /// <summary>
         /// Перенести конец коридора: начало ПЕРВОЙ области либо конец ПОСЛЕДНЕЙ.
         ///
         /// Микроразрыва здесь нет и быть не может: он разводит соседей, а с внешней

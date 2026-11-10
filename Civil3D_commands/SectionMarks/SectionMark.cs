@@ -7,6 +7,7 @@ using ObjectId = Autodesk.AutoCAD.DatabaseServices.ObjectId;
 using Entity = Autodesk.AutoCAD.DatabaseServices.Entity;
 using Line = Autodesk.AutoCAD.DatabaseServices.Line;
 using Polyline = Autodesk.AutoCAD.DatabaseServices.Polyline;
+using Alignment = Autodesk.Civil.DatabaseServices.Alignment;
 using ProfileView = Autodesk.Civil.DatabaseServices.ProfileView;
 using SectionView = Autodesk.Civil.DatabaseServices.SectionView;
 using SampleLine = Autodesk.Civil.DatabaseServices.SampleLine;
@@ -17,7 +18,7 @@ namespace Civil3D_commands.SectionMarks
     internal enum MarkPart
     {
         Block, TopTick, BotTick, TopArrow, BotArrow,
-        SampleLine, SectionView, ProfileView
+        SampleLine, SectionView, ProfileView, Alignment
     }
 
     /// <summary>
@@ -27,6 +28,9 @@ namespace Civil3D_commands.SectionMarks
     /// Источник истины — эта запись, а не нарисованное: пикет и название берутся
     /// из линии выборки при каждой синхронизации, от пользователя в модели
     /// остаются только высоты чёрточек, направление и имя блока.
+    ///
+    /// Пикет — это пересечение линии выборки с трассой ВИДА ПРОФИЛЯ, а не
+    /// пикет самой линии: сечение может принадлежать соседней трассе.
     /// </summary>
     internal class SectionMark
     {
@@ -34,7 +38,15 @@ namespace Civil3D_commands.SectionMarks
 
         public Handle ProfileViewHandle;
         public Handle SampleLineHandle;
+
+        /// <summary>
+        /// Вид сечения. Нужен только записям первой версии, где отметка
+        /// привязывалась к нему; у новых пусто — отметке достаточно линии выборки.
+        /// </summary>
         public Handle SectionViewHandle;
+
+        /// <summary>Трасса вида профиля: её изменение сдвигает пересечение.</summary>
+        public Handle AlignmentHandle;
 
         public string Name = "";
         public string BlockName = SectionMarkBuilder.DefaultBlockName;
@@ -55,6 +67,7 @@ namespace Civil3D_commands.SectionMarks
             yield return new KeyValuePair<Handle, MarkPart>(ProfileViewHandle, MarkPart.ProfileView);
             yield return new KeyValuePair<Handle, MarkPart>(SampleLineHandle, MarkPart.SampleLine);
             yield return new KeyValuePair<Handle, MarkPart>(SectionViewHandle, MarkPart.SectionView);
+            yield return new KeyValuePair<Handle, MarkPart>(AlignmentHandle, MarkPart.Alignment);
             yield return new KeyValuePair<Handle, MarkPart>(BlockHandle, MarkPart.Block);
             yield return new KeyValuePair<Handle, MarkPart>(TopTickHandle, MarkPart.TopTick);
             yield return new KeyValuePair<Handle, MarkPart>(BotTickHandle, MarkPart.BotTick);
@@ -240,7 +253,8 @@ namespace Civil3D_commands.SectionMarks
                 new TypedValue((int)DxfCode.Text, RwHandles.ToText(m.BotTickHandle)),
                 new TypedValue((int)DxfCode.Text, RwHandles.ToText(m.TopArrowHandle)),
                 new TypedValue((int)DxfCode.Text, RwHandles.ToText(m.BotArrowHandle)),
-                new TypedValue((int)DxfCode.Real, m.Station));
+                new TypedValue((int)DxfCode.Real, m.Station),
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(m.AlignmentHandle)));
         }
 
         private static SectionMark Decode(string key, Xrecord xr)
@@ -272,7 +286,12 @@ namespace Civil3D_commands.SectionMarks
                 BotTickHandle = RwHandles.Parse(Convert.ToString(v[13].Value)),
                 TopArrowHandle = RwHandles.Parse(Convert.ToString(v[14].Value)),
                 BotArrowHandle = RwHandles.Parse(Convert.ToString(v[15].Value)),
-                Station = Convert.ToDouble(v[16].Value)
+                Station = Convert.ToDouble(v[16].Value),
+
+                // Записи первой версии (17 значений) трассы не хранят — её даёт вид профиля.
+                AlignmentHandle = v.Length > 17
+                    ? RwHandles.Parse(Convert.ToString(v[17].Value))
+                    : new Handle(0)
             };
         }
     }
@@ -298,12 +317,33 @@ namespace Civil3D_commands.SectionMarks
         public static bool Sync(Transaction tr, Database db, SectionMark m)
         {
             var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
-            var sv = RwHandles.Open<SectionView>(tr, db, m.SectionViewHandle, OpenMode.ForRead);
             var sl = RwHandles.Open<SampleLine>(tr, db, m.SampleLineHandle, OpenMode.ForRead);
-            if (pv == null || sv == null || sl == null) return false;
+            if (pv == null || sl == null) return false;
 
-            m.Station = sl.Station;
+            // Запись первой версии привязана ещё и к виду сечения: стёрт он — стёрта и отметка.
+            if (m.SectionViewHandle.Value != 0 &&
+                RwHandles.Open<SectionView>(tr, db, m.SectionViewHandle, OpenMode.ForRead) == null)
+                return false;
+
+            var alignment = tr.GetObject(pv.AlignmentId, OpenMode.ForRead) as Alignment;
+            if (alignment == null) return false;
+            m.AlignmentHandle = alignment.Handle;
+
             m.Name = sl.Name ?? "";
+
+            // Пикет — там, где линия выборки пересекает ТРАССУ ВИДА. Не пересекает
+            // (сечение унесли или оно соседней трассы и не доходит) — рисовать
+            // нечего, но запись живёт: вернут линию, и отметка встанет сама.
+            double station;
+            bool forward;
+            if (!SectionCrossing.TryCross(tr, sl, alignment, out station, out forward))
+            {
+                EraseDrawn(tr, db, m);
+                return true;
+            }
+
+            m.Station = station;
+            bool reverse = !forward ^ m.Reverse;   // сторона по сечению, затем ручной разворот
 
             double eMin = pv.ElevationMin, eMax = pv.ElevationMax;
             double h = eMax - eMin;
@@ -317,9 +357,12 @@ namespace Civil3D_commands.SectionMarks
                 m.TicksSet = true;
             }
 
-            // Пикет вне вида (линию выборки утащили за его края) — рисовать нечего,
-            // но и отметку не стираем: вернут линию, и всё встанет на место.
-            if (m.Station < pv.StationStart || m.Station > pv.StationEnd) return true;
+            // Пикет вне вида — тоже нечего рисовать, запись остаётся.
+            if (m.Station < pv.StationStart || m.Station > pv.StationEnd)
+            {
+                EraseDrawn(tr, db, m);
+                return true;
+            }
 
             Point3d[] top = RwGeometry.ProfileSegment(pv, m.Station, m.TopLow, m.Station, m.TopHigh);
             Point3d[] bot = RwGeometry.ProfileSegment(pv, m.Station, m.BotLow, m.Station, m.BotHigh);
@@ -333,8 +376,8 @@ namespace Civil3D_commands.SectionMarks
 
             m.TopTickHandle = PlaceTick(tr, db, space, layer, m, m.TopTickHandle, top, true);
             m.BotTickHandle = PlaceTick(tr, db, space, layer, m, m.BotTickHandle, bot, false);
-            m.TopArrowHandle = PlaceArrow(tr, db, space, layer, m.TopArrowHandle, top, m.Reverse);
-            m.BotArrowHandle = PlaceArrow(tr, db, space, layer, m.BotArrowHandle, bot, m.Reverse);
+            m.TopArrowHandle = PlaceArrow(tr, db, space, layer, m.TopArrowHandle, top, reverse);
+            m.BotArrowHandle = PlaceArrow(tr, db, space, layer, m.BotArrowHandle, bot, reverse);
             m.BlockHandle = PlaceBlock(tr, db, space, layer, m, tipPoint);
 
             return true;
@@ -360,17 +403,26 @@ namespace Civil3D_commands.SectionMarks
             }
         }
 
-        /// <summary>Стереть всё нарисованное отметкой (сама запись остаётся).</summary>
+        /// <summary>
+        /// Стереть всё нарисованное отметкой (сама запись остаётся). Хэндлы
+        /// стёртого обнуляются: следующая синхронизация нарисует заново.
+        /// </summary>
         public static void EraseDrawn(Transaction tr, Database db, SectionMark m)
         {
             foreach (var link in m.Links())
             {
-                if (link.Value == MarkPart.ProfileView || link.Value == MarkPart.SampleLine ||
-                    link.Value == MarkPart.SectionView) continue;
+                if (link.Value > MarkPart.BotArrow) continue;   // привязки к чертежу не рисуются
 
                 var obj = RwHandles.Open<Entity>(tr, db, link.Key, OpenMode.ForWrite);
                 if (obj != null && !obj.IsErased) obj.Erase();
             }
+
+            var none = new Handle(0);
+            m.BlockHandle = none;
+            m.TopTickHandle = none;
+            m.BotTickHandle = none;
+            m.TopArrowHandle = none;
+            m.BotArrowHandle = none;
         }
 
         // -----------------------------------------------------------------

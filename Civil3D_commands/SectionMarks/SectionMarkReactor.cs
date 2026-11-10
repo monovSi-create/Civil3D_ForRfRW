@@ -182,7 +182,8 @@ namespace Civil3D_commands.SectionMarks
             foreach (Link l in links)
             {
                 bool primary = l.Part == MarkPart.SampleLine || l.Part == MarkPart.SectionView ||
-                               l.Part == MarkPart.ProfileView || l.Part == MarkPart.Block;
+                               l.Part == MarkPart.ProfileView || l.Part == MarkPart.Alignment ||
+                               l.Part == MarkPart.Block;
 
                 // Стёрли основу — отметка уходит. Вернули (UNDO) или стёрли только
                 // чёрточку со стрелкой — отметку перерисовываем.
