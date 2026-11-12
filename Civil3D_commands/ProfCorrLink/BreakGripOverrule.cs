@@ -131,7 +131,9 @@ namespace Civil3D_commands.AssociativeBreaks
                         if (bl != null)
                         {
                             lo = Math.Max(lo, bl.StartStation);
-                            hi = Math.Min(hi, bl.EndStation);
+                            // У смены отметки правая часть коридора — другая базовая
+                            // линия: двигать границу можно до конца ЕЁ профиля.
+                            hi = Math.Min(hi, session.SplitEnd(tr, m, bl.EndStation));
                         }
 
                         double clamped = RwGeometry.Clamp(station, lo, hi);

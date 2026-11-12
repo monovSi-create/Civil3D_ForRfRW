@@ -70,8 +70,7 @@ namespace Civil3D_commands.AssociativeBreaks
         public (double min, double max) GetMoveBounds(StationMarker m, double buffer,
                                                       double baselineStart, double baselineEnd)
         {
-            var siblings = ForProfile(m.ProfileHandle).Where(x => x.Id != m.Id)
-                                                      .Select(x => x.Station).ToList();
+            var siblings = Neighbours(m).Select(x => x.Station).ToList();
             double prev = baselineStart;
             double next = baselineEnd;
             foreach (var s in siblings)
@@ -85,6 +84,43 @@ namespace Civil3D_commands.AssociativeBreaks
 
             return (prev + lower, next - upper);
         }
+
+        /// <summary>
+        /// Маркеры, которые держат этот на месте. Обычно это соседи по профилю,
+        /// но смена отметки (<see cref="StationMarker.MarkerRole.Split"/>) стоит
+        /// МЕЖДУ двумя профилями, и граница коридора по другую её сторону ей
+        /// такой же сосед:
+        ///  • маркер правого профиля видит смену слева от себя — иначе его можно
+        ///    было бы утащить за неё;
+        ///  • сама смена видит маркеры обоих профилей.
+        /// </summary>
+        private List<StationMarker> Neighbours(StationMarker m)
+        {
+            var result = ForProfile(m.ProfileHandle).Where(x => x.Id != m.Id).ToList();
+
+            if (m.IsSplit && m.NextProfileHandle.Value != 0)
+                result.AddRange(ForProfile(m.NextProfileHandle).Where(x => x.Id != m.Id));
+
+            // Смены, у которых наш профиль — правый: они стоят слева от всех его маркеров.
+            result.AddRange(_byId.Values.Where(x => x.IsSplit && x.Id != m.Id
+                                                    && x.NextProfileHandle == m.ProfileHandle
+                                                    && x.ProfileHandle != m.ProfileHandle));
+            return result;
+        }
+
+        /// <summary>
+        /// Смена отметки, ЛЕВАЯ часть которой — этот профиль (профиль на ней кончается).
+        /// </summary>
+        public StationMarker SplitEndingProfile(Handle profileHandle) =>
+            _byId.Values.FirstOrDefault(x => x.IsSplit && x.ProfileHandle == profileHandle);
+
+        /// <summary>
+        /// Смена отметки, ПРАВАЯ часть которой — этот профиль (профиль на ней начинается).
+        /// </summary>
+        public StationMarker SplitStartingProfile(Handle profileHandle) =>
+            profileHandle.Value == 0
+                ? null
+                : _byId.Values.FirstOrDefault(x => x.IsSplit && x.NextProfileHandle == profileHandle);
 
         // ----------------------------------------------------------------------
         //  ПЕРСИСТЕНТНОСТЬ

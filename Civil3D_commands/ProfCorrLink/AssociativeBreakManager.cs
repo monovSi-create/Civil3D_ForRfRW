@@ -11,7 +11,7 @@ namespace Civil3D_commands.AssociativeBreaks
     /// под флагом BreakSession.Suspend(), чтобы реактор не реагировал на собственные правки.
     /// Порядок: правка модели -> профиль (если ступень) -> области -> прокси -> один Rebuild.
     /// </summary>
-    public class AssociativeBreakManager
+    public partial class AssociativeBreakManager
     {
         private readonly BreakSession _session;
         public AssociativeBreakManager(BreakSession session) { _session = session; }
@@ -171,6 +171,14 @@ namespace Civil3D_commands.AssociativeBreaks
             foreach (StationMarker existing in _session.Store.ForProfile(link.ProfileHandle))
                 if (existing.Role == role) return false;
 
+            // Край, на котором стоит смена отметки, держит она сама: там коридор
+            // переходит в другую базовую линию, и второй, концевой, маркер
+            // на том же месте лёг бы поверх неё.
+            if (role == StationMarker.MarkerRole.End &&
+                _session.Store.SplitEndingProfile(link.ProfileHandle) != null) return false;
+            if (role == StationMarker.MarkerRole.Start &&
+                _session.Store.SplitStartingProfile(link.ProfileHandle) != null) return false;
+
             StationMarker m = link.NewMarker();
             m.Role = role;
             m.Station = station;
@@ -218,6 +226,10 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             var m = _session.Store.Get(id);
             if (m == null) return;
+
+            // Смена отметки удаляется иначе: два профиля и две базовые линии
+            // обратно в одну этот метод не склеит.
+            if (m.IsSplit) { ForgetSplit(m); return; }
 
             using (Doc.LockDocument())
             using (_session.Suspend())
@@ -271,6 +283,9 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             var m = _session.Store.Get(id);
             if (m == null) return;
+
+            // Смена отметки двигает сразу два профиля и две базовые линии.
+            if (m.IsSplit) { ApplySplitStationChange(m, newStation); return; }
 
             using (Doc.LockDocument())
             using (_session.Suspend())
@@ -393,6 +408,10 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             var m = _session.Store.Get(id);
             if (m == null) return;
+
+            // У смены отметки нет ступени и своего зазора, который можно было бы
+            // править: правка из палитры возвращается в то, что в модели.
+            if (m.IsSplit) { RestoreSplitProps(m); return; }
 
             using (Doc.LockDocument())
             using (_session.Suspend())

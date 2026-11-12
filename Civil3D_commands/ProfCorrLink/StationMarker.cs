@@ -29,8 +29,15 @@ namespace Civil3D_commands.AssociativeBreaks
         /// та же, что у разрыва, но соседа с другой стороны нет — значит, нет
         /// ни микроразрыва, ни ступени: поднимать «весь профиль правее» за
         /// пределами коридора не над чем.
+        ///
+        /// <see cref="MarkerRole.Split"/> — смена отметки (RW_BOTTOMSTEP): коридор
+        /// на этом пикете разделён на ДВЕ базовые линии с двумя профилями. Левая
+        /// часть (<see cref="ProfileHandle"/>) кончается на S − полузазор, правая
+        /// (<see cref="NextProfileHandle"/>) начинается на S + полузазор и лежит
+        /// на <see cref="StepHeight"/> выше или ниже. От ступени отличается тем,
+        /// что профиль не ломается, а режется на два самостоятельных.
         /// </summary>
-        public enum MarkerRole { Break = 0, Start = 1, End = 2 }
+        public enum MarkerRole { Break = 0, Start = 1, End = 2, Split = 3 }
 
         // Тег и версия формата записи. До их появления запись начиналась сразу
         // с Guid, и отличить свою запись от чужой было нельзя вообще: чтение
@@ -39,7 +46,8 @@ namespace Civil3D_commands.AssociativeBreaks
         private const string Tag = "RWBREAK";
         // 2 — собственный микроразрыв у каждого разрыва.
         // 3 — роль маркера: разрыв или конец коридора.
-        private const int FormatVersion = 3;
+        // 4 — смена отметки: хэндл правого профиля.
+        private const int FormatVersion = 4;
 
         /// <summary>
         /// Вид записи. LinkStore хранит связь этим же классом (заполнены только
@@ -61,7 +69,14 @@ namespace Civil3D_commands.AssociativeBreaks
         public MarkerRole Role { get; set; } = MarkerRole.Break;
 
         /// <summary>Концевая граница коридора — её нельзя ни удалить, ни сделать ступенью.</summary>
-        public bool IsTerminal => Role != MarkerRole.Break;
+        public bool IsTerminal => Role == MarkerRole.Start || Role == MarkerRole.End;
+
+        /// <summary>
+        /// Смена отметки: коридор разделён на две базовые линии. Ступенью в смысле
+        /// <see cref="IsStep"/> не бывает — высота лежит в <see cref="StepHeight"/>
+        /// как сдвиг правого профиля, а PVI левого не трогаются.
+        /// </summary>
+        public bool IsSplit => Role == MarkerRole.Split;
 
         /// <summary>true — это ступень профиля; false — рубка на ровном участке.</summary>
         public bool IsStep { get; set; }
@@ -93,7 +108,8 @@ namespace Civil3D_commands.AssociativeBreaks
         /// </summary>
         public double HalfGap
         {
-            get { return ProfileGeometryOps.SanitizeGap(Gap) / 2.0; }
+            // У смены отметки зазора нет: обе части стыкуются ровно на пикете.
+            get { return IsSplit ? 0.0 : ProfileGeometryOps.SanitizeGap(Gap) / 2.0; }
         }
 
         /// <summary>Слой прокси-объектов.</summary>
@@ -101,6 +117,12 @@ namespace Civil3D_commands.AssociativeBreaks
 
         // --- Связи с объектами чертежа. Храним Handle, а не ObjectId: Handle стабилен между сессиями. ---
         public Handle ProfileHandle { get; set; }      // Profile (продольный профиль-основание)
+
+        /// <summary>
+        /// Только у <see cref="MarkerRole.Split"/>: профиль ПРАВОЙ части коридора
+        /// (левая — <see cref="ProfileHandle"/>). У прочих ролей пусто.
+        /// </summary>
+        public Handle NextProfileHandle { get; set; }
         public Handle ProfileViewHandle { get; set; }  // ProfileView
         public Handle AlignmentHandle { get; set; }    // Alignment (ось — для плана)
         public Handle CorridorHandle { get; set; }     // Corridor
@@ -144,7 +166,9 @@ namespace Civil3D_commands.AssociativeBreaks
                 // формат 2
                 new TypedValue((int)DxfCode.Real, Gap),
                 // формат 3
-                new TypedValue((int)DxfCode.Int16, (short)Role));
+                new TypedValue((int)DxfCode.Int16, (short)Role),
+                // формат 4
+                new TypedValue((int)DxfCode.Text, RwHandles.ToText(NextProfileHandle)));
         }
 
         /// <summary>
@@ -217,9 +241,16 @@ namespace Civil3D_commands.AssociativeBreaks
             if (v.Length > i)
                 m.Role = ParseRole(Convert.ToInt16(v[i++].Value));
 
+            // Формат 4: правый профиль смены отметки.
+            if (v.Length > i)
+                m.NextProfileHandle = RwHandles.Parse(v[i++].Value.ToString());
+
             // Концевая граница ступенью быть не может. Проверка здесь, а не
             // только при вводе: запись в чертеже могли поправить руками.
             if (m.IsTerminal) { m.IsStep = false; m.StepHeight = 0.0; }
+
+            // У смены отметки StepHeight — сдвиг правого профиля, а не ступень.
+            if (m.IsSplit) m.IsStep = false;
 
             return m;
         }
@@ -229,6 +260,7 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             if (value == (short)MarkerRole.Start) return MarkerRole.Start;
             if (value == (short)MarkerRole.End) return MarkerRole.End;
+            if (value == (short)MarkerRole.Split) return MarkerRole.Split;
             return MarkerRole.Break;
         }
 

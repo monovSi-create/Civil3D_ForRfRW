@@ -15,7 +15,7 @@ using AcAp = Autodesk.AutoCAD.ApplicationServices.Application;
 
 namespace Civil3D_commands.AssociativeBreaks
 {
-    public class BreakCommands : IExtensionApplication
+    public partial class BreakCommands : IExtensionApplication
     {
         private static BreakGripOverrule _gripOverrule;
 
@@ -409,7 +409,7 @@ namespace Civil3D_commands.AssociativeBreaks
         ///    нельзя, поэтому печатаем имя: подмену видно сразу;
         ///  • слой профиля выключен или заморожен — тоже сообщаем.
         /// </summary>
-        private static void EnsureProfileVisible(Transaction tr, Database db, Editor ed,
+        internal static void EnsureProfileVisible(Transaction tr, Database db, Editor ed,
                                                  ObjectId profileViewId, Profile profile,
                                                  double elevation)
         {
@@ -999,6 +999,18 @@ namespace Civil3D_commands.AssociativeBreaks
                 return;
             }
 
+            // Смена отметки — это два профиля и две базовые линии, а не пара
+            // PVI: «удалить» её значило бы склеивать их обратно, и этого модуль
+            // пока не умеет. Лучше отказать, чем снять прокси и оставить коридор
+            // разрезанным без ручки.
+            if (target != null && target.IsSplit)
+            {
+                ed.WriteMessage(
+                    "\nЭто граница смены отметки (RW_BOTTOMSTEP) — удалить её нельзя." +
+                    "\nДвигать можно: ручкой или веткой «Перенести» в RW_EDITMODE.");
+                return;
+            }
+
             session.Manager.DeleteBreak(id.Value);
             ed.WriteMessage("\nРазрыв удалён.");
         }
@@ -1272,6 +1284,18 @@ namespace Civil3D_commands.AssociativeBreaks
             // У конца коридора нет ни ступени, ни микроразрыва — спрашивать
             // о них нечего, а участок рядом только один.
             if (m.IsTerminal) { EditTerminalCore(doc, session, m); return; }
+
+            // У смены отметки нет ни ступени, ни своего микроразрыва в этом меню:
+            // сдвиг задан при создании, а границу двигают ручкой или «Перенести».
+            if (m.IsSplit)
+            {
+                ed.WriteMessage(
+                    $"\nСмена отметки на пикете {m.Station:F3}: сдвиг {m.StepHeight:+0.###;-0.###;0}, " +
+                    $"микроразрыв {m.Gap:F4}." +
+                    "\nСвойства здесь не правятся: перенос — ручкой или веткой «Перенести»," +
+                    " конструкции участков — веткой «Конструкция».");
+                return;
+            }
 
             ed.WriteMessage(
                 $"\nРазрыв на пикете {m.Station:F3}: ступень={(m.IsStep ? m.StepHeight.ToString("F3") : "нет")}, " +
@@ -2017,6 +2041,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 hi = Math.Min(hi, bl.EndStation);
             }
 
+            // Смена отметки стоит между двумя профилями: ей можно двигаться
+            // вправо до конца профиля ПРАВОЙ части, а не только левой.
+            if (target is StationMarker split && split.IsSplit)
+                hi = session.SplitEnd(tr, split, hi);
+
             lo += margin;
             hi -= margin;
 
@@ -2090,7 +2119,7 @@ namespace Civil3D_commands.AssociativeBreaks
         /// «без меток». Если и это не пройдёт, вызывающий откатится на первый
         /// набор из списка — метки лучше, чем несозданный профиль.
         /// </summary>
-        private static ObjectId FindEmptyLabelSet(CivilDocument civDoc, Transaction tr)
+        internal static ObjectId FindEmptyLabelSet(CivilDocument civDoc, Transaction tr)
         {
             try
             {

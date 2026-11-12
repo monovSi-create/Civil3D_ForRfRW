@@ -106,6 +106,17 @@ namespace Civil3D_commands.AssociativeBreaks
             return _links.FirstOrDefault(l => l.Covers(target));
         }
 
+        /// <summary>
+        /// Связь именно этого профиля в этом коридоре. После смены отметки на
+        /// одном виде лежат две связи одного коридора — различает их профиль.
+        /// </summary>
+        public BreakLink FindLinkByProfile(Handle profileHandle, Handle corridorHandle)
+        {
+            if (profileHandle.Value == 0) return null;
+            return _links.FirstOrDefault(l => l.ProfileHandle == profileHandle
+                                              && l.CorridorHandle == corridorHandle);
+        }
+
         public void AddLink(BreakLink link)
         {
             if (link == null) return;
@@ -326,6 +337,47 @@ namespace Civil3D_commands.AssociativeBreaks
                     if (bl.AlignmentId == alId) return bl;
 
             return null;
+        }
+
+        /// <summary>
+        /// Базовая линия коридора по профилю — СТРОГО по профилю, без запасного
+        /// поиска по оси, как у <see cref="GetBaseline"/>. Для смены отметки это
+        /// принципиально: у неё две базовые линии на одной оси, и «любая с той же
+        /// осью» вернула бы левую вместо правой.
+        /// </summary>
+        public Baseline GetBaselineByProfile(Transaction tr, Corridor corridor, Handle profileHandle)
+        {
+            if (corridor == null) return null;
+
+            ObjectId profId = RwHandles.Resolve(_doc.Database, profileHandle);
+            if (profId.IsNull) return null;
+
+            foreach (Baseline bl in corridor.Baselines)
+                if (bl.ProfileId == profId) return bl;
+
+            return null;
+        }
+
+        /// <summary>
+        /// Конец допустимых пикетов смены отметки: профиль и базовая линия ПРАВОЙ
+        /// части. Левая кончается на самой смене, и двигать смену вправо можно
+        /// ровно настолько, насколько тянется правая часть. Нет правой части —
+        /// возвращается <paramref name="fallback"/>.
+        /// </summary>
+        public double SplitEnd(Transaction tr, StationMarker m, double fallback)
+        {
+            if (m == null || !m.IsSplit) return fallback;
+
+            var profile = RwHandles.Open<Profile>(tr, _doc.Database, m.NextProfileHandle, OpenMode.ForRead);
+            if (profile == null) return fallback;
+
+            double end = profile.EndingStation;
+
+            Corridor corridor = RwHandles.Open<Corridor>(tr, _doc.Database, m.CorridorHandle, OpenMode.ForRead);
+            Baseline right = GetBaselineByProfile(tr, corridor, m.NextProfileHandle);
+            if (right != null) end = Math.Min(end, right.EndStation);
+
+            return end;
         }
 
         public Corridor GetCorridor(Transaction tr, IBreakTarget target)

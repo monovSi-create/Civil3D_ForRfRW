@@ -412,7 +412,7 @@ namespace Civil3D_commands.AssociativeBreaks
             }
         }
 
-        private static BaselineRegion FindByGuid(BaselineRegionCollection regions, Guid id)
+        internal static BaselineRegion FindByGuid(BaselineRegionCollection regions, Guid id)
         {
             if (id == Guid.Empty) return null;
             foreach (BaselineRegion r in regions)
@@ -421,7 +421,7 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>Область, внутрь которой попадает пикет (с запасом на будущий зазор).</summary>
-        private static BaselineRegion FindRegionAt(BaselineRegionCollection regions,
+        internal static BaselineRegion FindRegionAt(BaselineRegionCollection regions,
                                                    double station, double halfGap)
         {
             foreach (BaselineRegion r in regions)
