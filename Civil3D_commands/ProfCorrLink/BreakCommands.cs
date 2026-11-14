@@ -18,6 +18,7 @@ namespace Civil3D_commands.AssociativeBreaks
     public partial class BreakCommands : IExtensionApplication
     {
         private static BreakGripOverrule _gripOverrule;
+        private static BreakArrowOverrule _arrowOverrule;
 
         // ------------------------------------------------------------------
         //  ЖИЗНЕННЫЙ ЦИКЛ
@@ -26,6 +27,24 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             _gripOverrule = new BreakGripOverrule();
             Overrule.AddOverrule(RXObject.GetClass(typeof(Line)), _gripOverrule, false);
+
+            // Стрелки на прокси: отдельный оверрул отрисовки. Падение здесь не должно
+            // утащить за собой ручки и реактор — они работают и без стрелок.
+            try
+            {
+                _arrowOverrule = new BreakArrowOverrule();
+                Overrule.AddOverrule(RXObject.GetClass(typeof(Line)), _arrowOverrule, false);
+            }
+            catch (System.Exception)
+            {
+                _arrowOverrule = null;
+            }
+
+            // Перехват щелчка по стрелке: без него у прокси нет ни ручек, ни способа
+            // его сдвинуть, кроме ветки «Перенести» в RW_EDITMODE.
+            try { BreakArrowMouse.Enable(); }
+            catch (System.Exception) { }
+
             Overrule.Overruling = true;
 
             // Модуль облицовки вешает на Line свой оверрул ручек. Своего
@@ -66,6 +85,15 @@ namespace Civil3D_commands.AssociativeBreaks
                 Overrule.RemoveOverrule(RXObject.GetClass(typeof(Line)), _gripOverrule);
                 _gripOverrule.Dispose();
                 _gripOverrule = null;
+            }
+
+            BreakArrowMouse.Disable();
+
+            if (_arrowOverrule != null)
+            {
+                Overrule.RemoveOverrule(RXObject.GetClass(typeof(Line)), _arrowOverrule);
+                _arrowOverrule.Dispose();
+                _arrowOverrule = null;
             }
         }
 
@@ -537,6 +565,9 @@ namespace Civil3D_commands.AssociativeBreaks
                 kw.Keywords.Add("Assembly", "Конструкция", "Конструкция");
                 kw.Keywords.Add("Off",      "Выключить",  "Выключить");
                 kw.Keywords.Add("Delete",   "Удалить",    "Удалить");
+                // «Отметка» — смена отметки коридора (то же, что RW_BOTTOMSTEP);
+                // не «Смена»: оно начиналось бы на ту же букву, что и «Связь».
+                kw.Keywords.Add("Level",    "Отметка",    "Отметка");
                 kw.Keywords.Default = "Break";   // глобальное имя, не подпись
 
                 PromptResult res = ed.GetKeywords(kw);
@@ -562,6 +593,10 @@ namespace Civil3D_commands.AssociativeBreaks
 
                     case "Assembly":
                         using (new BoundaryUnlock(doc, session)) ChangeRegionAssemblyCore(doc, session);
+                        break;
+
+                    case "Level":
+                        BottomStepMenu(doc, session);
                         break;
 
                     case "Delete":
@@ -855,6 +890,29 @@ namespace Civil3D_commands.AssociativeBreaks
 
             ed.WriteMessage($"\nПикет {station:F3} (источник: {source}).");
 
+            // После смены отметки (RW_BOTTOMSTEP) у коридора несколько базовых линий,
+            // по связи на каждую. Разрыв создаётся на той, чей профиль накрывает
+            // пикет, — а не обязательно на активной.
+            BreakLink atStation;
+            using (var tr = doc.Database.TransactionManager.StartTransaction())
+            {
+                atStation = LinkAtStation(tr, doc.Database, session, link, station);
+                tr.Commit();
+            }
+
+            if (atStation == null)
+            {
+                ed.WriteMessage(
+                    $"\nПикет {station:F3} не попадает ни в один профиль этого коридора — разрыв не создан.");
+                return;
+            }
+
+            if (atStation != link)
+            {
+                ed.WriteMessage($"\nПикет лежит на связи «{atStation.Label}» — разрыв создаётся в ней.");
+                link = atStation;
+            }
+
             // Ступень?
             var stepKw = new PromptKeywordOptions("\nЭто ступень профиля?");
             stepKw.Keywords.Add("Yes", "Да", "Да");
@@ -999,15 +1057,11 @@ namespace Civil3D_commands.AssociativeBreaks
                 return;
             }
 
-            // Смена отметки — это два профиля и две базовые линии, а не пара
-            // PVI: «удалить» её значило бы склеивать их обратно, и этого модуль
-            // пока не умеет. Лучше отказать, чем снять прокси и оставить коридор
-            // разрезанным без ручки.
+            // Смена отметки — это два профиля и две базовые линии: удаляется склейкой
+            // их обратно, тем же путём, что пункт «Удалить» команды RW_BOTTOMSTEP.
             if (target != null && target.IsSplit)
             {
-                ed.WriteMessage(
-                    "\nЭто граница смены отметки (RW_BOTTOMSTEP) — удалить её нельзя." +
-                    "\nДвигать можно: ручкой или веткой «Перенести» в RW_EDITMODE.");
+                DeleteSplitInteractive(doc, session, target);
                 return;
             }
 
@@ -1044,6 +1098,18 @@ namespace Civil3D_commands.AssociativeBreaks
                 ed.WriteMessage("\nЭта линия в модели не числится — не прокси разрыва или его копия.");
                 return;
             }
+
+            MoveMarkerCore(doc, session, m);
+        }
+
+        /// <summary>
+        /// Перенос границы jig'ом для уже известного маркера. Отдельно от выбора
+        /// линии, потому что маркер приходит и по щелчку в стрелку прокси
+        /// (<see cref="BreakArrowMouse"/>), без всякого выбора.
+        /// </summary>
+        internal static void MoveMarkerCore(Document doc, BreakSession session, StationMarker m)
+        {
+            var ed = doc.Editor;
 
             double station;
             bool accepted = false;
@@ -1285,17 +1351,9 @@ namespace Civil3D_commands.AssociativeBreaks
             // о них нечего, а участок рядом только один.
             if (m.IsTerminal) { EditTerminalCore(doc, session, m); return; }
 
-            // У смены отметки нет ни ступени, ни своего микроразрыва в этом меню:
-            // сдвиг задан при создании, а границу двигают ручкой или «Перенести».
-            if (m.IsSplit)
-            {
-                ed.WriteMessage(
-                    $"\nСмена отметки на пикете {m.Station:F3}: сдвиг {m.StepHeight:+0.###;-0.###;0}, " +
-                    $"микроразрыв {m.Gap:F4}." +
-                    "\nСвойства здесь не правятся: перенос — ручкой или веткой «Перенести»," +
-                    " конструкции участков — веткой «Конструкция».");
-                return;
-            }
+            // Смена отметки: вместо ступени — высота, плюс конструкции участков по обе
+            // стороны (они лежат в РАЗНЫХ базовых линиях).
+            if (m.IsSplit) { EditSplitCore(doc, session, m); return; }
 
             ed.WriteMessage(
                 $"\nРазрыв на пикете {m.Station:F3}: ступень={(m.IsStep ? m.StepHeight.ToString("F3") : "нет")}, " +

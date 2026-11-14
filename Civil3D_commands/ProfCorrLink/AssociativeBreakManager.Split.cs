@@ -10,19 +10,6 @@ using Civil3D_commands.Shared;
 namespace Civil3D_commands.AssociativeBreaks
 {
     /// <summary>
-    /// Итог создания смены отметки — для сообщения команды.
-    /// </summary>
-    public sealed class SplitResult
-    {
-        public StationMarker Marker;
-        public BreakLink LeftLink;
-        public BreakLink RightLink;
-
-        /// <summary>Чего не удалось перенести или что стоит знать пользователю.</summary>
-        public List<string> Notes = new List<string>();
-    }
-
-    /// <summary>
     /// Смена отметки коридора (RW_BOTTOMSTEP).
     ///
     /// Ступень в профиле (обычный разрыв) ломает ОДИН профиль парой PVI, и коридор
@@ -73,221 +60,12 @@ namespace Civil3D_commands.AssociativeBreaks
             public SubassemblyTargetInfoCollection Targets;
         }
 
-        // ======================================================================
-        //  СОЗДАНИЕ
-        // ======================================================================
-
-        /// <summary>
-        /// Разделить коридор связи <paramref name="link"/> на пикете
-        /// <paramref name="station"/> и сместить правую часть на <paramref name="delta"/>
-        /// (+ вверх, − вниз). Бросает <see cref="InvalidOperationException"/> с понятным
-        /// текстом, если сделать этого нельзя: транзакция при этом откатывается.
-        /// </summary>
-        public SplitResult CreateSplit(BreakLink link, double station, double delta)
-        {
-            if (link == null) throw new ArgumentNullException(nameof(link));
-            if (double.IsNaN(station) || double.IsInfinity(station))
-                throw new InvalidOperationException("Пикет не определён.");
-            if (double.IsNaN(delta) || double.IsInfinity(delta) || Math.Abs(delta) < 1e-9)
-                throw new InvalidOperationException("Высота смены отметки не может быть нулевой.");
-
-            var db = Doc.Database;
-            var civDoc = CivilApplication.ActiveDocument;
-            var result = new SplitResult { LeftLink = link };
-            bool edit = _session.IsEditMode(link.ProfileHandle);
-            Handle rightHandle;
-
-            using (Doc.LockDocument())
-            using (_session.Suspend())
-            using (var tr = db.TransactionManager.StartTransaction())
-            {
-                BreakOverlay.Unlock(tr, db);
-
-                var profile = RwHandles.Open<Profile>(tr, db, link.ProfileHandle, OpenMode.ForWrite);
-                var pv = RwHandles.Open<ProfileView>(tr, db, link.ProfileViewHandle, OpenMode.ForRead);
-                var alignment = RwHandles.Open<Alignment>(tr, db, link.AlignmentHandle, OpenMode.ForRead);
-                var corridor = RwHandles.Open<Corridor>(tr, db, link.CorridorHandle, OpenMode.ForWrite);
-
-                if (profile == null || pv == null || alignment == null || corridor == null)
-                    throw new InvalidOperationException(
-                        "Связь потеряла профиль, вид, ось или коридор — открыть их не удалось.");
-
-                Baseline left = _session.GetBaselineByProfile(tr, corridor, link.ProfileHandle);
-                if (left == null)
-                    throw new InvalidOperationException(
-                        "У коридора нет базовой линии, построенной на профиле «" + profile.Name + "».");
-
-                StationMarker marker = link.NewMarker();
-                marker.Role = StationMarker.MarkerRole.Split;
-                marker.Station = station;
-                marker.StepHeight = delta;
-                marker.IsStep = false;
-                marker.Gap = 0.0;                 // стык ровно на пикете, HalfGap у Split = 0
-                double half = marker.HalfGap;
-                double cutLeft = station - half;
-                double startRight = station + half;
-
-                BreakTrace.Snapshot(tr, db, _session, marker,
-                    string.Format(CultureInfo.InvariantCulture,
-                        "СМЕНА ОТМЕТКИ, пикет {0:F3}, сдвиг {1:F3}, зазор {2}", station, delta, marker.Gap));
-
-                PreflightSplit(profile, left, marker, half);
-                BreakTrace.Step("проверка пройдена");
-
-                // --- Что есть до правок: отметки на концах зазора и вершины профиля ---
-                double eLeftEnd = profile.ElevationAt(cutLeft);
-                double eRightStart = profile.ElevationAt(startRight) + delta;
-                double profileEnd = profile.EndingStation;
-
-                var pvis = profile.PVIs.Cast<ProfilePVI>()
-                                  .OrderBy(p => p.Station)
-                                  .Select(p => new Pt(p.Station, p.Elevation))
-                                  .ToList();
-                double endElev = pvis[pvis.Count - 1].Elevation + delta;
-
-                // --- Правый профиль ---
-                string baseName = left.Name;
-                string profName = UniqueProfileName(tr, alignment,
-                    baseName + " " + eRightStart.ToString("0.###", CultureInfo.InvariantCulture));
-
-                BreakTrace.Step("профиль: создание правого «" + profName + "»");
-                ObjectId rightId = CreateRightProfile(
-                    tr, db, civDoc, profile, alignment, profName,
-                    startRight, eRightStart, profileEnd, endElev, pvis, delta, result.Notes);
-
-                var rightProfile = (Profile)tr.GetObject(rightId, OpenMode.ForWrite);
-                rightHandle = rightProfile.Handle;
-
-                PropertySetSupport.Attach(tr, rightId, PropertySetSupport.EnsureEditPsd(db));
-
-                // --- Правая базовая линия и перенос участков ---
-                string blName = UniqueBaselineName(corridor, profName);
-                BreakTrace.Step("коридор: базовая линия «" + blName + "»");
-                Baseline right = corridor.Baselines.Add(blName, alignment.ObjectId, rightId);
-
-                BreakTrace.Step("коридор: перенос участков");
-                Guid hostId, firstRightId;
-                Dictionary<Guid, Guid> map = TransferRegions(
-                    left, right, cutLeft, startRight, result.Notes, out hostId, out firstRightId);
-
-                marker.LeftRegionId = hostId;
-                marker.RightRegionId = firstRightId;
-
-                // --- Левый профиль: обрезать по S − полузазор ---
-                // Участки левой базовой линии уже ужаты (TransferRegions) — профиль
-                // можно резать, не оставляя область за его концом.
-                BreakTrace.Step("профиль: обрезка левого");
-                TruncateProfileEnd(profile, cutLeft, eLeftEnd);
-
-                // --- Маркеры правее S переезжают в правую связь ---
-                BreakLink rightLink = new BreakLink
-                {
-                    ProfileHandle     = rightHandle,
-                    ProfileViewHandle = link.ProfileViewHandle,
-                    AlignmentHandle   = link.AlignmentHandle,
-                    CorridorHandle    = link.CorridorHandle
-                };
-                rightLink.ColorIndex = BreakOverlay.RandomColor(rightLink.Id);
-                rightLink.RefreshNames(tr, db);
-
-                foreach (StationMarker mk in _session.Store.ForProfile(link.ProfileHandle)
-                                                     .Where(x => x.Station > station).ToList())
-                {
-                    mk.ProfileHandle = rightHandle;
-                    mk.BaseElevation += delta;
-
-                    Guid g;
-                    if (map.TryGetValue(mk.LeftRegionId, out g)) mk.LeftRegionId = g;
-                    if (map.TryGetValue(mk.RightRegionId, out g)) mk.RightRegionId = g;
-                }
-
-                int slot = _session.Links.Count(l => l.ProfileViewHandle == link.ProfileViewHandle);
-                BreakController.Ensure(tr, db, rightLink, slot);
-                _session.AddLink(rightLink);
-
-                // --- Сам маркер и его прокси ---
-                marker.NextProfileHandle = rightHandle;
-                marker.BaseElevation = eLeftEnd;
-
-                BreakTrace.Step("прокси смены отметки");
-                BreakProxyFactory.CreateProxies(tr, db, marker, pv, alignment);
-                _session.Store.Add(marker);
-                WriteProps(tr, marker);
-
-                BreakTrace.Step("коридор: Rebuild");
-                corridor.Rebuild();
-
-                // Профиль должен быть ВИДЕН в виде: тот же заслон, что у мастера связи.
-                BreakCommands.EnsureProfileVisible(
-                    tr, db, Doc.Editor, pv.ObjectId, rightProfile, eRightStart);
-
-                BreakTrace.Step("оформление");
-                RefreshOverlays(tr, link, rightLink);
-
-                BreakTrace.Step("коммит транзакции");
-                tr.Commit();
-                BreakTrace.Step("коммит прошёл");
-
-                result.Marker = marker;
-                result.RightLink = rightLink;
-            }
-
-            _session.Store.SaveToDatabase(db);
-            _session.SaveLinks();
-
-            // Режим правки переносится на правый профиль: иначе ручки у маркеров,
-            // уехавших в него, пропали бы, хотя левая часть правится.
-            if (edit) _session.SetEditMode(rightHandle, true);
-
-            return result;
-        }
-
-        /// <summary>
-        /// Проверки до первой правки. Профиль и коридор правятся по очереди, и
-        /// отказ посередине оставил бы их в разных состояниях — а нативный вызов
-        /// Civil, получивший негодные данные, иногда роняет процесс.
-        /// </summary>
-        private void PreflightSplit(Profile profile, Baseline left, StationMarker m, double half)
-        {
-            // Ломать (резать) можно только проектный профиль по трассе: у остальных
-            // правка вершин не определена — то же правило, что у ступени.
-            if (profile.ProfileType != ProfileType.FG)
-                throw new InvalidOperationException(
-                    "Профиль «" + profile.Name + "» имеет тип " + profile.ProfileType +
-                    ", а смена отметки работает только с проектным профилем (FG).");
-
-            double buf = BreakGripOverrule.Buffer;
-            double s = m.Station;
-
-            if (!(s - half > profile.StartingStation + buf) || !(s + half < profile.EndingStation - buf))
-                throw new InvalidOperationException(
-                    "Пикет " + s.ToString("F3") + " слишком близко к краю профиля (" +
-                    profile.StartingStation.ToString("F3") + ".." + profile.EndingStation.ToString("F3") +
-                    "): от края нужно не меньше " + buf.ToString("0.###") + " м.");
-
-            var bounds = _session.Store.GetMoveBounds(m, buf, left.StartStation, left.EndStation);
-            if (s < bounds.min - 1e-9 || s > bounds.max + 1e-9)
-                throw new InvalidOperationException(
-                    "Пикет " + s.ToString("F3") + " слишком близко к другой границе коридора. " +
-                    "Допустимо " + bounds.min.ToString("F3") + ".." + bounds.max.ToString("F3") + ".");
-
-            if (ProfileGeometryOps.FindRegionAt(left.BaselineRegions, s, half) == null)
-                throw new InvalidOperationException(
-                    "Пикет " + s.ToString("F3") + " не попадает ни в один участок коридора.");
-
-            foreach (ProfilePVI p in profile.PVIs.Cast<ProfilePVI>())
-                if (Math.Abs(p.Station - (s - half)) < SplitFindTol * 0.1 ||
-                    Math.Abs(p.Station - (s + half)) < SplitFindTol * 0.1)
-                    throw new InvalidOperationException(
-                        "На этом пикете в профиле уже стоит вершина — сдвиньте пикет.");
-        }
-
         /// <summary>
         /// Правый профиль: создаётся двумя вершинами (начало и КОНЕЦ — так же, как
         /// строит плоский профиль мастер связи), потом внутрь добавляются остальные.
         /// Вставка вершин за пределами уже построенного профиля не используется.
         /// </summary>
-        private ObjectId CreateRightProfile(Transaction tr, Database db, CivilDocument civDoc,
+        private static ObjectId CreateRightProfile(Transaction tr, Database db, CivilDocument civDoc,
                                             Profile source, Alignment alignment, string name,
                                             double start, double startElev,
                                             double end, double endElev,
@@ -295,9 +73,29 @@ namespace Civil3D_commands.AssociativeBreaks
         {
             // Стиль профиля прочитать нельзя (свойство только для записи), поэтому
             // берётся тот же, что у мастера. Слой — как у исходного профиля.
-            ObjectId styleId = civDoc.Styles.ProfileStyles[0];
+            // У Profile свойство StyleId только для записи, а у базового класса
+            // Entity оно читается — через него берём стиль исходного профиля.
+            // Первый стиль из списка мог оказаться стилем без отображения:
+            // профиль при этом есть в модели, но в виде его не видно.
+            ObjectId styleId = ObjectId.Null;
+            try { styleId = ((Autodesk.Civil.DatabaseServices.Entity)source).StyleId; }
+            catch (System.Exception ex) { BreakTrace.Step("  стиль исходного профиля не прочитан: " + ex.Message); }
+
+            if (styleId.IsNull)
+            {
+                styleId = civDoc.Styles.ProfileStyles[0];
+                notes.Add("Стиль исходного профиля прочитать не удалось — у нового взят первый в чертеже; смените его вручную.");
+            }
+
             ObjectId labelSetId = BreakCommands.FindEmptyLabelSet(civDoc, tr);
             ObjectId layerId = source.LayerId;
+
+            try
+            {
+                BreakTrace.Step("  стиль " + ((Autodesk.Civil.DatabaseServices.Entity)source).StyleName +
+                                ", слой " + source.Layer);
+            }
+            catch (System.Exception) { }
 
             ObjectId rightId;
             try
@@ -313,12 +111,47 @@ namespace Civil3D_commands.AssociativeBreaks
             }
 
             var right = (Profile)tr.GetObject(rightId, OpenMode.ForWrite);
-            right.PVIs.AddPVI(start, startElev);
+
+            // Профиль строится КАК В МАСТЕРЕ СВЯЗИ: первая вершина в начале оси,
+            // вторая — в конце. Первая вершина посреди трассы отвергалась
+            // («значение не попадает в ожидаемый диапазон»). Нужное начало
+            // получается потом обрезкой — вставкой вершины ВНУТРЬ и снятием
+            // всего левее, тем же приёмом, что и у левого профиля.
+            // Профиль исходной связи может выходить за ось (ось потом укоротили):
+            // в журнале конец профиля 251.315 при конце оси 251.113, и вершина
+            // за осью отвергается. Правый профиль ограничивается осью.
+            double alStart = alignment.StartingStation;
+            double alEnd = alignment.EndingStation;
+            BreakTrace.Step(string.Format(CultureInfo.InvariantCulture,
+                "ось: {0:F3}..{1:F3}, конец профиля {2:F3}", alStart, alEnd, end));
+
+            if (end > alEnd)
+            {
+                end = alEnd;
+                endElev = source.ElevationAt(Math.Min(end, source.EndingStation)) + delta;
+                notes.Add("Профиль выходил за конец оси — правый профиль кончается на конце оси (" +
+                          alEnd.ToString("F3", CultureInfo.InvariantCulture) + ").");
+            }
+
+            bool needTrim = start - alStart > SplitTol;
+            double first = needTrim ? alStart : start;
+
+            BreakTrace.Step("правый профиль: вершина в начале " + first.ToString("F3", CultureInfo.InvariantCulture));
+            right.PVIs.AddPVI(first, startElev);
+
+            BreakTrace.Step("правый профиль: вершина в конце " + end.ToString("F3", CultureInfo.InvariantCulture));
             right.PVIs.AddPVI(end, endElev);
 
-            // Остальные вершины прежнего профиля правее зазора — те же, но на delta.
+            // Остальные вершины прежнего профиля правее пикета — те же, но на delta.
+            BreakTrace.Step("правый профиль: внутренние вершины");
             foreach (Pt p in pvis.Where(p => p.Station > start + SplitTol && p.Station < end - SplitTol))
                 right.PVIs.AddPVI(p.Station, p.Elevation + delta);
+
+            if (needTrim)
+            {
+                BreakTrace.Step("правый профиль: обрезка начала на " + start.ToString("F3", CultureInfo.InvariantCulture));
+                CutProfileStart(right, start, startElev);
+            }
 
             if (source.PVIs.Cast<ProfilePVI>().Any(p => p.PVIType == ProfileEntityType.Circular
                                                       || p.PVIType == ProfileEntityType.ParabolaSymmetric
@@ -418,14 +251,7 @@ namespace Civil3D_commands.AssociativeBreaks
 
                 index++;
 
-                if (plan.Targets != null)
-                {
-                    try { created.SetTargets(plan.Targets); }
-                    catch (System.Exception)
-                    {
-                        notes.Add("Цели участка «" + plan.Name + "» не перенесены — задайте их заново.");
-                    }
-                }
+                CopyRegionSettings(plan, created, notes);
 
                 map[plan.OldId] = created.RegionGUID;
                 if (plan.IsHost) hostId = plan.OldId;
@@ -453,6 +279,109 @@ namespace Civil3D_commands.AssociativeBreaks
         }
 
         /// <summary>
+        /// Перенести настройки участка в его продолжение. Старый участок ещё жив
+        /// (он стирается или укорачивается позже), поэтому копировать можно с него.
+        ///
+        /// Основной путь — <c>BaselineRegion.Match(источник, All)</c>: Civil сам копирует
+        /// конструкцию, цели и частоты. Если он не принят, цели и частоты копируются
+        /// по отдельности. Станции после <c>Match</c> возвращаются на место, а
+        /// дополнительные станции переносятся те, что попали в диапазон нового участка.
+        /// Всё, что не удалось, попадает в <paramref name="notes"/>, а не теряется молча.
+        /// </summary>
+        private static void CopyRegionSettings(RegionPlan plan, BaselineRegion created, List<string> notes)
+        {
+            bool matched = false;
+
+            try
+            {
+                BreakTrace.Step("  участок «" + plan.Name + "»: Match(All)");
+                created.Match(plan.Old, RegionMatchType.All);
+                matched = true;
+            }
+            catch (System.Exception ex)
+            {
+                BreakTrace.Step("  Match не принят (" + ex.Message + ") — копирую по частям");
+            }
+
+            // Match мог тронуть станции — возвращаем.
+            try
+            {
+                if (Math.Abs(created.StartStation - plan.Start) > SplitTol) created.StartStation = plan.Start;
+                if (Math.Abs(created.EndStation - plan.End) > SplitTol) created.EndStation = plan.End;
+            }
+            catch (System.Exception ex)
+            {
+                BreakTrace.Step("  станции участка после Match не восстановлены: " + ex.Message);
+            }
+
+            if (!matched)
+            {
+                created.AssemblyId = plan.AssemblyId;
+
+                if (plan.Targets != null)
+                {
+                    try { created.SetTargets(plan.Targets); }
+                    catch (System.Exception)
+                    {
+                        notes.Add("Цели участка «" + plan.Name + "» не перенесены — задайте их заново.");
+                    }
+                }
+
+                try
+                {
+                    // Частоты и прочие параметры расстановки — свойство за свойством.
+                    var from = plan.Old.AppliedAssemblySetting;
+                    var to = created.AppliedAssemblySetting;
+                    foreach (var prop in typeof(AppliedAssemblySetting).GetProperties())
+                    {
+                        if (!prop.CanRead || !prop.CanWrite) continue;
+                        try { prop.SetValue(to, prop.GetValue(from, null), null); }
+                        catch (System.Exception) { }
+                    }
+                }
+                catch (System.Exception)
+                {
+                    notes.Add("Частоты участка «" + plan.Name + "» не перенесены — проверьте их.");
+                }
+            }
+
+            // Дополнительные станции участка.
+            try
+            {
+                foreach (double st in plan.Old.AdditionalStations())
+                    if (st > plan.Start + SplitTol && st < plan.End - SplitTol)
+                        created.AddStation(st, string.Empty);
+            }
+            catch (System.Exception)
+            {
+                notes.Add("Дополнительные станции участка «" + plan.Name + "» не перенесены.");
+            }
+        }
+
+        /// <summary>
+        /// Настройки самой базовой линии (цели и переходы) — в правую базовую линию.
+        /// Участки при этом переносятся отдельно, <see cref="TransferRegions"/>.
+        /// </summary>
+        private static void CopyBaselineSettings(Baseline from, Baseline to, List<string> notes)
+        {
+            try { to.SetTargets(from.GetTargets()); }
+            catch (System.Exception)
+            {
+                notes.Add("Цели базовой линии не перенесены — проверьте их в правой базовой линии.");
+            }
+
+            try
+            {
+                var transitions = from.getTransitions();
+                if (transitions != null && transitions.Count > 0) to.SetTransitions(transitions);
+            }
+            catch (System.Exception)
+            {
+                notes.Add("Переходы базовой линии не перенесены — проверьте их.");
+            }
+        }
+
+        /// <summary>
         /// Обрезать профиль на <paramref name="cut"/>: вершина ставится ВНУТРИ
         /// профиля (допустимо), всё правее неё снимается.
         /// </summary>
@@ -463,6 +392,674 @@ namespace Civil3D_commands.AssociativeBreaks
             foreach (ProfilePVI p in profile.PVIs.Cast<ProfilePVI>()
                                             .Where(p => p.Station > cut + SplitTol).ToList())
                 profile.PVIs.Remove(p);
+        }
+
+        // ======================================================================
+        //  ТОЛЬКО ПРОФИЛЬ (первый этап RW_BOTTOMSTEP: без коридора и связей)
+        // ======================================================================
+
+        /// <summary>
+        /// Разделить профиль на «до» и «после» на пикете station: левый кончается
+        /// ровно на пикете, правый — новый профиль — начинается на нём же на delta
+        /// выше/ниже и дальше повторяет прежний, сдвинутый на delta. Имя нового —
+        /// имя прежнего + отметка начала. Коридора, связей и маркеров не касается.
+        /// Возвращает ObjectId нового профиля.
+        /// </summary>
+        public ObjectId SplitProfileOnly(ObjectId profileId, ObjectId viewId,
+                                         double station, double delta, List<string> notes,
+                                         out string corridorInfo)
+        {
+            var db = Doc.Database;
+            var civDoc = CivilApplication.ActiveDocument;
+
+            try
+            {
+                return SplitProfileOnlyCore(db, civDoc, profileId, viewId, station, delta, notes,
+                                            out corridorInfo);
+            }
+            catch (System.Exception ex)
+            {
+                // Исключение должно попасть в журнал с текстом: в командной строке
+                // его легко не заметить, а по журналу видно и шаг, и причину.
+                BreakTrace.Step("ОШИБКА: " + ex.GetType().Name + ": " + ex.Message);
+                throw;
+            }
+        }
+
+        private ObjectId SplitProfileOnlyCore(Database db, CivilDocument civDoc,
+                                              ObjectId profileId, ObjectId viewId,
+                                              double station, double delta, List<string> notes,
+                                              out string corridorInfo)
+        {
+            ObjectId resultId;
+            Handle leftHandle, rightHandle;
+            BreakLink rightLinkOut = null;
+            corridorInfo = null;
+
+            using (Doc.LockDocument())
+            using (_session.Suspend())
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                // Прокси ложатся на слой границ, который вне режима правки заблокирован.
+                BreakOverlay.Unlock(tr, db);
+
+                var profile = (Profile)tr.GetObject(profileId, OpenMode.ForWrite);
+                var pv = (ProfileView)tr.GetObject(viewId, OpenMode.ForRead);
+                var alignment = (Alignment)tr.GetObject(pv.AlignmentId, OpenMode.ForRead);
+
+                BreakTrace.Step(string.Format(CultureInfo.InvariantCulture,
+                    "=== РАЗДЕЛИТЬ ПРОФИЛЬ «{0}», пикет {1:F3}, сдвиг {2:F3}, тип {3}, пикеты {4:F3}..{5:F3}, PVI {6}",
+                    profile.Name, station, delta, profile.ProfileType,
+                    profile.StartingStation, profile.EndingStation, profile.PVIs.Count));
+
+                if (profile.ProfileType != ProfileType.FG)
+                    throw new InvalidOperationException(
+                        "Профиль «" + profile.Name + "» имеет тип " + profile.ProfileType +
+                        ", а делить можно только проектный профиль (FG).");
+
+                const double edge = 0.1;
+                if (!(station > profile.StartingStation + edge) || !(station < profile.EndingStation - edge))
+                    throw new InvalidOperationException(
+                        "Пикет " + station.ToString("F3") + " вне профиля (" +
+                        profile.StartingStation.ToString("F3") + ".." + profile.EndingStation.ToString("F3") +
+                        ") или ближе " + edge.ToString("0.#") + " м к его краю.");
+
+                if (profile.PVIs.Cast<ProfilePVI>().Any(p => Math.Abs(p.Station - station) < 1e-4))
+                    throw new InvalidOperationException(
+                        "Ровно на этом пикете в профиле уже стоит вершина — сдвиньте пикет.");
+
+                // --- Связанный коридор: у профиля есть связь (RW_LINKPROFILECORRIDOR) ---
+                // Тогда профиль служит базовой линией коридора, и делить надо и её.
+                // Всё, что можно проверить заранее, проверяется ДО первой правки.
+                BreakLink link = _session.Links.FirstOrDefault(
+                                     l => l.ProfileHandle == profile.Handle && l.ProfileViewHandle == pv.Handle)
+                                 ?? _session.Links.FirstOrDefault(l => l.ProfileHandle == profile.Handle);
+
+                Corridor corridor = null;
+                Baseline leftBaseline = null;
+
+                if (link != null)
+                {
+                    corridor = RwHandles.Open<Corridor>(tr, db, link.CorridorHandle, OpenMode.ForWrite);
+                    leftBaseline = _session.GetBaselineByProfile(tr, corridor, profile.Handle);
+
+                    if (corridor == null || leftBaseline == null)
+                    {
+                        // Связь есть, а базовой линии на этом профиле уже нет — делим только профиль.
+                        notes.Add("Связь профиля есть, но базовой линии на нём не найдено — разделён только профиль.");
+                        link = null;
+                        corridor = null;
+                        leftBaseline = null;
+                    }
+                    else if (ProfileGeometryOps.FindRegionAt(leftBaseline.BaselineRegions, station, 0.0) == null)
+                    {
+                        throw new InvalidOperationException(
+                            "Пикет " + station.ToString("F3") + " не попадает ни в один участок коридора «" +
+                            corridor.Name + "».");
+                    }
+                    else
+                    {
+                        BreakTrace.Snapshot(tr, db, _session, link, "КОРИДОР «" + corridor.Name + "»: перед делением");
+                    }
+                }
+
+                double eLeft = profile.ElevationAt(station);
+                double eRight = eLeft + delta;
+                double end = profile.EndingStation;
+
+                var pvis = profile.PVIs.Cast<ProfilePVI>()
+                                  .OrderBy(p => p.Station)
+                                  .Select(p => new Pt(p.Station, p.Elevation))
+                                  .ToList();
+                double endElev = pvis[pvis.Count - 1].Elevation + delta;
+
+                string name = UniqueProfileName(tr, alignment,
+                    profile.Name + " " + eRight.ToString("0.###", CultureInfo.InvariantCulture));
+
+                BreakTrace.Step("новый профиль «" + name + "»");
+                ObjectId rightId = CreateRightProfile(
+                    tr, db, civDoc, profile, alignment, name,
+                    station, eRight, end, endElev, pvis, delta, notes);
+
+                // --- Коридор: правая базовая линия и перенос участков ---
+                // До обрезки левого профиля: участки левой базовой линии надо ужать
+                // раньше, чем профиль под ними станет короче.
+                Baseline rightBaseline = null;
+                Guid hostId = Guid.Empty, firstRightId = Guid.Empty;
+                Dictionary<Guid, Guid> regionMap = null;
+
+                if (link != null)
+                {
+                    string blName = UniqueBaselineName(corridor, name);
+                    BreakTrace.Step("коридор: базовая линия «" + blName + "»");
+                    rightBaseline = corridor.Baselines.Add(blName, alignment.ObjectId, rightId);
+
+                    BreakTrace.Step("коридор: настройки базовой линии");
+                    CopyBaselineSettings(leftBaseline, rightBaseline, notes);
+
+                    BreakTrace.Step("коридор: перенос участков");
+                    regionMap = TransferRegions(leftBaseline, rightBaseline, station, station, notes,
+                                                out hostId, out firstRightId);
+                }
+
+                BreakTrace.Step("левый профиль: обрезка конца");
+                CutProfileEnd(profile, station, eLeft);
+
+                var right = (Profile)tr.GetObject(rightId, OpenMode.ForWrite);
+                BreakCommands.EnsureProfileVisible(tr, db, Doc.Editor, viewId, right, eRight);
+
+                // Диагностика видимости: что именно получилось у нового профиля.
+                try
+                {
+                    BreakTrace.Step(string.Format(CultureInfo.InvariantCulture,
+                        "новый профиль: стиль «{0}», слой «{1}», пикеты {2:F3}..{3:F3}, отметки {4:F3}..{5:F3}, PVI {6}; " +
+                        "вид: отметки {7:F3}..{8:F3}, режим {9}",
+                        ((Autodesk.Civil.DatabaseServices.Entity)right).StyleName, right.Layer,
+                        right.StartingStation, right.EndingStation,
+                        right.ElevationMin, right.ElevationMax, right.PVIs.Count,
+                        pv.ElevationMin, pv.ElevationMax, pv.ElevationRangeMode));
+                }
+                catch (System.Exception ex) { BreakTrace.Step("диагностика видимости не удалась: " + ex.Message); }
+
+                // --- Маркер и прокси: к ним привязаны концы обоих профилей ---
+                // Маркер — обычный StationMarker с ролью Split, поэтому ручки,
+                // реактор и перенос работают теми же путями, что у разрывов.
+                // Без связанного коридора хэндл коридора пуст, и маркер держит только профили.
+                var marker = new StationMarker
+                {
+                    Role = StationMarker.MarkerRole.Split,
+                    Station = station,
+                    StepHeight = delta,
+                    IsStep = false,
+                    Gap = 0.0,
+                    BaseElevation = eLeft,
+                    ProfileHandle = profile.Handle,
+                    NextProfileHandle = right.Handle,
+                    ProfileViewHandle = pv.Handle,
+                    AlignmentHandle = alignment.Handle
+                };
+
+                if (link != null)
+                {
+                    marker.CorridorHandle = link.CorridorHandle;
+                    marker.LeftRegionId = hostId;
+                    marker.RightRegionId = firstRightId;
+
+                    // Правая часть — отдельная связь со своим контроллером; маркеры правее
+                    // пикета (и конец коридора) переходят в неё вместе с участками.
+                    var rightLink = new BreakLink
+                    {
+                        ProfileHandle     = right.Handle,
+                        ProfileViewHandle = link.ProfileViewHandle,
+                        AlignmentHandle   = link.AlignmentHandle,
+                        CorridorHandle    = link.CorridorHandle
+                    };
+                    rightLink.ColorIndex = BreakOverlay.RandomColor(rightLink.Id);
+                    rightLink.RefreshNames(tr, db);
+
+                    foreach (StationMarker mk in _session.Store.ForProfile(link.ProfileHandle)
+                                                         .Where(x => x.Station > station).ToList())
+                    {
+                        mk.ProfileHandle = right.Handle;
+                        mk.BaseElevation += delta;
+
+                        Guid g;
+                        if (regionMap.TryGetValue(mk.LeftRegionId, out g)) mk.LeftRegionId = g;
+                        if (regionMap.TryGetValue(mk.RightRegionId, out g)) mk.RightRegionId = g;
+                    }
+
+                    int slot = _session.Links.Count(l => l.ProfileViewHandle == link.ProfileViewHandle);
+                    BreakController.Ensure(tr, db, rightLink, slot);
+                    _session.AddLink(rightLink);
+                    rightLinkOut = rightLink;
+
+                    corridorInfo = "Коридор «" + corridor.Name + "»: новая базовая линия «" +
+                                   rightBaseline.Name + "», связь «" + rightLink.Label + "».";
+                }
+
+                BreakTrace.Step("прокси границы");
+                BreakProxyFactory.CreateProxies(tr, db, marker, pv, alignment);
+                _session.Store.Add(marker);
+                WriteProps(tr, marker);
+
+                if (corridor != null)
+                {
+                    BreakTrace.Step("коридор: Rebuild");
+                    corridor.Rebuild();
+
+                    BreakTrace.Step("оформление");
+                    RefreshOverlays(tr, link, rightLinkOut);
+                }
+
+                leftHandle = profile.Handle;
+                rightHandle = right.Handle;
+                resultId = rightId;
+
+                BreakTrace.Step("коммит транзакции");
+                tr.Commit();
+                BreakTrace.Step("коммит прошёл");
+            }
+
+            _session.Store.SaveToDatabase(db);
+            if (rightLinkOut != null) _session.SaveLinks();
+
+            // Ручки у прокси есть только в режиме правки профиля: включаем его
+            // для обоих профилей (после него слой границ разблокирован).
+            _session.SetEditMode(leftHandle, true);
+            _session.SetEditMode(rightHandle, true);
+
+            return resultId;
+        }
+
+        /// <summary>
+        /// Обрезать конец профиля на cut: лишние вершины снимаются, последняя
+        /// переносится в пикет. Каждый шаг пишется в журнал.
+        /// </summary>
+        private static void CutProfileEnd(Profile p, double cut, double elev)
+        {
+            // Первую и последнюю вершину Civil снять не даёт («Cound not remove the
+            // first or the last PVI»), поэтому крайняя ПЕРЕНОСИТСЯ в пикет. Лишние
+            // снимаются с конца к началу: после удаления индексы вершин правее
+            // сдвигаются, и прямой порядок рано или поздно попадал на последнюю.
+            var tail = p.PVIs.Cast<ProfilePVI>()
+                        .Where(x => x.Station > cut + SplitTol)
+                        .OrderBy(x => x.Station).ToList();
+            if (tail.Count == 0) throw new InvalidOperationException("Правее пикета нет вершин профиля.");
+
+            BreakTrace.Step("  конец: внутренних вершин правее пикета " + (tail.Count - 1));
+            for (int i = tail.Count - 2; i >= 0; i--)
+            {
+                BreakTrace.Step("  конец: снимаю вершину " + tail[i].Station.ToString("F3", CultureInfo.InvariantCulture));
+                p.PVIs.Remove(tail[i]);
+            }
+
+            // Объект последней вершины, взятый ДО удалений, мог устареть вместе
+            // с индексами — берём её заново из текущего списка.
+            BreakTrace.Step("  конец: сдвигаю последнюю вершину в пикет");
+            ProfilePVI last = p.PVIs.Cast<ProfilePVI>().OrderBy(x => x.Station).Last();
+            BreakTrace.Step("  конец: последняя вершина сейчас на " +
+                            last.Station.ToString("F3", CultureInfo.InvariantCulture));
+            last.Elevation = elev;
+            BreakTrace.Step("  конец: отметка задана");
+            last.Station = cut;
+            BreakTrace.Step("  конец: станция задана");
+            BreakTrace.Step("  конец: готово");
+        }
+
+        /// <summary>Зеркально <see cref="CutProfileEnd"/>: обрезать начало профиля на cut.</summary>
+        private static void CutProfileStart(Profile p, double cut, double elev)
+        {
+            var head = p.PVIs.Cast<ProfilePVI>()
+                        .Where(x => x.Station < cut - SplitTol)
+                        .OrderBy(x => x.Station).ToList();
+            if (head.Count == 0) throw new InvalidOperationException("Левее пикета нет вершин профиля.");
+
+            // Все, кроме первой, — с конца к началу (индексы нижних не плывут).
+            BreakTrace.Step("  начало: внутренних вершин левее пикета " + (head.Count - 1));
+            for (int i = head.Count - 1; i >= 1; i--)
+            {
+                BreakTrace.Step("  начало: снимаю вершину " + head[i].Station.ToString("F3", CultureInfo.InvariantCulture));
+                p.PVIs.Remove(head[i]);
+            }
+
+            BreakTrace.Step("  начало: сдвигаю первую вершину в пикет");
+            ProfilePVI first = p.PVIs.Cast<ProfilePVI>().OrderBy(x => x.Station).First();
+            first.Station = cut;
+            first.Elevation = elev;
+            BreakTrace.Step("  начало: готово");
+        }
+
+        // ======================================================================
+        //  ИЗМЕНЕНИЕ ВЫСОТЫ И УДАЛЕНИЕ
+        // ======================================================================
+
+        /// <summary>
+        /// Цепочка профилей правее смены отметки: правый профиль и все, что идёт
+        /// за ним через следующие смены. Сдвиг высоты первой смены сдвигает их все
+        /// разом — иначе ступени следующих смен изменились бы.
+        /// </summary>
+        private List<Handle> ChainRightOf(StationMarker m)
+        {
+            var chain = new List<Handle>();
+            var seen = new HashSet<long>();
+
+            Handle cur = m.NextProfileHandle;
+            while (cur.Value != 0 && seen.Add(cur.Value))
+            {
+                chain.Add(cur);
+                StationMarker next = _session.Store.SplitEndingProfile(cur);
+                cur = next != null ? next.NextProfileHandle : new Handle(0);
+            }
+
+            return chain;
+        }
+
+        /// <summary>
+        /// Изменить высоту смены отметки: правый профиль и всё, что правее него по
+        /// цепочке, поднимается или опускается на разницу. Форма профилей и ступени
+        /// следующих смен сохраняются. Имена профилей и базовых линий, оканчивающиеся
+        /// прежней отметкой, переименовываются на новую.
+        /// </summary>
+        public void ChangeSplitHeight(StationMarker m, double newDelta, List<string> notes)
+        {
+            if (m == null || !m.IsSplit) throw new InvalidOperationException("Это не смена отметки.");
+            if (double.IsNaN(newDelta) || double.IsInfinity(newDelta) || Math.Abs(newDelta) < 1e-9)
+                throw new InvalidOperationException("Высота смены отметки не может быть нулевой.");
+
+            double d = newDelta - m.StepHeight;
+            if (Math.Abs(d) < 1e-9) return;
+
+            var db = Doc.Database;
+            double oldDelta = m.StepHeight;
+
+            try
+            {
+                using (Doc.LockDocument())
+                using (_session.Suspend())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    BreakOverlay.Unlock(tr, db);
+
+                    var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
+                    var alignment = pv != null
+                        ? tr.GetObject(pv.AlignmentId, OpenMode.ForRead) as Alignment
+                        : null;
+                    var corridor = RwHandles.Open<Corridor>(tr, db, m.CorridorHandle, OpenMode.ForWrite);
+
+                    List<Handle> chain = ChainRightOf(m);
+                    BreakTrace.Step(string.Format(CultureInfo.InvariantCulture,
+                        "=== ВЫСОТА смены отметки на {0:F3}: {1:F3} -> {2:F3}, профилей в цепочке {3}",
+                        m.Station, oldDelta, newDelta, chain.Count));
+
+                    var touchedLinks = new List<BreakLink>();
+                    BreakLink leftLink = _session.FindLinkByProfile(m.ProfileHandle, m.CorridorHandle);
+                    if (leftLink != null) touchedLinks.Add(leftLink);
+
+                    Profile firstRight = null;
+                    double firstRightElev = 0.0;
+
+                    foreach (Handle h in chain)
+                    {
+                        var p = RwHandles.Open<Profile>(tr, db, h, OpenMode.ForWrite);
+                        if (p == null) continue;
+
+                        double oldStartElev = p.PVIs.Cast<ProfilePVI>()
+                                               .OrderBy(x => x.Station).First().Elevation;
+
+                        BreakTrace.Step("  профиль «" + p.Name + "»: сдвиг на " +
+                                        d.ToString("F3", CultureInfo.InvariantCulture));
+                        foreach (ProfilePVI pvi in p.PVIs.Cast<ProfilePVI>().ToList())
+                            pvi.Elevation += d;
+
+                        if (firstRight == null)
+                        {
+                            firstRight = p;
+                            firstRightElev = oldStartElev + d;
+                        }
+
+                        // Имя и базовая линия, названная так же, — на новую отметку.
+                        Baseline bl = _session.GetBaselineByProfile(tr, corridor, h);
+                        if (alignment != null)
+                            RenameForElevation(tr, alignment, corridor, p, bl, oldStartElev, oldStartElev + d);
+
+                        BreakLink link = _session.FindLinkByProfile(h, m.CorridorHandle);
+                        if (link != null)
+                        {
+                            link.RefreshNames(tr, db);
+                            BreakController.Update(tr, db, link);
+                            touchedLinks.Add(link);
+                        }
+                    }
+
+                    // Маркеры цепочки стоят на сдвинутых профилях.
+                    var inChain = new HashSet<long>(chain.Select(c => c.Value));
+                    foreach (StationMarker mk in _session.Store.All)
+                        if (inChain.Contains(mk.ProfileHandle.Value) && mk.Id != m.Id)
+                            mk.BaseElevation += d;
+
+                    m.StepHeight = newDelta;
+                    WriteProps(tr, m);
+
+                    if (corridor != null)
+                    {
+                        BreakTrace.Step("коридор: Rebuild");
+                        corridor.Rebuild();
+                    }
+
+                    if (firstRight != null && pv != null)
+                        BreakCommands.EnsureProfileVisible(tr, db, Doc.Editor, pv.ObjectId, firstRight, firstRightElev);
+
+                    RefreshOverlays(tr, touchedLinks.ToArray());
+
+                    BreakTrace.Step("коммит транзакции");
+                    tr.Commit();
+                    BreakTrace.Step("коммит прошёл");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                BreakTrace.Step("ОШИБКА: " + ex.GetType().Name + ": " + ex.Message);
+                throw;
+            }
+
+            _session.Store.SaveToDatabase(db);
+            _session.SaveLinks();
+        }
+
+        /// <summary>
+        /// Имя профиля вида «… 36.5» — на новую отметку. Если имя не оканчивается
+        /// прежней отметкой (пользователь переименовал сам) — не трогаем.
+        /// Базовая линия переименовывается, только если называлась так же, как профиль.
+        /// </summary>
+        private static void RenameForElevation(Transaction tr, Alignment alignment, Corridor corridor,
+                                               Profile p, Baseline bl, double oldElev, double newElev)
+        {
+            string suffix = " " + oldElev.ToString("0.###", CultureInfo.InvariantCulture);
+            if (!p.Name.EndsWith(suffix, StringComparison.Ordinal)) return;
+
+            string oldName = p.Name;
+            string wanted = oldName.Substring(0, oldName.Length - suffix.Length) +
+                            " " + newElev.ToString("0.###", CultureInfo.InvariantCulture);
+
+            p.Name = UniqueProfileName(tr, alignment, wanted);
+
+            if (bl != null && corridor != null && string.Equals(bl.Name, oldName, StringComparison.Ordinal))
+                bl.Name = UniqueBaselineName(corridor, p.Name);
+        }
+
+        /// <summary>
+        /// Удалить смену отметки: два профиля снова становятся одним, а коридор —
+        /// одной базовой линией. Обратная к созданию:
+        ///
+        ///  • левый профиль продлевается до конца правого, формой правого, сдвинутого
+        ///    назад на высоту смены; правый профиль стирается;
+        ///  • участки правой базовой линии возвращаются в левую: первый из них, стоявший
+        ///    у разреза, поглощается разрезанным (выживают настройки левого участка,
+        ///    как при удалении обычного разрыва), остальные создаются заново с настройками
+        ///    прежних; правая базовая линия удаляется;
+        ///  • маркеры правого профиля переходят в левый, правая связь стирается вместе
+        ///    с контроллером и оформлением, прокси смены стираются.
+        /// </summary>
+        public void DeleteSplit(StationMarker m, List<string> notes)
+        {
+            if (m == null || !m.IsSplit) throw new InvalidOperationException("Это не смена отметки.");
+
+            var db = Doc.Database;
+            Handle leftHandle = m.ProfileHandle, rightHandle = m.NextProfileHandle;
+
+            // Режим правки у правого профиля снимается ДО его стирания: запись
+            // флага открывает сам профиль.
+            if (_session.IsEditMode(rightHandle)) _session.SetEditMode(rightHandle, false);
+
+            BreakLink rightLink = _session.FindLinkByProfile(rightHandle, m.CorridorHandle);
+
+            try
+            {
+                using (Doc.LockDocument())
+                using (_session.Suspend())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    BreakOverlay.Unlock(tr, db);
+
+                    var left = RwHandles.Open<Profile>(tr, db, leftHandle, OpenMode.ForWrite);
+                    var right = RwHandles.Open<Profile>(tr, db, rightHandle, OpenMode.ForWrite);
+                    var corridor = RwHandles.Open<Corridor>(tr, db, m.CorridorHandle, OpenMode.ForWrite);
+
+                    BreakTrace.Step(string.Format(CultureInfo.InvariantCulture,
+                        "=== УДАЛИТЬ смену отметки на {0:F3}, сдвиг {1:F3}", m.Station, m.StepHeight));
+
+                    if (left == null || right == null)
+                    {
+                        // Одного из профилей уже нет: склеивать нечего — снимается только управление.
+                        BreakTrace.Step("профиль слева или справа не открылся — снимаю только управление");
+                        notes.Add("Один из профилей уже отсутствует: удалены только прокси и маркер.");
+                    }
+                    else
+                    {
+                        double delta = m.StepHeight;
+
+                        // --- 1) Профиль: левый продлевается формой правого, сдвинутого назад ---
+                        var shape = right.PVIs.Cast<ProfilePVI>()
+                                         .Where(p => p.Station > m.Station + SplitTol)
+                                         .OrderBy(p => p.Station)
+                                         .Select(p => new Pt(p.Station, p.Elevation - delta))
+                                         .ToList();
+                        if (shape.Count == 0)
+                            throw new InvalidOperationException("У правого профиля нет вершин правее пикета.");
+
+                        Pt last = shape[shape.Count - 1];
+                        shape.RemoveAt(shape.Count - 1);
+
+                        BreakTrace.Step("профиль: левый продлевается до " +
+                                        last.Station.ToString("F3", CultureInfo.InvariantCulture));
+                        ExtendProfileEnd(left, last.Station, last.Elevation, shape, 0.0);
+
+                        // --- 2) Коридор: участки обратно в левую базовую линию ---
+                        var map = new Dictionary<Guid, Guid>();
+                        if (corridor != null)
+                        {
+                            Baseline bl = _session.GetBaselineByProfile(tr, corridor, leftHandle);
+                            Baseline br = _session.GetBaselineByProfile(tr, corridor, rightHandle);
+
+                            if (bl != null && br != null)
+                            {
+                                BreakTrace.Step("коридор: участки обратно в левую базовую линию");
+                                MergeRegionsBack(bl, br, m, map, notes);
+
+                                BreakTrace.Step("коридор: удаление правой базовой линии");
+                                corridor.Baselines.Remove(br);
+                            }
+                            else notes.Add("Не найдена базовая линия одной из частей — участки коридора не склеивались.");
+                        }
+
+                        // --- 3) Маркеры правого профиля — в левый ---
+                        foreach (StationMarker mk in _session.Store.ForProfile(rightHandle).ToList())
+                        {
+                            if (mk.Id == m.Id) continue;
+
+                            mk.ProfileHandle = leftHandle;
+                            mk.BaseElevation -= delta;
+
+                            Guid g;
+                            if (map.TryGetValue(mk.LeftRegionId, out g)) mk.LeftRegionId = g;
+                            if (map.TryGetValue(mk.RightRegionId, out g)) mk.RightRegionId = g;
+                        }
+
+                        // --- 4) Правая связь и правый профиль ---
+                        if (rightLink != null)
+                        {
+                            BreakOverlay.Erase(tr, db, rightLink);
+                            BreakController.Erase(tr, db, rightLink);
+                            _session.RemoveLink(rightLink);
+                        }
+
+                        BreakTrace.Step("профиль: удаление правого");
+                        try { right.Erase(); }
+                        catch (System.Exception ex)
+                        {
+                            BreakTrace.Step("  правый профиль не стёрт: " + ex.Message);
+                            notes.Add("Правый профиль стереть не удалось — удалите его вручную.");
+                        }
+                    }
+
+                    // --- 5) Сам маркер и прокси ---
+                    EraseIfValid(tr, m.ProfileProxyHandle);
+                    EraseIfValid(tr, m.PlanProxyHandle);
+                    _session.Store.Remove(m.Id);
+
+                    if (corridor != null)
+                    {
+                        BreakTrace.Step("коридор: Rebuild");
+                        corridor.Rebuild();
+                    }
+
+                    RefreshOverlays(tr, _session.FindLinkByProfile(leftHandle, m.CorridorHandle));
+
+                    BreakTrace.Step("коммит транзакции");
+                    tr.Commit();
+                    BreakTrace.Step("коммит прошёл");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                BreakTrace.Step("ОШИБКА: " + ex.GetType().Name + ": " + ex.Message);
+                // Связь выводилась из сессии внутри транзакции, а та откатилась.
+                if (rightLink != null) _session.AddLink(rightLink);
+                throw;
+            }
+
+            _session.Store.SaveToDatabase(db);
+            _session.SaveLinks();
+        }
+
+        /// <summary>
+        /// Вернуть участки правой базовой линии в левую. Первый (у разреза) поглощается
+        /// разрезанным участком слева — тот просто растягивается; остальные создаются
+        /// заново, настройки копируются с прежних.
+        /// </summary>
+        private static void MergeRegionsBack(Baseline left, Baseline right, StationMarker m,
+                                             Dictionary<Guid, Guid> map, List<string> notes)
+        {
+            var rights = new List<BaselineRegion>();
+            foreach (BaselineRegion r in right.BaselineRegions) rights.Add(r);
+            rights = rights.OrderBy(r => r.StartStation).ToList();
+            if (rights.Count == 0) return;
+
+            BaselineRegion host = ProfileGeometryOps.FindByGuid(left.BaselineRegions, m.LeftRegionId)
+                                  ?? RegionWithMaxEnd(left);
+            BaselineRegion first = rights[0];
+
+            int from = 0;
+            if (host != null)
+            {
+                // Левый профиль уже продлён — участок можно растянуть.
+                host.EndStation = first.EndStation;
+                map[first.RegionGUID] = host.RegionGUID;
+                from = 1;
+            }
+
+            for (int i = from; i < rights.Count; i++)
+            {
+                BaselineRegion r = rights[i];
+                var plan = new RegionPlan
+                {
+                    Old = r,
+                    OldId = r.RegionGUID,
+                    Name = r.Name,
+                    AssemblyId = r.AssemblyId,
+                    Start = r.StartStation,
+                    End = r.EndStation
+                };
+
+                try { plan.Targets = r.GetTargets(); }
+                catch (System.Exception) { }
+
+                BaselineRegion created = left.BaselineRegions.Add(
+                    plan.Name, plan.AssemblyId, plan.Start, plan.End);
+
+                CopyRegionSettings(plan, created, notes);
+                map[plan.OldId] = created.RegionGUID;
+            }
         }
 
         // ======================================================================
@@ -491,20 +1088,19 @@ namespace Civil3D_commands.AssociativeBreaks
                     var right = RwHandles.Open<Profile>(tr, db, m.NextProfileHandle, OpenMode.ForWrite);
                     var pv = RwHandles.Open<ProfileView>(tr, db, m.ProfileViewHandle, OpenMode.ForRead);
                     var alignment = RwHandles.Open<Alignment>(tr, db, m.AlignmentHandle, OpenMode.ForRead);
+                    // Коридор необязателен: на первом этапе смена отметки делит только
+                    // профили, и тогда участков и базовых линий нет.
                     var corridor = RwHandles.Open<Corridor>(tr, db, m.CorridorHandle, OpenMode.ForWrite);
 
-                    if (left == null || right == null || corridor == null)
+                    if (left == null || right == null)
                         throw new InvalidOperationException(
-                            "У смены отметки не открылся профиль или коридор — она осталась на прежнем месте.");
+                            "У смены отметки не открылся один из профилей — она осталась на прежнем месте.");
 
                     Baseline bl = _session.GetBaselineByProfile(tr, corridor, m.ProfileHandle);
                     Baseline br = _session.GetBaselineByProfile(tr, corridor, m.NextProfileHandle);
-                    if (bl == null || br == null)
-                        throw new InvalidOperationException(
-                            "У смены отметки нет одной из базовых линий — она осталась на прежнем месте.");
 
                     var bounds = _session.Store.GetMoveBounds(
-                        m, BreakGripOverrule.Buffer, bl.StartStation, br.EndStation);
+                        m, BreakGripOverrule.Buffer, left.StartingStation, right.EndingStation);
                     double s = Math.Min(Math.Max(newStation, bounds.min), bounds.max);
 
                     if (Math.Abs(s - old) > 1e-6)
@@ -517,8 +1113,11 @@ namespace Civil3D_commands.AssociativeBreaks
 
                         MoveSplit(m, old, s, left, right, bl, br);
 
-                        BreakTrace.Step("коридор: Rebuild");
-                        corridor.Rebuild();
+                        if (corridor != null)
+                        {
+                            BreakTrace.Step("коридор: Rebuild");
+                            corridor.Rebuild();
+                        }
                     }
 
                     // Прокси пересчитываем всегда — и когда кламп съел всё перемещение.
@@ -573,39 +1172,44 @@ namespace Civil3D_commands.AssociativeBreaks
             double fL = old >= lNew ? ElevationClamped(left, lNew) : ElevationClamped(right, lNew) - delta;
             double fR = old >= rNew ? ElevationClamped(left, rNew) : ElevationClamped(right, rNew) - delta;
 
-            BaselineRegion lr = ProfileGeometryOps.FindByGuid(bl.BaselineRegions, m.LeftRegionId)
-                                ?? RegionWithMaxEnd(bl);
-            BaselineRegion rr = ProfileGeometryOps.FindByGuid(br.BaselineRegions, m.RightRegionId)
-                                ?? RegionWithMinStart(br);
-            if (lr == null || rr == null)
-                throw new InvalidOperationException("Не найдены участки по обе стороны смены отметки.");
+            // Участки есть, только если смена отметки связана с коридором.
+            BaselineRegion lr = null, rr = null;
+            if (bl != null && br != null)
+            {
+                lr = ProfileGeometryOps.FindByGuid(bl.BaselineRegions, m.LeftRegionId)
+                     ?? RegionWithMaxEnd(bl);
+                rr = ProfileGeometryOps.FindByGuid(br.BaselineRegions, m.RightRegionId)
+                     ?? RegionWithMinStart(br);
+            }
 
+            // Профили правятся только тем, что Civil принимает: перенос КРАЙНЕЙ
+            // вершины, снятие внутренних (с конца к началу) и вставка внутрь.
             if (s > old)
             {
                 // Левый удлиняется, правый укорачивается.
-                BreakTrace.Step("профиль: левый удлиняется");
+                BreakTrace.Step("профиль: левый удлиняется до " + lNew.ToString("F3", CultureInfo.InvariantCulture));
                 ExtendProfileEnd(left, lNew, fL, shape.Where(p => p.Station > lOld + SplitTol && p.Station < lNew - SplitTol), 0.0);
-                lr.EndStation = lNew;
+                if (lr != null) lr.EndStation = lNew;
 
-                BreakTrace.Step("профиль: правый укорачивается");
-                rr.StartStation = rNew;
-                TruncateProfileStart(right, rNew, fR + delta);
+                BreakTrace.Step("профиль: правый укорачивается до " + rNew.ToString("F3", CultureInfo.InvariantCulture));
+                if (rr != null) rr.StartStation = rNew;
+                CutProfileStart(right, rNew, fR + delta);
             }
             else
             {
                 // Левый укорачивается, правый удлиняется.
-                BreakTrace.Step("профиль: левый укорачивается");
-                lr.EndStation = lNew;
-                TruncateProfileEnd(left, lNew, fL);
+                BreakTrace.Step("профиль: левый укорачивается до " + lNew.ToString("F3", CultureInfo.InvariantCulture));
+                if (lr != null) lr.EndStation = lNew;
+                CutProfileEnd(left, lNew, fL);
 
-                BreakTrace.Step("профиль: правый удлиняется");
+                BreakTrace.Step("профиль: правый удлиняется до " + rNew.ToString("F3", CultureInfo.InvariantCulture));
                 ExtendProfileStart(right, rNew, fR + delta,
                                    shape.Where(p => p.Station > rNew + SplitTol && p.Station < rOld - SplitTol), delta);
-                rr.StartStation = rNew;
+                if (rr != null) rr.StartStation = rNew;
             }
 
-            m.LeftRegionId = lr.RegionGUID;
-            m.RightRegionId = rr.RegionGUID;
+            if (lr != null) m.LeftRegionId = lr.RegionGUID;
+            if (rr != null) m.RightRegionId = rr.RegionGUID;
             m.BaseElevation = fL;
         }
 

@@ -81,6 +81,7 @@
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Drawing" />
+    <Reference Include="WindowsBase" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Windows.Forms.DataVisualization" />
     <Reference Include="System.Windows.Forms.DataVisualization.Design" />
@@ -112,6 +113,7 @@
     <Compile Include="ProfCorrLink\AssociativeBreakManager.Split.cs" />
     <Compile Include="ProfCorrLink\BreakCommands.cs" />
     <Compile Include="ProfCorrLink\BreakCommands.BottomStep.cs" />
+    <Compile Include="ProfCorrLink\BreakArrowMouse.cs" />
     <Compile Include="ProfCorrLink\BreakController.cs" />
     <Compile Include="ProfCorrLink\BreakLink.cs" />
     <Compile Include="ProfCorrLink\BreakOverlay.cs" />

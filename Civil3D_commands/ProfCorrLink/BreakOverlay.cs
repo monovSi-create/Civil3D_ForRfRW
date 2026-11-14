@@ -175,8 +175,25 @@ namespace Civil3D_commands.AssociativeBreaks
             }
 
             // --- Надписи вдоль каждой границы ---
+            // На границе смены отметки участок СПРАВА лежит в другой базовой линии —
+            // той, что у правого профиля. Для подписей конструкции берём и его
+            // участки: подбор идёт по пикету, и чужие участки далеко от других
+            // границ в подбор не попадают. Заливки по-прежнему только свои.
+            var labelRegions = new List<RegionInfo>(regions);
+
+            var splits = session.Store.ForProfile(link.ProfileHandle).Where(x => x.IsSplit).ToList();
+            if (splits.Count > 0)
+            {
+                var corridor = RwHandles.Open<Corridor>(tr, db, link.CorridorHandle, OpenMode.ForRead);
+                foreach (StationMarker split in splits)
+                {
+                    Baseline rightBaseline = session.GetBaselineByProfile(tr, corridor, split.NextProfileHandle);
+                    if (rightBaseline != null) labelRegions.AddRange(CollectRegions(tr, rightBaseline));
+                }
+            }
+
             foreach (double station in boundaries.OrderBy(s => s))
-                AddBoundaryLabels(tr, db, space, link, pv, regions,
+                AddBoundaryLabels(tr, db, space, link, pv, labelRegions,
                                   station, yLo, yHi, height, linkColor);
         }
 
